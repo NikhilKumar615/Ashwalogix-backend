@@ -1,0 +1,50 @@
+import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
+import { EmploymentType } from '@prisma/client';
+import {
+  IsEmail,
+  IsEnum,
+  IsOptional,
+  IsString,
+  Matches,
+  MinLength,
+} from 'class-validator';
+
+export class RegisterCompanyDriverDto {
+  @ApiProperty()
+  @IsString()
+  fullName!: string;
+
+  @ApiProperty()
+  @IsEmail()
+  email!: string;
+
+  @ApiProperty()
+  @IsString()
+  phone!: string;
+
+  @ApiProperty()
+  @IsString()
+  @MinLength(8)
+  @Matches(/^(?=.*[A-Za-z])(?=.*\d).+$/, {
+    message: 'password must contain at least one letter and one number',
+  })
+  password!: string;
+
+  @ApiProperty({ enum: EmploymentType })
+  @IsEnum(EmploymentType)
+  employmentType!: EmploymentType;
+
+  @ApiProperty()
+  @IsString()
+  licenseNumber!: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  driverCode?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  homeBase?: string;
+}
