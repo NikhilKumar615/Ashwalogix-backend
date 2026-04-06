@@ -9,10 +9,12 @@ import { HealthModule } from './modules/health/health.module';
 import { NotificationsModule } from './modules/notifications/notifications.module';
 import { OrganizationsModule } from './modules/organizations/organizations.module';
 import { PodModule } from './modules/pod/pod.module';
+import { PlatformSettingsModule } from './modules/platform-settings/platform-settings.module';
 import { ShipmentsModule } from './modules/shipments/shipments.module';
 import { TrackingModule } from './modules/tracking/tracking.module';
 import { VehiclesModule } from './modules/vehicles/vehicles.module';
 import { WarehouseModule } from './modules/warehouse/warehouse.module';
+import { KafkaModule } from './shared/kafka/kafka.module';
 import { PrismaModule } from './shared/prisma/prisma.module';
 
 @Module({
@@ -22,6 +24,7 @@ import { PrismaModule } from './shared/prisma/prisma.module';
       envFilePath: '.env',
     }),
     PrismaModule,
+    KafkaModule,
     HealthModule,
     AuthModule,
     OrganizationsModule,
@@ -32,6 +35,7 @@ import { PrismaModule } from './shared/prisma/prisma.module';
     TrackingModule,
     DocumentsModule,
     PodModule,
+    PlatformSettingsModule,
     WarehouseModule,
     NotificationsModule,
     AuditModule,

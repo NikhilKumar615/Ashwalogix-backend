@@ -3,6 +3,7 @@ import {
   Controller,
   Get,
   Param,
+  Patch,
   Post,
   UseGuards,
 } from '@nestjs/common';
@@ -17,6 +18,7 @@ import { CurrentUser } from './decorators/current-user.decorator';
 import { Roles } from './decorators/roles.decorator';
 import { ApproveIndependentDriverDto } from './dto/approve-independent-driver.dto';
 import { ApproveOrganizationDto } from './dto/approve-organization.dto';
+import { CreateClientOrganizationDto } from './dto/create-client-organization.dto';
 import { ForgotPasswordDto } from './dto/forgot-password.dto';
 import { LoginDto } from './dto/login.dto';
 import { RegisterCompanyAdminDto } from './dto/register-company-admin.dto';
@@ -24,6 +26,9 @@ import { RegisterIndependentDriverDto } from './dto/register-independent-driver.
 import { RejectIndependentDriverDto } from './dto/reject-independent-driver.dto';
 import { RejectOrganizationDto } from './dto/reject-organization.dto';
 import { ResetPasswordDto } from './dto/reset-password.dto';
+import { SuperAdminRequestOtpDto } from './dto/super-admin-request-otp.dto';
+import { SuperAdminVerifyOtpDto } from './dto/super-admin-verify-otp.dto';
+import { UpdateClientOrganizationDto } from './dto/update-client-organization.dto';
 import { VerifyEmailDto } from './dto/verify-email.dto';
 import { JwtAuthGuard } from './guards/jwt-auth.guard';
 import { RolesGuard } from './guards/roles.guard';
@@ -68,6 +73,24 @@ export class AuthController {
     return this.authService.login(body);
   }
 
+  @Post('super-admin/request-otp')
+  @ApiOperation({
+    summary: 'Validate super admin credentials and send a sign-in OTP by email',
+  })
+  @ApiBody({ type: SuperAdminRequestOtpDto })
+  requestSuperAdminOtp(@Body() body: SuperAdminRequestOtpDto) {
+    return this.authService.requestSuperAdminOtp(body);
+  }
+
+  @Post('super-admin/verify-otp')
+  @ApiOperation({
+    summary: 'Verify the emailed OTP and complete super admin sign-in',
+  })
+  @ApiBody({ type: SuperAdminVerifyOtpDto })
+  verifySuperAdminOtp(@Body() body: SuperAdminVerifyOtpDto) {
+    return this.authService.verifySuperAdminOtp(body);
+  }
+
   @Post('forgot-password')
   @ApiOperation({ summary: 'Create a password reset token for a user account' })
   @ApiBody({ type: ForgotPasswordDto })
@@ -97,6 +120,56 @@ export class AuthController {
   @Roles('SUPER_ADMIN')
   getPendingOrganizations() {
     return this.authService.getPendingOrganizations();
+  }
+
+  @Get('organizations/approved/count')
+  @ApiBearerAuth()
+  @ApiOperation({ summary: 'Get total approved client organizations' })
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles('SUPER_ADMIN')
+  getApprovedOrganizationsCount() {
+    return this.authService.getApprovedOrganizationsCount();
+  }
+
+  @Get('organizations/approved')
+  @ApiBearerAuth()
+  @ApiOperation({ summary: 'List approved client organizations for super admin' })
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles('SUPER_ADMIN')
+  getApprovedOrganizations() {
+    return this.authService.getApprovedOrganizations();
+  }
+
+  @Post('organizations')
+  @ApiBearerAuth()
+  @ApiOperation({ summary: 'Create a client organization as super admin' })
+  @ApiBody({ type: CreateClientOrganizationDto })
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles('SUPER_ADMIN')
+  createClientOrganization(
+    @Body() body: CreateClientOrganizationDto,
+    @CurrentUser() user: JwtPayload,
+  ) {
+    return this.authService.createClientOrganization(body, user.sub);
+  }
+
+  @Patch('organizations/:organizationId')
+  @ApiBearerAuth()
+  @ApiOperation({ summary: 'Update a client organization as super admin' })
+  @ApiParam({ name: 'organizationId', type: String })
+  @ApiBody({ type: UpdateClientOrganizationDto })
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles('SUPER_ADMIN')
+  updateClientOrganization(
+    @Param('organizationId') organizationId: string,
+    @Body() body: UpdateClientOrganizationDto,
+    @CurrentUser() user: JwtPayload,
+  ) {
+    return this.authService.updateClientOrganization(
+      organizationId,
+      body,
+      user.sub,
+    );
   }
 
   @Get('independent-drivers/pending')

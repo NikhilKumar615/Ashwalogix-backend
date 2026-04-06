@@ -1,4 +1,4 @@
-import { BadRequestException, Injectable } from '@nestjs/common';
+import { BadRequestException, Inject, Injectable } from '@nestjs/common';
 import {
   EventSource,
   ProofType,
@@ -12,6 +12,11 @@ import {
   TrackingSessionStatus,
 } from '@prisma/client';
 import { randomUUID } from 'crypto';
+import { TRACKING_EVENT_BUS } from '../../shared/kafka/kafka.constants';
+import type {
+  OrderEventMessage,
+  TrackingEventBus,
+} from '../../shared/kafka/interfaces/tracking-event-bus.interface';
 import { PrismaService } from '../../shared/prisma/prisma.service';
 import { AssignDriverDto } from './dto/assign-driver.dto';
 import { CreateShipmentDto } from './dto/create-shipment.dto';
@@ -20,6 +25,7 @@ import { CreateTrackingPointDto } from './dto/create-tracking-point.dto';
 import { FailShipmentDto } from './dto/fail-shipment.dto';
 import { ShipmentStatusActionDto } from './dto/shipment-status-action.dto';
 import { StartTrackingSessionDto } from './dto/start-tracking-session.dto';
+import { UpdateShipmentDto } from './dto/update-shipment.dto';
 
 type ListShipmentsParams = {
   organizationId?: string;
@@ -29,7 +35,11 @@ type ListShipmentsParams = {
 
 @Injectable()
 export class ShipmentsService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    @Inject(TRACKING_EVENT_BUS)
+    private readonly trackingEventBus: TrackingEventBus,
+  ) {}
 
   async listShipments(params: ListShipmentsParams) {
     const where: Prisma.ShipmentWhereInput = {};
@@ -149,6 +159,10 @@ export class ShipmentsService {
         internalReceiverPhone: input.internalReceiverPhone,
         internalReceiverDepartment: input.internalReceiverDepartment,
         notes: input.notes,
+        adminFormData:
+          input.adminFormData !== undefined
+            ? (input.adminFormData as Prisma.InputJsonValue)
+            : undefined,
         items: input.items?.length
           ? {
               create: input.items.map((item) => ({
@@ -224,6 +238,263 @@ export class ShipmentsService {
     return this.mapShipmentCompanyClient(shipment);
   }
 
+  async updateShipment(shipmentId: string, input: UpdateShipmentDto) {
+    const existingShipment = await this.ensureShipmentExists(shipmentId);
+
+    const organizationId = existingShipment.organizationId;
+    const normalizedInput: CreateShipmentDto = {
+      organizationId,
+      shipmentMode: input.shipmentMode ?? existingShipment.shipmentMode,
+      shipmentType: input.shipmentType ?? existingShipment.shipmentType,
+      priority: input.priority ?? existingShipment.priority ?? undefined,
+      shipmentCode: input.shipmentCode ?? existingShipment.shipmentCode,
+      companyClientId:
+        input.shipmentMode === ShipmentMode.INTERNAL
+          ? undefined
+          : input.companyClientId !== undefined
+          ? input.companyClientId
+          : existingShipment.companyClientId ?? undefined,
+      sourceLocationId:
+        input.sourceLocationId !== undefined
+          ? input.sourceLocationId
+          : existingShipment.sourceLocationId ?? undefined,
+      destinationLocationId:
+        input.destinationLocationId !== undefined
+          ? input.destinationLocationId
+          : existingShipment.destinationLocationId ?? undefined,
+      plannedPickupAt:
+        input.plannedPickupAt !== undefined
+          ? input.plannedPickupAt
+          : existingShipment.plannedPickupAt?.toISOString(),
+      plannedDeliveryAt:
+        input.plannedDeliveryAt !== undefined
+          ? input.plannedDeliveryAt
+          : existingShipment.plannedDeliveryAt?.toISOString(),
+      invoiceNumber:
+        input.invoiceNumber !== undefined
+          ? input.invoiceNumber
+          : existingShipment.invoiceNumber ?? undefined,
+      invoiceDate:
+        input.invoiceDate !== undefined
+          ? input.invoiceDate
+          : existingShipment.invoiceDate?.toISOString(),
+      invoiceAmount:
+        input.invoiceAmount !== undefined
+          ? input.invoiceAmount
+          : existingShipment.invoiceAmount !== null &&
+              existingShipment.invoiceAmount !== undefined
+            ? Number(existingShipment.invoiceAmount)
+            : undefined,
+      internalSenderName:
+        input.internalSenderName !== undefined
+          ? input.internalSenderName
+          : existingShipment.internalSenderName ?? undefined,
+      internalSenderPhone:
+        input.internalSenderPhone !== undefined
+          ? input.internalSenderPhone
+          : existingShipment.internalSenderPhone ?? undefined,
+      internalSenderDepartment:
+        input.internalSenderDepartment !== undefined
+          ? input.internalSenderDepartment
+          : existingShipment.internalSenderDepartment ?? undefined,
+      internalReceiverName:
+        input.internalReceiverName !== undefined
+          ? input.internalReceiverName
+          : existingShipment.internalReceiverName ?? undefined,
+      internalReceiverPhone:
+        input.internalReceiverPhone !== undefined
+          ? input.internalReceiverPhone
+          : existingShipment.internalReceiverPhone ?? undefined,
+      internalReceiverDepartment:
+        input.internalReceiverDepartment !== undefined
+          ? input.internalReceiverDepartment
+          : existingShipment.internalReceiverDepartment ?? undefined,
+      notes:
+        input.notes !== undefined ? input.notes : existingShipment.notes ?? undefined,
+      adminFormData:
+        input.adminFormData !== undefined
+          ? input.adminFormData
+          : ((existingShipment.adminFormData as Record<string, unknown> | null) ?? undefined),
+      items: input.items,
+      stops: input.stops,
+      initialStatus:
+        input.initialStatus !== undefined
+          ? input.initialStatus
+          : existingShipment.status,
+      eventSource: input.eventSource ?? EventSource.API,
+    };
+
+    this.validateCreateShipmentInput(normalizedInput);
+
+    const shipment = await this.prisma.$transaction(async (tx) => {
+      if (input.items) {
+        await tx.shipmentItem.deleteMany({
+          where: {
+            shipmentId,
+          },
+        });
+      }
+
+      if (input.stops) {
+        await tx.shipmentStop.deleteMany({
+          where: {
+            shipmentId,
+          },
+        });
+      }
+
+      const updated = await tx.shipment.update({
+        where: { id: shipmentId },
+        data: {
+          companyClientId: normalizedInput.companyClientId ?? null,
+          shipmentMode: normalizedInput.shipmentMode,
+          shipmentCode: normalizedInput.shipmentCode,
+          shipmentType: normalizedInput.shipmentType,
+          priority: normalizedInput.priority ?? ShipmentPriority.MEDIUM,
+          sourceLocationId: normalizedInput.sourceLocationId ?? null,
+          destinationLocationId: normalizedInput.destinationLocationId ?? null,
+          plannedPickupAt: normalizedInput.plannedPickupAt
+            ? new Date(normalizedInput.plannedPickupAt)
+            : null,
+          plannedDeliveryAt: normalizedInput.plannedDeliveryAt
+            ? new Date(normalizedInput.plannedDeliveryAt)
+            : null,
+          invoiceNumber: normalizedInput.invoiceNumber ?? null,
+          invoiceDate: normalizedInput.invoiceDate
+            ? new Date(normalizedInput.invoiceDate)
+            : null,
+          invoiceAmount:
+            normalizedInput.invoiceAmount !== undefined
+              ? new Prisma.Decimal(normalizedInput.invoiceAmount)
+              : null,
+          internalSenderName: normalizedInput.internalSenderName ?? null,
+          internalSenderPhone: normalizedInput.internalSenderPhone ?? null,
+          internalSenderDepartment:
+            normalizedInput.internalSenderDepartment ?? null,
+          internalReceiverName: normalizedInput.internalReceiverName ?? null,
+          internalReceiverPhone: normalizedInput.internalReceiverPhone ?? null,
+          internalReceiverDepartment:
+            normalizedInput.internalReceiverDepartment ?? null,
+          notes: normalizedInput.notes ?? null,
+          adminFormData:
+            normalizedInput.adminFormData !== undefined
+              ? (normalizedInput.adminFormData as Prisma.InputJsonValue)
+              : Prisma.DbNull,
+          items: normalizedInput.items?.length
+            ? {
+                create: normalizedInput.items.map((item) => ({
+                  organizationId,
+                  description: item.description,
+                  quantity: new Prisma.Decimal(item.quantity),
+                  unit: item.unit,
+                  weight:
+                    item.weight !== undefined
+                      ? new Prisma.Decimal(item.weight)
+                      : undefined,
+                  volume:
+                    item.volume !== undefined
+                      ? new Prisma.Decimal(item.volume)
+                      : undefined,
+                  declaredValue:
+                    item.declaredValue !== undefined
+                      ? new Prisma.Decimal(item.declaredValue)
+                      : undefined,
+                })),
+              }
+            : input.items
+              ? undefined
+              : undefined,
+          stops: normalizedInput.stops?.length
+            ? {
+                create: normalizedInput.stops.map((stop) => ({
+                  organizationId,
+                  stopSequence: stop.stopSequence,
+                  stopType: stop.stopType,
+                  locationName: stop.locationName,
+                  addressLine1: stop.addressLine1,
+                  addressLine2: stop.addressLine2,
+                  city: stop.city,
+                  state: stop.state,
+                  postalCode: stop.postalCode,
+                  country: stop.country ?? 'India',
+                  plannedArrivalAt: stop.plannedArrivalAt
+                    ? new Date(stop.plannedArrivalAt)
+                    : undefined,
+                  plannedDepartureAt: stop.plannedDepartureAt
+                    ? new Date(stop.plannedDepartureAt)
+                    : undefined,
+                  status: StopStatus.PENDING,
+                })),
+              }
+            : input.stops
+              ? undefined
+              : undefined,
+          status:
+            input.initialStatus !== undefined
+              ? input.initialStatus
+              : existingShipment.status,
+        },
+        include: {
+          companyClient: true,
+          sourceLocation: true,
+          destinationLocation: true,
+          currentDriver: true,
+          currentVehicle: true,
+          items: true,
+          stops: {
+            orderBy: { stopSequence: 'asc' },
+          },
+          assignments: {
+            include: {
+              driver: true,
+              vehicle: true,
+            },
+            orderBy: { assignedAt: 'desc' },
+          },
+          statusEvents: {
+            include: {
+              driver: true,
+            },
+            orderBy: { eventTime: 'desc' },
+          },
+          trackingSessions: {
+            orderBy: { startedAt: 'desc' },
+          },
+          documents: {
+            orderBy: { uploadedAt: 'desc' },
+          },
+          proofOfDeliveries: {
+            orderBy: { capturedAt: 'desc' },
+          },
+        },
+      });
+
+      await tx.shipmentStatusEvent.create({
+        data: {
+          organizationId,
+          shipmentId,
+          eventType: 'shipment_updated',
+          fromStatus: existingShipment.status,
+          toStatus:
+            input.initialStatus !== undefined
+              ? input.initialStatus
+              : existingShipment.status,
+          source: normalizedInput.eventSource ?? EventSource.API,
+          notes: 'Shipment updated via API',
+          metadata: {
+            shipmentMode: normalizedInput.shipmentMode,
+            shipmentType: normalizedInput.shipmentType,
+            priority: normalizedInput.priority ?? ShipmentPriority.MEDIUM,
+          },
+        },
+      });
+
+      return updated;
+    });
+
+    return this.mapShipmentCompanyClient(shipment);
+  }
+
   async assignDriver(shipmentId: string, input: AssignDriverDto) {
     const shipment = await this.ensureShipmentExists(shipmentId);
     await this.ensureDriverExists(input.driverId, input.organizationId);
@@ -232,7 +503,7 @@ export class ShipmentsService {
       await this.ensureVehicleExists(input.vehicleId, input.organizationId);
     }
 
-    return this.prisma.$transaction(async (tx) => {
+    const result = await this.prisma.$transaction(async (tx) => {
       await tx.shipmentAssignment.updateMany({
         where: {
           shipmentId,
@@ -272,24 +543,32 @@ export class ShipmentsService {
         },
       });
 
-      await tx.shipmentStatusEvent.create({
-        data: {
-          organizationId: input.organizationId,
-          shipmentId,
-          driverId: input.driverId,
-          eventType: 'driver_assigned',
-          fromStatus: shipment.status,
-          toStatus: nextStatus,
-          source: EventSource.API,
-          notes: input.notes ?? 'Driver assigned to shipment',
-          metadata: {
-            vehicleId: input.vehicleId,
-          },
+      const event = {
+        organizationId: input.organizationId,
+        shipmentId,
+        driverId: input.driverId,
+        eventType: 'driver_assigned',
+        fromStatus: shipment.status,
+        toStatus: nextStatus,
+        source: EventSource.API,
+        notes: input.notes ?? 'Driver assigned to shipment',
+        metadata: {
+          vehicleId: input.vehicleId,
         },
+      };
+
+      await tx.shipmentStatusEvent.create({
+        data: event,
       });
 
-      return assignment;
+      return {
+        assignment,
+        orderEvent: this.toOrderEventMessage(event),
+      };
     });
+
+    await this.publishOrderEventSafe(result.orderEvent);
+    return result.assignment;
   }
 
   async startTrackingSession(
@@ -320,7 +599,7 @@ export class ShipmentsService {
       return activeSession;
     }
 
-    return this.prisma.$transaction(async (tx) => {
+    const result = await this.prisma.$transaction(async (tx) => {
       const trackingSession = await tx.trackingSession.create({
         data: {
           organizationId: input.organizationId,
@@ -343,24 +622,32 @@ export class ShipmentsService {
         },
       });
 
-      await tx.shipmentStatusEvent.create({
-        data: {
-          organizationId: input.organizationId,
-          shipmentId,
-          driverId: input.driverId,
-          eventType: 'tracking_started',
-          fromStatus: shipment.status,
-          toStatus: nextStatus,
-          source: EventSource.API,
-          notes: 'Tracking session started',
-          metadata: {
-            trackingSessionId: trackingSession.id,
-          },
+      const event = {
+        organizationId: input.organizationId,
+        shipmentId,
+        driverId: input.driverId,
+        eventType: 'tracking_started',
+        fromStatus: shipment.status,
+        toStatus: nextStatus,
+        source: EventSource.API,
+        notes: 'Tracking session started',
+        metadata: {
+          trackingSessionId: trackingSession.id,
         },
+      };
+
+      await tx.shipmentStatusEvent.create({
+        data: event,
       });
 
-      return trackingSession;
+      return {
+        trackingSession,
+        orderEvent: this.toOrderEventMessage(event),
+      };
     });
+
+    await this.publishOrderEventSafe(result.orderEvent);
+    return result.trackingSession;
   }
 
   async addTrackingPoint(shipmentId: string, input: CreateTrackingPointDto) {
@@ -487,7 +774,7 @@ export class ShipmentsService {
       );
     }
 
-    return this.prisma.$transaction(async (tx) => {
+    const result = await this.prisma.$transaction(async (tx) => {
       const proof = await tx.proofOfDelivery.create({
         data: {
           organizationId: input.organizationId,
@@ -502,30 +789,38 @@ export class ShipmentsService {
         },
       });
 
-      await tx.shipmentStatusEvent.create({
-        data: {
-          organizationId: input.organizationId,
-          shipmentId,
-          eventType:
-            input.proofType === ProofType.PICKUP
-              ? 'pickup_proof_uploaded'
-              : 'delivery_proof_uploaded',
-          fromStatus: shipment.status,
-          toStatus: shipment.status,
-          source: EventSource.API,
-          notes:
-            input.proofType === ProofType.PICKUP
-              ? 'Pickup proof recorded'
-              : 'Delivery proof recorded',
-          metadata: {
-            proofType: input.proofType,
-            proofId: proof.id,
-          },
+      const event = {
+        organizationId: input.organizationId,
+        shipmentId,
+        eventType:
+          input.proofType === ProofType.PICKUP
+            ? 'pickup_proof_uploaded'
+            : 'delivery_proof_uploaded',
+        fromStatus: shipment.status,
+        toStatus: shipment.status,
+        source: EventSource.API,
+        notes:
+          input.proofType === ProofType.PICKUP
+            ? 'Pickup proof recorded'
+            : 'Delivery proof recorded',
+        metadata: {
+          proofType: input.proofType,
+          proofId: proof.id,
         },
+      };
+
+      await tx.shipmentStatusEvent.create({
+        data: event,
       });
 
-      return proof;
+      return {
+        proof,
+        orderEvent: this.toOrderEventMessage(event),
+      };
     });
+
+    await this.publishOrderEventSafe(result.orderEvent);
+    return result.proof;
   }
 
   async planShipment(shipmentId: string, input: ShipmentStatusActionDto) {
@@ -814,7 +1109,7 @@ export class ShipmentsService {
       );
     }
 
-    return this.prisma.$transaction(async (tx) => {
+    const result = await this.prisma.$transaction(async (tx) => {
       await tx.shipment.update({
         where: { id: shipmentId },
         data: {
@@ -826,17 +1121,19 @@ export class ShipmentsService {
         await afterUpdate(tx);
       }
 
+      const event = {
+        organizationId,
+        shipmentId,
+        eventType: eventTypes[0],
+        fromStatus: shipment.status,
+        toStatus: nextStatus,
+        source: EventSource.API,
+        notes,
+        metadata,
+      };
+
       await tx.shipmentStatusEvent.create({
-        data: {
-          organizationId,
-          shipmentId,
-          eventType: eventTypes[0],
-          fromStatus: shipment.status,
-          toStatus: nextStatus,
-          source: EventSource.API,
-          notes,
-          metadata,
-        },
+        data: event,
       });
 
       const shipmentDetails = await tx.shipment.findUnique({
@@ -855,10 +1152,16 @@ export class ShipmentsService {
         },
       });
 
-      return shipmentDetails
-        ? this.mapShipmentCompanyClient(shipmentDetails)
-        : null;
+      return {
+        shipmentDetails: shipmentDetails
+          ? this.mapShipmentCompanyClient(shipmentDetails)
+          : null,
+        orderEvent: this.toOrderEventMessage(event),
+      };
     });
+
+    await this.publishOrderEventSafe(result.orderEvent);
+    return result.shipmentDetails;
   }
 
   private async closeTrackingSession(
@@ -957,5 +1260,31 @@ export class ShipmentsService {
       ...rest,
       companyClientCode: companyClientCode ?? null,
     };
+  }
+
+  private toOrderEventMessage(input: {
+    organizationId: string;
+    shipmentId: string;
+    eventType: string;
+    notes?: string | null;
+    fromStatus?: ShipmentStatus | null;
+    toStatus?: ShipmentStatus | null;
+    metadata?: Prisma.InputJsonValue;
+  }): OrderEventMessage {
+    return {
+      eventId: randomUUID(),
+      shipmentId: input.shipmentId,
+      organizationId: input.organizationId,
+      eventType: input.eventType,
+      notes: input.notes ?? null,
+      fromStatus: input.fromStatus ?? null,
+      toStatus: input.toStatus ?? null,
+      eventTime: new Date().toISOString(),
+      metadata: input.metadata,
+    };
+  }
+
+  private async publishOrderEventSafe(event: OrderEventMessage) {
+    await this.trackingEventBus.publishOrderEvent(event);
   }
 }

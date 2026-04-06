@@ -12,6 +12,7 @@ import {
   IsEnum,
   IsISO8601,
   IsNumber,
+  IsObject,
   IsOptional,
   IsString,
   IsUUID,
@@ -209,6 +210,15 @@ export class CreateShipmentDto {
   @IsOptional()
   @IsString()
   notes?: string;
+
+  @ApiPropertyOptional({
+    description:
+      'Full shipment wizard form payload for admin-facing UI fields that do not map to core shipment columns.',
+    type: Object,
+  })
+  @IsOptional()
+  @IsObject()
+  adminFormData?: Record<string, unknown>;
 
   @ApiPropertyOptional({ type: () => [CreateShipmentItemDto] })
   @IsOptional()

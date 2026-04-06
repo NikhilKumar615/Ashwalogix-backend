@@ -50,6 +50,44 @@ enum ClientStatus {
   INACTIVE
 }
 
+enum PlanStatus {
+  ACTIVE
+  INACTIVE
+}
+
+enum PlanBillingCycle {
+  MONTHLY
+  QUARTERLY
+  YEARLY
+  ONE_TIME
+  CUSTOM
+}
+
+enum SubscriptionStatus {
+  DRAFT
+  PENDING_PAYMENT
+  ACTIVE
+  PAST_DUE
+  SUSPENDED
+  CANCELLED
+  EXPIRED
+}
+
+enum SubscriptionPaymentStatus {
+  NOT_REQUIRED
+  PENDING
+  RECEIVED
+  WAIVED
+  FAILED
+}
+
+enum PaymentCollectionMethod {
+  NONE
+  MANUAL
+  OFFLINE
+  DEFERRED
+}
+
 enum DriverStatus {
   ACTIVE
   INACTIVE
@@ -211,7 +249,21 @@ enum ProofType {
 model Organization {
   id                   String                @id @default(uuid()) @db.Uuid
   name                 String
+  clientCode           String?               @map("client_code")
   legalName            String?               @map("legal_name")
+  companyType          String?               @map("company_type")
+  clientSegment        String?               @map("client_segment")
+  industry             String?
+  clientStatus         ClientStatus          @default(ACTIVE) @map("client_status")
+  tags                 String?
+  notes                String?
+  billingCycle         String?               @map("billing_cycle")
+  creditAccount        Boolean               @default(false) @map("credit_account")
+  priorityClient       Boolean               @default(true) @map("priority_client")
+  contactPerson        String?               @map("contact_person")
+  designation          String?
+  contactEmail         String?               @map("contact_email")
+  contactPhone         String?               @map("contact_phone")
   email                String?
   phone                String?
   gstNumber            String?               @map("gst_number")
@@ -231,8 +283,9 @@ model Organization {
   rejectedAt           DateTime?             @map("rejected_at")
   rejectedReason       String?               @map("rejected_reason")
   users                OrganizationUser[]
-  companyClients              CompanyClient[]
-  companyClientLocations      CompanyClientLocation[]
+  locations            OrganizationLocation[]
+  companyClients       CompanyClient[]
+  companyClientLocations CompanyClientLocation[]
   drivers              Driver[]
   vehicles             Vehicle[]
   warehouses           Warehouse[]
@@ -248,11 +301,36 @@ model Organization {
   trackingPoints       TrackingPoint[]
   documents            Document[]
   proofOfDeliveries    ProofOfDelivery[]
+  subscriptions        OrganizationSubscription[]
   independentDriverRegistrations IndependentDriverRegistration[]
   createdAt            DateTime              @default(now()) @map("created_at")
   updatedAt            DateTime              @updatedAt @map("updated_at")
 
+  @@index([clientCode])
   @@map("organizations")
+}
+
+model OrganizationLocation {
+  id               String        @id @default(uuid()) @db.Uuid
+  organizationId   String        @map("organization_id") @db.Uuid
+  locationType     String        @map("location_type")
+  name             String
+  addressLine1     String        @map("address_line_1")
+  addressLine2     String?       @map("address_line_2")
+  city             String?
+  state            String?
+  postalCode       String?       @map("postal_code")
+  country          String?       @default("India")
+  gstin            String?
+  contactPhone     String?       @map("contact_phone")
+  isPrimary        Boolean       @default(false) @map("is_primary")
+  organization     Organization  @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  createdAt        DateTime      @default(now()) @map("created_at")
+  updatedAt        DateTime      @updatedAt @map("updated_at")
+
+  @@index([organizationId])
+  @@index([organizationId, isPrimary])
+  @@map("organization_locations")
 }
 
 model User {
@@ -266,6 +344,9 @@ model User {
   emailVerifiedAt     DateTime?          @map("email_verified_at")
   verificationToken   String?            @unique @map("verification_token")
   verificationTokenExpiresAt DateTime?   @map("verification_token_expires_at")
+  loginOtpHash        String?            @map("login_otp_hash")
+  loginOtpExpiresAt   DateTime?          @map("login_otp_expires_at")
+  loginOtpRequestedAt DateTime?          @map("login_otp_requested_at")
   resetPasswordToken  String?            @unique @map("reset_password_token")
   resetPasswordTokenExpiresAt DateTime?  @map("reset_password_token_expires_at")
   approvedAt          DateTime?          @map("approved_at")
@@ -275,11 +356,201 @@ model User {
   lastLoginAt         DateTime?          @map("last_login_at")
   organizationMembers OrganizationUser[]
   driverProfile       Driver?
+  platformSettingsRevisions PlatformSettingsRevision[]
+  createdOrganizationSubscriptions OrganizationSubscription[] @relation("OrganizationSubscriptionCreatedByUser")
   approvedIndependentDriverRegistrations IndependentDriverRegistration[] @relation("IndependentDriverApprovedByUser")
   createdAt           DateTime           @default(now()) @map("created_at")
   updatedAt           DateTime           @updatedAt @map("updated_at")
 
   @@map("users")
+}
+
+model PlatformSettingsRevision {
+  id              String    @id
+  updatedByUserId String?   @map("updated_by_user_id") @db.Uuid
+  updatedByUser   User?     @relation(fields: [updatedByUserId], references: [id], onDelete: SetNull)
+  createdAt       DateTime  @default(now()) @map("created_at")
+  updatedAt       DateTime  @updatedAt @map("updated_at")
+
+  @@index([updatedByUserId])
+  @@map("platform_settings_revisions")
+}
+
+model PlatformIdentitySetting {
+  id            String   @id
+  platformName  String   @map("platform_name")
+  supportEmail  String?  @map("support_email")
+  supportPhone  String?  @map("support_phone")
+  timezone      String   @default("Asia/Kolkata")
+  currency      String   @default("INR")
+  language      String   @default("English")
+  dateFormat    String   @default("DD-MM-YYYY") @map("date_format")
+  regionalNote  String?  @map("regional_note")
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+
+  @@map("platform_identity_settings")
+}
+
+model TenantGovernanceSetting {
+  id                           String   @id
+  autoApproval                 Boolean  @default(false) @map("auto_approval")
+  requireDocumentVerification  Boolean  @default(true) @map("require_document_verification")
+  tenantLimitPolicy            String   @default("Standard") @map("tenant_limit_policy")
+  approvalWorkflow             String   @default("Two-step approval") @map("approval_workflow")
+  tenantOperationalLimit       String?  @map("tenant_operational_limit")
+  tenantReviewNote             String?  @map("tenant_review_note")
+  createdAt                    DateTime @default(now()) @map("created_at")
+  updatedAt                    DateTime @updatedAt @map("updated_at")
+
+  @@map("tenant_governance_settings")
+}
+
+model SubscriptionPlan {
+  id                 String                   @id @default(uuid()) @db.Uuid
+  code               String                   @unique
+  name               String
+  description        String?
+  priceAmount        Decimal                  @map("price_amount") @db.Decimal(12, 2)
+  currency           String                   @default("INR")
+  billingCycle       PlanBillingCycle         @default(MONTHLY) @map("billing_cycle")
+  tenantCap          Int?                     @map("tenant_cap")
+  shipmentCapPerDay  Int?                     @map("shipment_cap_per_day")
+  graceDays          Int?                     @map("grace_days")
+  sortOrder          Int                      @default(0) @map("sort_order")
+  status             PlanStatus               @default(ACTIVE)
+  isDefault          Boolean                  @default(false) @map("is_default")
+  metadata           Json?
+  billingDefaults    BillingSetting[]         @relation("BillingDefaultPlan")
+  subscriptions      OrganizationSubscription[]
+  createdAt          DateTime                 @default(now()) @map("created_at")
+  updatedAt          DateTime                 @updatedAt @map("updated_at")
+
+  @@index([status])
+  @@index([isDefault])
+  @@index([sortOrder])
+  @@map("subscription_plans")
+}
+
+model BillingSetting {
+  id                               String                  @id
+  defaultInvoicePrefix             String                  @default("ALX") @map("default_invoice_prefix")
+  billingGraceDays                 Int                     @default(7) @map("billing_grace_days")
+  taxMode                          String                  @default("GST inclusive") @map("tax_mode")
+  defaultPlanId                    String?                 @map("default_plan_id") @db.Uuid
+  defaultPaymentCollectionMethod   PaymentCollectionMethod @default(MANUAL) @map("default_payment_collection_method")
+  allowManualActivationWithoutPayment Boolean             @default(true) @map("allow_manual_activation_without_payment")
+  defaultPlan                      SubscriptionPlan?       @relation("BillingDefaultPlan", fields: [defaultPlanId], references: [id], onDelete: SetNull)
+  createdAt                        DateTime                @default(now()) @map("created_at")
+  updatedAt                        DateTime                @updatedAt @map("updated_at")
+
+  @@index([defaultPlanId])
+  @@map("billing_settings")
+}
+
+model NotificationSetting {
+  id                        String   @id
+  emailShipmentAlerts       Boolean  @default(true) @map("email_shipment_alerts")
+  emailDelayAlerts          Boolean  @default(true) @map("email_delay_alerts")
+  emailDeliveryAlerts       Boolean  @default(true) @map("email_delivery_alerts")
+  smsShipmentAlerts         Boolean  @default(false) @map("sms_shipment_alerts")
+  whatsappDelayAlerts       Boolean  @default(true) @map("whatsapp_delay_alerts")
+  whatsappDeliveryAlerts    Boolean  @default(false) @map("whatsapp_delivery_alerts")
+  notificationTemplateName  String?  @map("notification_template_name")
+  notificationTemplateBody  String?  @map("notification_template_body")
+  createdAt                 DateTime @default(now()) @map("created_at")
+  updatedAt                 DateTime @updatedAt @map("updated_at")
+
+  @@map("notification_settings")
+}
+
+model SecuritySetting {
+  id                    String   @id
+  sessionTimeoutMinutes Int      @default(45) @map("session_timeout_minutes")
+  maxLoginAttempts      Int      @default(5) @map("max_login_attempts")
+  passwordMinLength     Int      @default(10) @map("password_min_length")
+  requireUppercase      Boolean  @default(true) @map("require_uppercase")
+  requireNumbers        Boolean  @default(true) @map("require_numbers")
+  requireSpecialChars   Boolean  @default(true) @map("require_special_chars")
+  allowRememberMe       Boolean  @default(false) @map("allow_remember_me")
+  createdAt             DateTime @default(now()) @map("created_at")
+  updatedAt             DateTime @updatedAt @map("updated_at")
+
+  @@map("security_settings")
+}
+
+model IntegrationSetting {
+  id                String   @id
+  mapsProvider      String   @default("Google Maps") @map("maps_provider")
+  mapsApiKey        String?  @map("maps_api_key")
+  messagingProvider String   @default("Twilio") @map("messaging_provider")
+  messagingApiKey   String?  @map("messaging_api_key")
+  externalApiEnabled Boolean @default(false) @map("external_api_enabled")
+  externalApiBaseUrl String? @map("external_api_base_url")
+  externalApiKey    String?  @map("external_api_key")
+  createdAt         DateTime @default(now()) @map("created_at")
+  updatedAt         DateTime @updatedAt @map("updated_at")
+
+  @@map("integration_settings")
+}
+
+model BrandingSetting {
+  id                  String   @id
+  logoFile            String?  @map("logo_file")
+  brandPrimaryColor   String   @default("#7C3AED") @map("brand_primary_color")
+  brandSecondaryColor String   @default("#1447E6") @map("brand_secondary_color")
+  brandTagline        String?  @map("brand_tagline")
+  createdAt           DateTime @default(now()) @map("created_at")
+  updatedAt           DateTime @updatedAt @map("updated_at")
+
+  @@map("branding_settings")
+}
+
+model SystemSetting {
+  id                        String   @id
+  tenantIdPattern           String   @default("TEN-{YYYY}-{SEQ4}") @map("tenant_id_pattern")
+  shipmentIdPattern         String   @default("SHP-{YYYYMMDD}-{SEQ6}") @map("shipment_id_pattern")
+  dataRetentionDays         Int      @default(365) @map("data_retention_days")
+  auditRetentionDays        Int      @default(730) @map("audit_retention_days")
+  enableDriverMarketplace   Boolean  @default(true) @map("enable_driver_marketplace")
+  enableSmartTracking       Boolean  @default(true) @map("enable_smart_tracking")
+  enableExperimentalBilling Boolean  @default(false) @map("enable_experimental_billing")
+  createdAt                 DateTime @default(now()) @map("created_at")
+  updatedAt                 DateTime @updatedAt @map("updated_at")
+
+  @@map("system_settings")
+}
+
+model OrganizationSubscription {
+  id                      String                    @id @default(uuid()) @db.Uuid
+  organizationId          String                    @map("organization_id") @db.Uuid
+  planId                  String                    @map("plan_id") @db.Uuid
+  status                  SubscriptionStatus        @default(DRAFT)
+  paymentStatus           SubscriptionPaymentStatus @default(PENDING) @map("payment_status")
+  paymentCollectionMethod PaymentCollectionMethod   @default(MANUAL) @map("payment_collection_method")
+  billingAmount           Decimal                   @map("billing_amount") @db.Decimal(12, 2)
+  billingCurrency         String                    @default("INR") @map("billing_currency")
+  startsAt                DateTime?                 @map("starts_at")
+  renewsAt                DateTime?                 @map("renews_at")
+  endsAt                  DateTime?                 @map("ends_at")
+  graceEndsAt             DateTime?                 @map("grace_ends_at")
+  activatedAt             DateTime?                 @map("activated_at")
+  isCurrent               Boolean                   @default(true) @map("is_current")
+  notes                   String?
+  metadata                Json?
+  createdByUserId         String?                   @map("created_by_user_id") @db.Uuid
+  organization            Organization              @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  plan                    SubscriptionPlan          @relation(fields: [planId], references: [id], onDelete: Restrict)
+  createdByUser           User?                     @relation("OrganizationSubscriptionCreatedByUser", fields: [createdByUserId], references: [id], onDelete: SetNull)
+  createdAt               DateTime                  @default(now()) @map("created_at")
+  updatedAt               DateTime                  @updatedAt @map("updated_at")
+
+  @@index([organizationId])
+  @@index([planId])
+  @@index([createdByUserId])
+  @@index([organizationId, isCurrent])
+  @@index([status])
+  @@map("organization_subscriptions")
 }
 
 model OrganizationUser {
@@ -535,6 +806,7 @@ model Shipment {
   internalReceiverPhone String?              @map("internal_receiver_phone")
   internalReceiverDepartment String?         @map("internal_receiver_department")
   notes                String?
+  adminFormData        Json?                 @map("admin_form_data")
   organization         Organization          @relation(fields: [organizationId], references: [id], onDelete: Cascade)
   companyClient        CompanyClient?        @relation(fields: [companyClientId], references: [id], onDelete: Restrict)
   sourceLocation       CompanyClientLocation?       @relation("ShipmentSourceLocation", fields: [sourceLocationId], references: [id], onDelete: SetNull)

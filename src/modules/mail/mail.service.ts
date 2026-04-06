@@ -68,6 +68,26 @@ export class MailService {
     });
   }
 
+  async sendSuperAdminOtpEmail(input: {
+    to: string;
+    fullName: string;
+    otp: string;
+    expiresInMinutes: number;
+  }) {
+    await this.sendEmail({
+      to: input.to,
+      subject: 'Your Ashwa Logix super admin OTP',
+      html: this.wrapTemplate({
+        title: 'Super admin sign-in verification',
+        intro: `Hello ${this.escape(input.fullName)},`,
+        body: `Use this one-time password to finish signing in: <strong style="font-size:24px;letter-spacing:6px;">${this.escape(input.otp)}</strong><br/><br/>This code expires in ${input.expiresInMinutes} minutes.`,
+        footer:
+          'If you did not attempt to sign in, you can ignore this email and review your account access.',
+      }),
+      text: `Hello ${input.fullName}, your Ashwa Logix super admin OTP is ${input.otp}. It expires in ${input.expiresInMinutes} minutes.`,
+    });
+  }
+
   async sendOrganizationApprovedEmail(input: {
     to: string;
     fullName: string;

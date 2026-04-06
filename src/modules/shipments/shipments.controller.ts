@@ -5,10 +5,11 @@ import {
   Get,
   NotFoundException,
   Param,
+  Patch,
   Post,
   Query,
 } from '@nestjs/common';
-import { OrganizationRole, ShipmentStatus } from '@prisma/client';
+import { OrganizationRole, PlatformRole, ShipmentStatus } from '@prisma/client';
 import {
   ApiBearerAuth,
   ApiBody,
@@ -30,6 +31,7 @@ import { CreateTrackingPointDto } from './dto/create-tracking-point.dto';
 import { FailShipmentDto } from './dto/fail-shipment.dto';
 import { ShipmentStatusActionDto } from './dto/shipment-status-action.dto';
 import { StartTrackingSessionDto } from './dto/start-tracking-session.dto';
+import { UpdateShipmentDto } from './dto/update-shipment.dto';
 import { ShipmentsService } from './shipments.service';
 
 @ApiTags('Shipments')
@@ -68,7 +70,10 @@ export class ShipmentsController {
 
     return this.shipmentsService.listShipments({
       organizationId,
-      organizationIds: organizationId ? undefined : user.organizationIds,
+      organizationIds:
+        organizationId || user.platformRole === PlatformRole.SUPER_ADMIN
+          ? undefined
+          : user.organizationIds,
       status,
     });
   }
@@ -124,6 +129,31 @@ export class ShipmentsController {
     );
 
     return this.shipmentsService.createShipment(body);
+  }
+
+  @Patch(':id')
+  @ApiOperation({ summary: 'Update a shipment' })
+  @ApiParam({ name: 'id', type: String })
+  @ApiBody({ type: UpdateShipmentDto })
+  @Roles(
+    OrganizationRole.ORG_ADMIN,
+    OrganizationRole.DISPATCHER,
+    OrganizationRole.OPERATIONS,
+  )
+  async updateShipment(
+    @Param('id') shipmentId: string,
+    @Body() body: UpdateShipmentDto,
+    @CurrentUser() user: JwtPayload,
+  ) {
+    await this.authorizationService.assertShipmentAccess(user, shipmentId, {
+      allowedOrganizationRoles: [
+        OrganizationRole.ORG_ADMIN,
+        OrganizationRole.DISPATCHER,
+        OrganizationRole.OPERATIONS,
+      ],
+    });
+
+    return this.shipmentsService.updateShipment(shipmentId, body);
   }
 
   @Post(':id/assign-driver')
