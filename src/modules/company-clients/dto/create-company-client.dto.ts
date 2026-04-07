@@ -1,6 +1,6 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { ClientStatus } from '@prisma/client';
-import { IsEnum, IsOptional, IsString } from 'class-validator';
+import { IsBoolean, IsEmail, IsEnum, IsOptional, IsString } from 'class-validator';
 
 export class CreateCompanyClientDto {
   @ApiProperty({ description: 'Business-facing code for this company client' })
@@ -15,6 +15,11 @@ export class CreateCompanyClientDto {
   @IsOptional()
   @IsString()
   legalName?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  companyType?: string;
 
   @ApiPropertyOptional()
   @IsOptional()
@@ -39,7 +44,37 @@ export class CreateCompanyClientDto {
   @ApiPropertyOptional()
   @IsOptional()
   @IsString()
+  billingCycle?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsBoolean()
+  creditAccount?: boolean;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
   creditTerms?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  contactPerson?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  designation?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsEmail()
+  contactEmail?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  contactPhone?: string;
 
   @ApiPropertyOptional()
   @IsOptional()

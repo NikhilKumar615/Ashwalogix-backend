@@ -425,7 +425,19 @@ export class AuthService {
       include: {
         organizationMembers: {
           include: {
-            organization: true,
+            organization: {
+              include: {
+                locations: {
+                  orderBy: [{ isPrimary: 'desc' }, { createdAt: 'asc' }],
+                },
+                subscriptions: {
+                  where: { isCurrent: true },
+                  include: { plan: true },
+                  orderBy: { createdAt: 'desc' },
+                  take: 1,
+                },
+              },
+            },
           },
         },
       },
@@ -439,6 +451,7 @@ export class AuthService {
       id: user.id,
       fullName: user.fullName,
       email: user.email,
+      phone: user.phone,
       platformRole: user.platformRole,
       status: user.status,
       emailVerifiedAt: user.emailVerifiedAt,
@@ -449,6 +462,37 @@ export class AuthService {
         organizationStatus: membership.organization.status,
         role: membership.role,
         membershipStatus: membership.status,
+        organization: {
+          id: membership.organization.id,
+          name: membership.organization.name,
+          clientCode: membership.organization.clientCode,
+          legalName: membership.organization.legalName,
+          companyType: membership.organization.companyType,
+          clientSegment: membership.organization.clientSegment,
+          industry: membership.organization.industry,
+          clientStatus: membership.organization.clientStatus,
+          billingCycle: membership.organization.billingCycle,
+          creditAccount: membership.organization.creditAccount,
+          priorityClient: membership.organization.priorityClient,
+          contactPerson: membership.organization.contactPerson,
+          designation: membership.organization.designation,
+          contactEmail: membership.organization.contactEmail,
+          contactPhone: membership.organization.contactPhone,
+          email: membership.organization.email,
+          phone: membership.organization.phone,
+          gstNumber: membership.organization.gstNumber,
+          panNumber: membership.organization.panNumber,
+          cinNumber: membership.organization.cinNumber,
+          addressLine1: membership.organization.addressLine1,
+          addressLine2: membership.organization.addressLine2,
+          city: membership.organization.city,
+          state: membership.organization.state,
+          postalCode: membership.organization.postalCode,
+          country: membership.organization.country,
+          status: membership.organization.status,
+          locations: membership.organization.locations,
+          subscription: membership.organization.subscriptions[0] ?? null,
+        },
       })),
     };
   }

@@ -9,6 +9,7 @@ generator client {
 
 datasource db {
   provider = "postgresql"
+
 }
 
 enum OrganizationStatus {
@@ -577,11 +578,18 @@ model CompanyClient {
   companyClientCode  String           @map("company_client_code")
   name               String
   legalName          String?          @map("legal_name")
+  companyType        String?          @map("company_type")
   industry           String?
   status             ClientStatus     @default(ACTIVE)
   pan                String?
   gstin              String?
+  billingCycle       String?          @map("billing_cycle")
+  creditAccount      Boolean          @default(false) @map("credit_account")
   creditTerms        String?          @map("credit_terms")
+  contactPerson      String?          @map("contact_person")
+  designation        String?
+  contactEmail       String?          @map("contact_email")
+  contactPhone       String?          @map("contact_phone")
   notes              String?
   organization       Organization     @relation(fields: [organizationId], references: [id], onDelete: Cascade)
   locations          CompanyClientLocation[]

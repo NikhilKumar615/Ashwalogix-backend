@@ -37,19 +37,20 @@ export class CompanyClientsService {
     organizationId: string,
     input: CreateCompanyClientDto,
   ) {
+    const companyClientCode =
+      input.companyClientCode?.trim() ||
+      (await this.generateCompanyClientCode(organizationId));
+
+    const normalizedInput = this.normalizeCompanyClientInput(input);
+    const { companyClientCode: _ignoredCompanyClientCode, ...createData } =
+      normalizedInput;
+
     const companyClient = await this.prisma.companyClient.create({
       data: {
         organizationId,
-        companyClientCode: input.companyClientCode,
-        name: input.name,
-        legalName: input.legalName,
-        industry: input.industry,
-        status: input.status ?? ClientStatus.ACTIVE,
-        pan: input.pan,
-        gstin: input.gstin,
-        creditTerms: input.creditTerms,
-        notes: input.notes,
-      },
+        companyClientCode,
+        ...createData,
+      } as Prisma.CompanyClientUncheckedCreateInput,
     });
 
     return this.mapCompanyClientResponse(companyClient);
@@ -89,9 +90,12 @@ export class CompanyClientsService {
   ) {
     await this.ensureCompanyClientExists(organizationId, companyClientId);
 
+    const normalizedInput =
+      this.normalizeCompanyClientInput(input);
+
     const companyClient = await this.prisma.companyClient.update({
       where: { id: companyClientId },
-      data: input,
+      data: normalizedInput as Prisma.CompanyClientUncheckedUpdateInput,
     });
 
     return this.mapCompanyClientResponse(companyClient);
@@ -237,5 +241,79 @@ export class CompanyClientsService {
       ...rest,
       companyClientCode: companyClientCode ?? null,
     };
+  }
+
+  private normalizeCompanyClientInput(
+    input: CreateCompanyClientDto | UpdateCompanyClientDto,
+  ) {
+    const normalizedEmail =
+      input.contactEmail === undefined
+        ? undefined
+        : input.contactEmail
+            ? input.contactEmail.toLowerCase()
+            : null;
+
+    return {
+      companyClientCode:
+        input.companyClientCode === undefined
+          ? undefined
+          : input.companyClientCode.trim(),
+      name: input.name === undefined ? undefined : input.name.trim(),
+      legalName:
+        input.legalName === undefined ? undefined : input.legalName || null,
+      companyType:
+        input.companyType === undefined ? undefined : input.companyType || null,
+      industry: input.industry === undefined ? undefined : input.industry || null,
+      status: input.status === undefined ? undefined : input.status,
+      pan: input.pan === undefined ? undefined : input.pan || null,
+      gstin: input.gstin === undefined ? undefined : input.gstin || null,
+      billingCycle:
+        input.billingCycle === undefined ? undefined : input.billingCycle || null,
+      creditAccount:
+        input.creditAccount === undefined ? undefined : input.creditAccount,
+      creditTerms:
+        input.creditTerms === undefined ? undefined : input.creditTerms || null,
+      contactPerson:
+        input.contactPerson === undefined ? undefined : input.contactPerson || null,
+      designation:
+        input.designation === undefined ? undefined : input.designation || null,
+      contactEmail: normalizedEmail,
+      contactPhone:
+        input.contactPhone === undefined ? undefined : input.contactPhone || null,
+      notes: input.notes === undefined ? undefined : input.notes || null,
+    };
+  }
+
+  private async generateCompanyClientCode(organizationId: string) {
+    const organization = await this.prisma.organization.findUnique({
+      where: { id: organizationId },
+      select: { name: true },
+    });
+
+    if (!organization) {
+      throw new NotFoundException('Organization not found');
+    }
+
+    const year = new Date().getFullYear();
+    const startOfYear = new Date(Date.UTC(year, 0, 1));
+    const startOfNextYear = new Date(Date.UTC(year + 1, 0, 1));
+
+    const count = await this.prisma.companyClient.count({
+      where: {
+        organizationId,
+        createdAt: {
+          gte: startOfYear,
+          lt: startOfNextYear,
+        },
+      },
+    });
+
+    const sequence = String(count + 1).padStart(3, '0');
+    const organizationCode = organization.name
+      .toUpperCase()
+      .replace(/[^A-Z0-9]/g, '')
+      .slice(0, 3);
+
+    return `${organizationCode || 'ORG'}-${year}-${sequence}`;
   }
 }
