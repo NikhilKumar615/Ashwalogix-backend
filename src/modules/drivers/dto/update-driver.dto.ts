@@ -12,11 +12,6 @@ export class UpdateDriverDto {
   @ApiPropertyOptional()
   @IsOptional()
   @IsString()
-  driverCode?: string;
-
-  @ApiPropertyOptional()
-  @IsOptional()
-  @IsString()
   fullName?: string;
 
   @ApiPropertyOptional()

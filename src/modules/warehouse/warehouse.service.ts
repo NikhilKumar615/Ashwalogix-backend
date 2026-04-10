@@ -6,6 +6,11 @@ import {
   WarehouseStatus,
 } from '@prisma/client';
 import { PrismaService } from '../../shared/prisma/prisma.service';
+import {
+  buildBusinessPrefix,
+  formatNumericCode,
+  parseNumericCodeSequence,
+} from '../../shared/codes/entity-code.util';
 import { CreateInventoryItemDto } from './dto/create-inventory-item.dto';
 import { CreateInventoryMovementDto } from './dto/create-inventory-movement.dto';
 import { CreateWarehouseDto } from './dto/create-warehouse.dto';
@@ -27,10 +32,12 @@ export class WarehouseService {
   }
 
   async createWarehouse(organizationId: string, input: CreateWarehouseDto) {
+    const warehouseCode = await this.generateWarehouseCode(organizationId);
+
     return this.prisma.warehouse.create({
       data: {
         organizationId,
-        warehouseCode: input.warehouseCode,
+        warehouseCode,
         name: input.name,
         addressLine1: input.addressLine1,
         addressLine2: input.addressLine2,
@@ -42,6 +49,34 @@ export class WarehouseService {
         notes: input.notes,
       },
     });
+  }
+
+  private async generateWarehouseCode(organizationId: string) {
+    const organization = await this.prisma.organization.findUnique({
+      where: { id: organizationId },
+      select: { name: true },
+    });
+
+    if (!organization) {
+      throw new NotFoundException('Organization not found');
+    }
+
+    const prefix = buildBusinessPrefix(organization.name);
+    const existingCodes = await this.prisma.warehouse.findMany({
+      where: { organizationId },
+      select: { warehouseCode: true },
+    });
+    const nextSequence =
+      existingCodes.reduce((highest, warehouse) => {
+        const sequence = parseNumericCodeSequence(
+          warehouse.warehouseCode,
+          prefix,
+          'WAR',
+        );
+        return sequence !== null && sequence > highest ? sequence : highest;
+      }, 0) + 1;
+
+    return formatNumericCode(prefix, 'WAR', nextSequence);
   }
 
   async getWarehouseById(organizationId: string, warehouseId: string) {

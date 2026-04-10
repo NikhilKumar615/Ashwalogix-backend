@@ -2,6 +2,7 @@ import {
   BadRequestException,
   ForbiddenException,
   Injectable,
+  Logger,
   UnauthorizedException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
@@ -26,6 +27,14 @@ import {
 import { compare, hash } from 'bcryptjs';
 import { randomInt, randomUUID } from 'crypto';
 import { PrismaService } from '../../shared/prisma/prisma.service';
+import {
+  formatIndependentDriverCode,
+  formatPlatformClientCode,
+  isIndependentDriverCode,
+  isPlatformClientCode,
+  parseIndependentDriverCodeSequence,
+  parsePlatformClientCodeSequence,
+} from '../../shared/codes/entity-code.util';
 import { MailService } from '../mail/mail.service';
 import { CreateClientOrganizationDto } from './dto/create-client-organization.dto';
 import { LoginDto } from './dto/login.dto';
@@ -39,6 +48,9 @@ import { JwtPayload } from './interfaces/jwt-payload.interface';
 
 @Injectable()
 export class AuthService {
+  private readonly logger = new Logger(AuthService.name);
+  private independentDriverCodeColumnAvailable: boolean | null = null;
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly jwtService: JwtService,
@@ -86,6 +98,7 @@ export class AuthService {
 
       const organization = await tx.organization.create({
         data: {
+          clientCode: await this.generateOrganizationClientCode(tx),
           name: input.organizationName,
           legalName: input.legalName,
           email: input.organizationEmail,
@@ -169,8 +182,10 @@ export class AuthService {
       );
     }
 
-    return this.prisma.independentDriverRegistration.create({
-      data: {
+    return this.prisma.$transaction(async (tx) => {
+      const driverCode = await this.generateIndependentDriverCode(tx);
+
+      const baseData = {
         fullName: input.fullName,
         phone: input.phone,
         email: input.email?.toLowerCase(),
@@ -201,8 +216,37 @@ export class AuthService {
         fuelType: input.fuelType,
         uploadedDocuments:
           input.uploadedDocuments as unknown as Prisma.InputJsonValue,
-        status: 'PENDING_APPROVAL',
-      },
+        status: 'PENDING_APPROVAL' as const,
+      };
+
+      try {
+        const registration = await tx.independentDriverRegistration.create({
+          data: {
+            ...baseData,
+            driverCode,
+          },
+        });
+        this.independentDriverCodeColumnAvailable = true;
+        return registration;
+      } catch (error) {
+        if (!this.isIndependentDriverCodeColumnMissing(error)) {
+          throw error;
+        }
+
+        this.independentDriverCodeColumnAvailable = false;
+        this.logger.warn(
+          'independent_driver_registrations.driver_code is missing in the database. Falling back to legacy registration mode.',
+        );
+
+        const registration = await tx.independentDriverRegistration.create({
+          data: baseData,
+        });
+
+        return {
+          ...registration,
+          driverCode: null,
+        };
+      }
     });
   }
 
@@ -420,6 +464,8 @@ export class AuthService {
   }
 
   async getCurrentUser(userId: string) {
+    await this.normalizeOrganizationClientCodes();
+
     const user = await this.prisma.user.findUnique({
       where: { id: userId },
       include: {
@@ -498,6 +544,8 @@ export class AuthService {
   }
 
   async getPendingOrganizations() {
+    await this.normalizeOrganizationClientCodes();
+
     return this.prisma.organization.findMany({
       where: {
         status: OrganizationStatus.PENDING_APPROVAL,
@@ -528,6 +576,8 @@ export class AuthService {
   }
 
   async getApprovedOrganizations() {
+    await this.normalizeOrganizationClientCodes();
+
     return this.prisma.organization.findMany({
       where: {
         status: OrganizationStatus.ACTIVE,
@@ -593,7 +643,7 @@ export class AuthService {
       const organization = await tx.organization.create({
         data: {
           name: input.organizationName,
-          clientCode: this.generateClientCode(input.organizationName),
+          clientCode: await this.generateOrganizationClientCode(tx),
           legalName: input.legalName,
           companyType: input.companyType,
           clientSegment: input.clientSegment,
@@ -813,6 +863,12 @@ export class AuthService {
   }
 
   async getPendingIndependentDrivers() {
+    await this.normalizeIndependentDriverCodes();
+
+    if (this.independentDriverCodeColumnAvailable === false) {
+      return this.listIndependentDriversWithoutCodeColumn();
+    }
+
     return this.prisma.independentDriverRegistration.findMany({
       where: {
         status: IndependentDriverRegistrationStatus.PENDING_APPROVAL,
@@ -822,6 +878,14 @@ export class AuthService {
   }
 
   async getIndependentDriverRegistration(registrationId: string) {
+    await this.normalizeIndependentDriverCodes();
+
+    if (this.independentDriverCodeColumnAvailable === false) {
+      return this.getIndependentDriverRegistrationWithoutCodeColumn(
+        registrationId,
+      );
+    }
+
     const registration =
       await this.prisma.independentDriverRegistration.findUnique({
         where: { id: registrationId },
@@ -890,7 +954,10 @@ export class AuthService {
       await tx.organization.update({
         where: { id: organizationId },
         data: {
-          clientCode: organization.clientCode ?? this.generateClientCode(organization.name),
+          clientCode:
+            organization.clientCode && isPlatformClientCode(organization.clientCode)
+              ? organization.clientCode
+              : await this.generateOrganizationClientCode(tx, approvedAt),
           status: OrganizationStatus.ACTIVE,
           approvedAt,
           approvedByUserId: approverUserId,
@@ -1395,13 +1462,241 @@ export class AuthService {
     return new Date(startsAt.getTime() + graceDays * 24 * 60 * 60 * 1000);
   }
 
-  private generateClientCode(name: string) {
-    const prefix = name
-      .toUpperCase()
-      .replace(/[^A-Z0-9]+/g, '')
-      .slice(0, 2);
+  private async generateOrganizationClientCode(
+    tx: Prisma.TransactionClient,
+    referenceDate = new Date(),
+  ) {
+    const year = referenceDate.getUTCFullYear();
+    const startOfYear = new Date(Date.UTC(year, 0, 1));
+    const startOfNextYear = new Date(Date.UTC(year + 1, 0, 1));
+    const organizations = await tx.organization.findMany({
+      where: {
+        createdAt: {
+          gte: startOfYear,
+          lt: startOfNextYear,
+        },
+      },
+      select: { clientCode: true },
+    });
 
-    return `LW-${prefix || 'CL'}${Date.now().toString().slice(-4)}`;
+    const nextSequence =
+      organizations.reduce((highest, organization) => {
+        const sequence = parsePlatformClientCodeSequence(
+          organization.clientCode || '',
+          year,
+        );
+        return sequence !== null && sequence > highest ? sequence : highest;
+      }, -1) + 1;
+
+    return formatPlatformClientCode(year, nextSequence);
+  }
+
+  private async generateIndependentDriverCode(tx: Prisma.TransactionClient) {
+    const registrations = await tx.independentDriverRegistration.findMany({
+      select: { driverCode: true },
+    });
+    const nextSequence =
+      registrations.reduce((highest, registration) => {
+        const sequence = parseIndependentDriverCodeSequence(
+          registration.driverCode || '',
+        );
+        return sequence !== null && sequence > highest ? sequence : highest;
+      }, -1) + 1;
+
+    return formatIndependentDriverCode(nextSequence);
+  }
+
+  private async normalizeOrganizationClientCodes() {
+    const organizations = await this.prisma.organization.findMany({
+      orderBy: { createdAt: 'asc' },
+      select: { id: true, clientCode: true, createdAt: true },
+    });
+    const usedSequences = new Map<number, Set<number>>();
+
+    for (const organization of organizations) {
+      const year = organization.createdAt.getUTCFullYear();
+      const parsedSequence = parsePlatformClientCodeSequence(
+        organization.clientCode || '',
+        year,
+      );
+
+      if (parsedSequence !== null) {
+        if (!usedSequences.has(year)) {
+          usedSequences.set(year, new Set<number>());
+        }
+        usedSequences.get(year)?.add(parsedSequence);
+      }
+    }
+
+    for (const organization of organizations) {
+      const year = organization.createdAt.getUTCFullYear();
+      const parsedSequence = parsePlatformClientCodeSequence(
+        organization.clientCode || '',
+        year,
+      );
+
+      if (parsedSequence !== null) {
+        continue;
+      }
+
+      if (!usedSequences.has(year)) {
+        usedSequences.set(year, new Set<number>());
+      }
+
+      const sequences = usedSequences.get(year)!;
+      let nextSequence = 0;
+      while (sequences.has(nextSequence)) {
+        nextSequence += 1;
+      }
+
+      await this.prisma.organization.update({
+        where: { id: organization.id },
+        data: {
+          clientCode: formatPlatformClientCode(year, nextSequence),
+        },
+      });
+      sequences.add(nextSequence);
+    }
+  }
+
+  private async normalizeIndependentDriverCodes() {
+    if (this.independentDriverCodeColumnAvailable === false) {
+      return;
+    }
+
+    let registrations: { id: string; driverCode: string | null }[];
+
+    try {
+      registrations = await this.prisma.independentDriverRegistration.findMany({
+        orderBy: { createdAt: 'asc' },
+        select: { id: true, driverCode: true },
+      });
+      this.independentDriverCodeColumnAvailable = true;
+    } catch (error) {
+      if (!this.isIndependentDriverCodeColumnMissing(error)) {
+        throw error;
+      }
+
+      this.independentDriverCodeColumnAvailable = false;
+      this.logger.warn(
+        'Skipping independent driver code normalization because the driver_code column is not present in the current database.',
+      );
+      return;
+    }
+    const usedSequences = new Set<number>();
+
+    for (const registration of registrations) {
+      const parsedSequence = parseIndependentDriverCodeSequence(
+        registration.driverCode || '',
+      );
+
+      if (parsedSequence !== null) {
+        usedSequences.add(parsedSequence);
+      }
+    }
+
+    for (const registration of registrations) {
+      if (isIndependentDriverCode(registration.driverCode)) {
+        continue;
+      }
+
+      let nextSequence = 0;
+      while (usedSequences.has(nextSequence)) {
+        nextSequence += 1;
+      }
+
+      await this.prisma.independentDriverRegistration.update({
+        where: { id: registration.id },
+        data: {
+          driverCode: formatIndependentDriverCode(nextSequence),
+        },
+      });
+      usedSequences.add(nextSequence);
+    }
+  }
+
+  private async listIndependentDriversWithoutCodeColumn() {
+    const registrations = await this.prisma.independentDriverRegistration.findMany({
+      where: {
+        status: IndependentDriverRegistrationStatus.PENDING_APPROVAL,
+      },
+      orderBy: { createdAt: 'asc' },
+      select: this.independentDriverRegistrationLegacySelect(),
+    });
+
+    return registrations.map((registration) => ({
+      ...registration,
+      driverCode: null,
+    }));
+  }
+
+  private async getIndependentDriverRegistrationWithoutCodeColumn(
+    registrationId: string,
+  ) {
+    const registration = await this.prisma.independentDriverRegistration.findUnique({
+      where: { id: registrationId },
+      select: this.independentDriverRegistrationLegacySelect(),
+    });
+
+    if (!registration) {
+      throw new BadRequestException(
+        'Independent driver registration not found',
+      );
+    }
+
+    return {
+      ...registration,
+      driverCode: null,
+    };
+  }
+
+  private independentDriverRegistrationLegacySelect() {
+    return {
+      id: true,
+      organizationId: true,
+      fullName: true,
+      phone: true,
+      email: true,
+      dateOfBirth: true,
+      gender: true,
+      addressLine1: true,
+      addressLine2: true,
+      city: true,
+      state: true,
+      postalCode: true,
+      country: true,
+      homeBaseLocation: true,
+      licenseNumber: true,
+      licenseExpiry: true,
+      licenseType: true,
+      licenseIssueDate: true,
+      licenseIssuingState: true,
+      aadhaarNumber: true,
+      panNumber: true,
+      vehicleNumber: true,
+      vehicleType: true,
+      vehicleModel: true,
+      vehicleCapacity: true,
+      vehicleOwnerName: true,
+      vehicleRegistrationState: true,
+      fuelType: true,
+      uploadedDocuments: true,
+      status: true,
+      approvedAt: true,
+      approvedByUserId: true,
+      rejectedAt: true,
+      rejectedReason: true,
+      createdAt: true,
+      updatedAt: true,
+    } satisfies Prisma.IndependentDriverRegistrationSelect;
+  }
+
+  private isIndependentDriverCodeColumnMissing(error: unknown) {
+    return (
+      error instanceof Prisma.PrismaClientKnownRequestError &&
+      error.code === 'P2022' &&
+      String(error.meta?.modelName || '') === 'IndependentDriverRegistration'
+    );
   }
 
   private async getUserForAuthentication(email: string) {

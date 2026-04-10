@@ -5,7 +5,6 @@ import {
   IsEnum,
   IsOptional,
   IsString,
-  IsUUID,
   Matches,
   MinLength,
 } from 'class-validator';
@@ -24,13 +23,14 @@ export class CreateOrganizationUserDto {
   @IsString()
   phone?: string;
 
-  @ApiProperty()
+  @ApiPropertyOptional()
+  @IsOptional()
   @IsString()
   @MinLength(8)
   @Matches(/^(?=.*[A-Za-z])(?=.*\d).+$/, {
     message: 'password must contain at least one letter and one number',
   })
-  password!: string;
+  password?: string;
 
   @ApiProperty({ enum: OrganizationRole })
   @IsEnum(OrganizationRole)

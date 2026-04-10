@@ -11,6 +11,7 @@ import { randomUUID } from 'crypto';
 import { PrismaService } from '../../shared/prisma/prisma.service';
 import { CreateDocumentDto } from './dto/create-document.dto';
 import { GenerateUploadUrlDto } from './dto/generate-upload-url.dto';
+import { GeneratePublicUploadUrlDto } from './dto/generate-public-upload-url.dto';
 
 @Injectable()
 export class DocumentsService {
@@ -43,6 +44,34 @@ export class DocumentsService {
     this.ensureBucketConfigured();
 
     const storageKey = this.buildStorageKey(input);
+    const command = new PutObjectCommand({
+      Bucket: this.bucketName,
+      Key: storageKey,
+      ContentType: input.mimeType ?? 'application/octet-stream',
+    });
+
+    try {
+      const uploadUrl = await getSignedUrl(this.s3Client, command, {
+        expiresIn: 900,
+      });
+
+      return {
+        bucket: this.bucketName,
+        region: this.region,
+        key: storageKey,
+        uploadUrl,
+      };
+    } catch (error) {
+      throw new InternalServerErrorException(
+        `Failed to generate upload URL: ${error instanceof Error ? error.message : 'unknown error'}`,
+      );
+    }
+  }
+
+  async generatePublicUploadUrl(input: GeneratePublicUploadUrlDto) {
+    this.ensureBucketConfigured();
+
+    const storageKey = this.buildPublicRegistrationStorageKey(input);
     const command = new PutObjectCommand({
       Bucket: this.bucketName,
       Key: storageKey,
@@ -101,6 +130,17 @@ export class DocumentsService {
       input.entityType.toLowerCase(),
       input.entityId,
       `${input.documentType}-${randomUUID()}-${safeFileName}`,
+    ].join('/');
+  }
+
+  private buildPublicRegistrationStorageKey(input: GeneratePublicUploadUrlDto) {
+    const safeFileName = input.fileName.replace(/\s+/g, '-');
+    return [
+      'public',
+      'registrations',
+      'company-admin',
+      input.documentType.toLowerCase(),
+      `${randomUUID()}-${safeFileName}`,
     ].join('/');
   }
 

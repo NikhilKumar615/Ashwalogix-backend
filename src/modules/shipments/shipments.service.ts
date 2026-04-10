@@ -18,6 +18,11 @@ import type {
   TrackingEventBus,
 } from '../../shared/kafka/interfaces/tracking-event-bus.interface';
 import { PrismaService } from '../../shared/prisma/prisma.service';
+import {
+  buildBusinessPrefix,
+  formatRollingAlphaCode,
+  parseRollingAlphaCodeSequence,
+} from '../../shared/codes/entity-code.util';
 import { AssignDriverDto } from './dto/assign-driver.dto';
 import { CreateShipmentDto } from './dto/create-shipment.dto';
 import { CreateProofOfDeliveryDto } from './dto/create-proof-of-delivery.dto';
@@ -42,6 +47,16 @@ export class ShipmentsService {
   ) {}
 
   async listShipments(params: ListShipmentsParams) {
+    if (params.organizationId) {
+      await this.normalizeShipmentCodes(params.organizationId);
+    } else if (params.organizationIds?.length) {
+      await Promise.all(
+        params.organizationIds.map((organizationId) =>
+          this.normalizeShipmentCodes(organizationId),
+        ),
+      );
+    }
+
     const where: Prisma.ShipmentWhereInput = {};
 
     if (params.organizationId) {
@@ -70,6 +85,15 @@ export class ShipmentsService {
   }
 
   async getShipmentById(id: string) {
+    const shipmentForNormalization = await this.prisma.shipment.findUnique({
+      where: { id },
+      select: { organizationId: true },
+    });
+
+    if (shipmentForNormalization?.organizationId) {
+      await this.normalizeShipmentCodes(shipmentForNormalization.organizationId);
+    }
+
     const shipment = await this.prisma.shipment.findUnique({
       where: { id },
       include: {
@@ -126,7 +150,7 @@ export class ShipmentsService {
     this.validateCreateShipmentInput(input);
 
     const status = input.initialStatus ?? ShipmentStatus.DRAFT;
-    const shipmentCode = input.shipmentCode ?? this.generateShipmentCode();
+    const shipmentCode = await this.generateShipmentCode(input.organizationId);
     const resolvedCompanyClientId = input.companyClientId;
 
     const shipment = await this.prisma.shipment.create({
@@ -1076,13 +1100,88 @@ export class ShipmentsService {
     }
   }
 
-  private generateShipmentCode() {
-    const today = new Date();
-    const y = today.getUTCFullYear();
-    const m = String(today.getUTCMonth() + 1).padStart(2, '0');
-    const d = String(today.getUTCDate()).padStart(2, '0');
+  private async generateShipmentCode(organizationId: string) {
+    const organization = await this.prisma.organization.findUnique({
+      where: { id: organizationId },
+      select: { name: true },
+    });
 
-    return `SHP-${y}${m}${d}-${randomUUID().slice(0, 8).toUpperCase()}`;
+    if (!organization) {
+      throw new BadRequestException('Organization not found');
+    }
+
+    const prefix = buildBusinessPrefix(organization.name);
+    const existingCodes = await this.prisma.shipment.findMany({
+      where: { organizationId },
+      select: { shipmentCode: true },
+    });
+    const nextSequence =
+      existingCodes.reduce((highest, shipment) => {
+        const sequence = parseRollingAlphaCodeSequence(
+          shipment.shipmentCode,
+          prefix,
+          'SHP',
+        );
+        return sequence !== null && sequence > highest ? sequence : highest;
+      }, -1) + 1;
+
+    return formatRollingAlphaCode(prefix, 'SHP', nextSequence);
+  }
+
+  private async normalizeShipmentCodes(organizationId: string) {
+    const organization = await this.prisma.organization.findUnique({
+      where: { id: organizationId },
+      select: { name: true },
+    });
+
+    if (!organization) {
+      throw new BadRequestException('Organization not found');
+    }
+
+    const prefix = buildBusinessPrefix(organization.name);
+    const shipments = await this.prisma.shipment.findMany({
+      where: { organizationId },
+      orderBy: { createdAt: 'asc' },
+      select: { id: true, shipmentCode: true },
+    });
+    const usedSequences = new Set<number>();
+
+    for (const shipment of shipments) {
+      const parsedSequence = parseRollingAlphaCodeSequence(
+        shipment.shipmentCode,
+        prefix,
+        'SHP',
+      );
+
+      if (parsedSequence !== null) {
+        usedSequences.add(parsedSequence);
+      }
+    }
+
+    for (const shipment of shipments) {
+      const parsedSequence = parseRollingAlphaCodeSequence(
+        shipment.shipmentCode,
+        prefix,
+        'SHP',
+      );
+
+      if (parsedSequence !== null) {
+        continue;
+      }
+
+      let nextSequence = 0;
+      while (usedSequences.has(nextSequence)) {
+        nextSequence += 1;
+      }
+
+      await this.prisma.shipment.update({
+        where: { id: shipment.id },
+        data: {
+          shipmentCode: formatRollingAlphaCode(prefix, 'SHP', nextSequence),
+        },
+      });
+      usedSequences.add(nextSequence);
+    }
   }
 
   private async transitionShipmentStatus(

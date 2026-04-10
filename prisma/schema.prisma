@@ -1047,6 +1047,7 @@ model ProofOfDelivery {
 model IndependentDriverRegistration {
   id                        String                                @id @default(uuid()) @db.Uuid
   organizationId            String?                               @map("organization_id") @db.Uuid
+  driverCode                String?                               @map("driver_code")
   fullName                  String                                @map("full_name")
   phone                     String
   email                     String?
@@ -1085,6 +1086,7 @@ model IndependentDriverRegistration {
   updatedAt                 DateTime                              @updatedAt @map("updated_at")
 
   @@index([organizationId])
+  @@index([driverCode])
   @@index([phone])
   @@index([vehicleNumber])
   @@index([status])

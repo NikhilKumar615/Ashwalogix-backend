@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Param, Patch, Query, UseGuards } from '@nestjs/common';
+import { Body, Controller, Get, Param, Patch, Post, Query, UseGuards } from '@nestjs/common';
 import { DriverStatus, OrganizationRole } from '@prisma/client';
 import {
   ApiBearerAuth,
@@ -14,6 +14,7 @@ import { Roles } from '../auth/decorators/roles.decorator';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { RolesGuard } from '../auth/guards/roles.guard';
 import type { JwtPayload } from '../auth/interfaces/jwt-payload.interface';
+import { RegenerateDriverPasswordDto } from './dto/regenerate-driver-password.dto';
 import { UpdateDriverDto } from './dto/update-driver.dto';
 import { DriversService } from './drivers.service';
 
@@ -101,6 +102,46 @@ export class DriversController {
     ]);
 
     return this.driversService.updateDriver(driverId, organizationId, body);
+  }
+
+  @Post('organizations/:organizationId/drivers/:driverId/regenerate-password')
+  @ApiOperation({ summary: 'Regenerate a temporary password for a driver' })
+  @ApiParam({ name: 'organizationId', type: String })
+  @ApiParam({ name: 'driverId', type: String })
+  @ApiBody({ type: RegenerateDriverPasswordDto })
+  @Roles(OrganizationRole.ORG_ADMIN, OrganizationRole.OPERATIONS)
+  async regenerateDriverPassword(
+    @Param('organizationId') organizationId: string,
+    @Param('driverId') driverId: string,
+    @Body() body: RegenerateDriverPasswordDto,
+    @CurrentUser() user: JwtPayload,
+  ) {
+    await this.authorizationService.assertOrganizationAccess(user, organizationId, [
+      OrganizationRole.ORG_ADMIN,
+      OrganizationRole.OPERATIONS,
+    ]);
+
+    return this.driversService.regeneratePassword(
+      driverId,
+      organizationId,
+      body.password,
+    );
+  }
+
+  @Post('organizations/:organizationId/drivers/normalize-codes')
+  @ApiOperation({ summary: 'Normalize legacy driver codes to the strict company format' })
+  @ApiParam({ name: 'organizationId', type: String })
+  @Roles(OrganizationRole.ORG_ADMIN, OrganizationRole.OPERATIONS)
+  async normalizeDriverCodes(
+    @Param('organizationId') organizationId: string,
+    @CurrentUser() user: JwtPayload,
+  ) {
+    await this.authorizationService.assertOrganizationAccess(user, organizationId, [
+      OrganizationRole.ORG_ADMIN,
+      OrganizationRole.OPERATIONS,
+    ]);
+
+    return this.driversService.normalizeDriverCodes(organizationId);
   }
 
   @Get(':driverId/assigned-shipments')

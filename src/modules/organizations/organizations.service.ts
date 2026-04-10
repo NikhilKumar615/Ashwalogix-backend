@@ -1,6 +1,7 @@
 import {
   BadRequestException,
   Injectable,
+  Logger,
   NotFoundException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
@@ -10,11 +11,18 @@ import {
   MembershipStatus,
   OrganizationRole,
   OrganizationStatus,
+  Prisma,
   UserStatus,
 } from '@prisma/client';
 import { hash } from 'bcryptjs';
 import { randomUUID } from 'crypto';
 import { PrismaService } from '../../shared/prisma/prisma.service';
+import {
+  buildBusinessPrefix,
+  buildStatePrefix,
+  formatRollingAlphaCodeWithState,
+  parseRollingAlphaCodeSequence,
+} from '../../shared/codes/entity-code.util';
 import { MailService } from '../mail/mail.service';
 import { CreateOrganizationUserDto } from './dto/create-organization-user.dto';
 import { RegisterCompanyDriverDto } from './dto/register-company-driver.dto';
@@ -24,6 +32,8 @@ import { UpdateOrganizationUserDto } from './dto/update-organization-user.dto';
 
 @Injectable()
 export class OrganizationsService {
+  private readonly logger = new Logger(OrganizationsService.name);
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly configService: ConfigService,
@@ -249,7 +259,7 @@ export class OrganizationsService {
   }
 
   private async createUserWithinOrganization(
-    organization: { id: string; name: string },
+    organization: { id: string; name: string; state: string | null },
     input: CreateOrganizationUserDto,
     createdByUserId: string,
   ) {
@@ -275,7 +285,8 @@ export class OrganizationsService {
     }
 
     const now = new Date();
-    const passwordHash = await hash(input.password, 10);
+    const temporaryPassword = input.password || this.generateTemporaryPassword();
+    const passwordHash = await hash(temporaryPassword, 10);
     const resetPasswordToken = randomUUID();
     const resetHours = Number(
       this.configService.get<string>('PASSWORD_RESET_TTL_HOURS') ?? '24',
@@ -314,7 +325,12 @@ export class OrganizationsService {
           data: {
             organizationId: organization.id,
             userId: user.id,
-            driverCode: input.driverCode ?? this.generateDriverCode(),
+            driverCode: await this.generateDriverCode(
+              tx,
+              organization.id,
+              organization.name,
+              organization.state,
+            ),
             fullName: input.fullName,
             phone: input.phone ?? input.email,
             email: input.email.toLowerCase(),
@@ -338,15 +354,28 @@ export class OrganizationsService {
       throw new BadRequestException('Organization user could not be created');
     }
 
-    await this.mailService.sendOrganizationUserInvitationEmail({
-      to: createdUser.email,
-      fullName: createdUser.fullName,
-      organizationName: organization.name,
-      roleLabel: this.formatRoleLabel(input.role),
-      token: resetPasswordToken,
-    });
+    if (input.role !== OrganizationRole.DRIVER) {
+      try {
+        await this.mailService.sendOrganizationUserInvitationEmail({
+          to: createdUser.email,
+          fullName: createdUser.fullName,
+          organizationName: organization.name,
+          roleLabel: this.formatRoleLabel(input.role),
+          token: resetPasswordToken,
+        });
+      } catch (error) {
+        this.logger.error(
+          `Organization user ${createdUser.id} was created but invitation email could not be sent.`,
+          error instanceof Error ? error.stack : undefined,
+        );
+      }
+    }
 
-    return createdUser;
+    return {
+      ...createdUser,
+      temporaryPassword:
+        input.role === OrganizationRole.DRIVER ? temporaryPassword : undefined,
+    };
   }
 
   private async ensureUserIdentityIsAvailable(
@@ -391,8 +420,35 @@ export class OrganizationsService {
     return organization;
   }
 
-  private generateDriverCode() {
-    return `DRV-${randomUUID().slice(0, 8).toUpperCase()}`;
+  private async generateDriverCode(
+    tx: Prisma.TransactionClient,
+    organizationId: string,
+    organizationName: string,
+    organizationState: string | null,
+  ) {
+    const prefix = buildBusinessPrefix(organizationName);
+    const statePrefix = buildStatePrefix(organizationState);
+    const existingCodes = await tx.driver.findMany({
+      where: { organizationId },
+      select: { driverCode: true },
+    });
+    const nextSequence =
+      existingCodes.reduce((highest, driver) => {
+        const sequence = parseRollingAlphaCodeSequence(
+          driver.driverCode,
+          prefix,
+          'DRV',
+          statePrefix,
+        );
+        return sequence !== null && sequence > highest ? sequence : highest;
+      }, -1) + 1;
+
+    return formatRollingAlphaCodeWithState(
+      prefix,
+      'DRV',
+      statePrefix,
+      nextSequence,
+    );
   }
 
   private formatRoleLabel(role: OrganizationRole) {
@@ -400,5 +456,9 @@ export class OrganizationsService {
       .split('_')
       .map((segment) => segment.charAt(0) + segment.slice(1).toLowerCase())
       .join(' ');
+  }
+
+  private generateTemporaryPassword() {
+    return `Lg${randomUUID().replace(/-/g, '').slice(0, 10)}`;
   }
 }
