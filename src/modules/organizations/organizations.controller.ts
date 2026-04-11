@@ -2,6 +2,7 @@ import {
   Body,
   Controller,
   Get,
+  NotFoundException,
   Param,
   Patch,
   Post,
@@ -72,6 +73,26 @@ export class OrganizationsController {
     );
 
     return this.organizationsService.getUserById(organizationId, userId);
+  }
+
+  @Get('lookup/client-code/:clientCode')
+  @ApiOperation({ summary: 'Lookup an active organization by platform client code' })
+  @ApiParam({ name: 'clientCode', type: String })
+  @Roles(
+    OrganizationRole.ORG_ADMIN,
+    OrganizationRole.DISPATCHER,
+    OrganizationRole.OPERATIONS,
+    OrganizationRole.WAREHOUSE,
+  )
+  async lookupOrganizationByClientCode(
+    @Param('clientCode') clientCode: string,
+    @CurrentUser() user: JwtPayload,
+  ) {
+    if (!user.organizationIds?.length) {
+      throw new NotFoundException('Organization not found');
+    }
+
+    return this.organizationsService.lookupOrganizationByClientCode(clientCode);
   }
 
   @Post(':organizationId/users')

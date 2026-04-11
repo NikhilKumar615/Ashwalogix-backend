@@ -80,6 +80,28 @@ export class OrganizationsService {
     return organizationUser;
   }
 
+  async lookupOrganizationByClientCode(clientCode: string) {
+    const normalizedCode = clientCode.trim().toUpperCase();
+
+    const organization = await this.prisma.organization.findFirst({
+      where: {
+        clientCode: normalizedCode,
+        status: OrganizationStatus.ACTIVE,
+      },
+      include: {
+        locations: {
+          orderBy: [{ isPrimary: 'desc' }, { createdAt: 'asc' }],
+        },
+      },
+    });
+
+    if (!organization) {
+      throw new NotFoundException('Organization not found');
+    }
+
+    return organization;
+  }
+
   async createOrganizationUser(
     organizationId: string,
     input: CreateOrganizationUserDto,

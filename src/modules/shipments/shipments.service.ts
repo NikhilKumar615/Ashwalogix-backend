@@ -134,6 +134,55 @@ export class ShipmentsService {
     return shipment ? this.mapShipmentCompanyClient(shipment) : null;
   }
 
+  async getShipmentByCode(shipmentCode: string) {
+    const normalizedCode = shipmentCode.trim().toUpperCase();
+
+    const shipment = await this.prisma.shipment.findFirst({
+      where: {
+        shipmentCode: normalizedCode,
+      },
+      include: {
+        companyClient: true,
+        sourceLocation: true,
+        destinationLocation: true,
+        currentDriver: true,
+        currentVehicle: true,
+        assignments: {
+          include: {
+            driver: true,
+            vehicle: true,
+          },
+          orderBy: { assignedAt: 'desc' },
+        },
+        items: true,
+        stops: {
+          orderBy: { stopSequence: 'asc' },
+        },
+        statusEvents: {
+          include: {
+            driver: true,
+          },
+          orderBy: { eventTime: 'desc' },
+        },
+        trackingSessions: {
+          orderBy: { startedAt: 'desc' },
+        },
+        documents: {
+          orderBy: { uploadedAt: 'desc' },
+        },
+        proofOfDeliveries: {
+          orderBy: { capturedAt: 'desc' },
+        },
+      },
+    });
+
+    if (!shipment) {
+      return null;
+    }
+
+    return this.mapShipmentCompanyClient(shipment);
+  }
+
   async getShipmentTimeline(id: string) {
     await this.ensureShipmentExists(id);
 

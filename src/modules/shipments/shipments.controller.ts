@@ -78,6 +78,32 @@ export class ShipmentsController {
     });
   }
 
+  @Get('lookup/code/:shipmentCode')
+  @ApiOperation({ summary: 'Lookup shipment details by shipment code for cross-org prefilling' })
+  @ApiParam({ name: 'shipmentCode', type: String })
+  @Roles(
+    OrganizationRole.ORG_ADMIN,
+    OrganizationRole.DISPATCHER,
+    OrganizationRole.OPERATIONS,
+    OrganizationRole.WAREHOUSE,
+  )
+  async lookupShipmentByCode(
+    @Param('shipmentCode') shipmentCode: string,
+    @CurrentUser() user: JwtPayload,
+  ) {
+    if (!user.organizationIds?.length && user.platformRole !== PlatformRole.SUPER_ADMIN) {
+      throw new NotFoundException(`Shipment ${shipmentCode} not found`);
+    }
+
+    const shipment = await this.shipmentsService.getShipmentByCode(shipmentCode);
+
+    if (!shipment) {
+      throw new NotFoundException(`Shipment ${shipmentCode} not found`);
+    }
+
+    return shipment;
+  }
+
   @Get(':id')
   @ApiOperation({ summary: 'Get shipment details' })
   @ApiParam({ name: 'id', type: String })
