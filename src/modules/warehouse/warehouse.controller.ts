@@ -79,7 +79,7 @@ export class WarehouseController {
     @Body() body: CreateWarehouseDto,
     @CurrentUser() user: JwtPayload,
   ) {
-    await this.authorizationService.assertOrganizationAccess(user, organizationId, [
+    await this.authorizationService.assertOrganizationWriteAccess(user, organizationId, [
       OrganizationRole.ORG_ADMIN,
       OrganizationRole.OPERATIONS,
     ]);
@@ -124,7 +124,7 @@ export class WarehouseController {
     @Body() body: UpdateWarehouseDto,
     @CurrentUser() user: JwtPayload,
   ) {
-    await this.authorizationService.assertOrganizationAccess(user, organizationId, [
+    await this.authorizationService.assertOrganizationWriteAccess(user, organizationId, [
       OrganizationRole.ORG_ADMIN,
       OrganizationRole.OPERATIONS,
     ]);
@@ -151,7 +151,7 @@ export class WarehouseController {
     @Query('status') status: InventoryItemStatus | undefined,
     @CurrentUser() user: JwtPayload,
   ) {
-    await this.authorizationService.assertOrganizationAccess(user, organizationId, [
+    await this.authorizationService.assertOrganizationWriteAccess(user, organizationId, [
       OrganizationRole.ORG_ADMIN,
       OrganizationRole.OPERATIONS,
       OrganizationRole.WAREHOUSE,
@@ -171,7 +171,7 @@ export class WarehouseController {
     @Body() body: CreateInventoryItemDto,
     @CurrentUser() user: JwtPayload,
   ) {
-    await this.authorizationService.assertOrganizationAccess(user, organizationId, [
+    await this.authorizationService.assertOrganizationWriteAccess(user, organizationId, [
       OrganizationRole.ORG_ADMIN,
       OrganizationRole.OPERATIONS,
       OrganizationRole.WAREHOUSE,
@@ -195,7 +195,7 @@ export class WarehouseController {
     @Param('inventoryItemId') inventoryItemId: string,
     @CurrentUser() user: JwtPayload,
   ) {
-    await this.authorizationService.assertOrganizationAccess(user, organizationId, [
+    await this.authorizationService.assertOrganizationWriteAccess(user, organizationId, [
       OrganizationRole.ORG_ADMIN,
       OrganizationRole.OPERATIONS,
       OrganizationRole.WAREHOUSE,

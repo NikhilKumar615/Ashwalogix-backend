@@ -108,7 +108,7 @@ export class OrganizationsController {
     @Body() body: CreateOrganizationUserDto,
     @CurrentUser() user: JwtPayload,
   ) {
-    await this.authorizationService.assertOrganizationAccess(
+    await this.authorizationService.assertOrganizationWriteAccess(
       user,
       organizationId,
       [OrganizationRole.ORG_ADMIN],
@@ -131,7 +131,7 @@ export class OrganizationsController {
     @Body() body: RegisterDispatcherDto,
     @CurrentUser() user: JwtPayload,
   ) {
-    await this.authorizationService.assertOrganizationAccess(
+    await this.authorizationService.assertOrganizationWriteAccess(
       user,
       organizationId,
       [OrganizationRole.ORG_ADMIN],
@@ -154,7 +154,7 @@ export class OrganizationsController {
     @Body() body: RegisterOrganizationStaffDto,
     @CurrentUser() user: JwtPayload,
   ) {
-    await this.authorizationService.assertOrganizationAccess(
+    await this.authorizationService.assertOrganizationWriteAccess(
       user,
       organizationId,
       [OrganizationRole.ORG_ADMIN],
@@ -177,7 +177,7 @@ export class OrganizationsController {
     @Body() body: RegisterOrganizationStaffDto,
     @CurrentUser() user: JwtPayload,
   ) {
-    await this.authorizationService.assertOrganizationAccess(
+    await this.authorizationService.assertOrganizationWriteAccess(
       user,
       organizationId,
       [OrganizationRole.ORG_ADMIN],
@@ -200,7 +200,7 @@ export class OrganizationsController {
     @Body() body: RegisterCompanyDriverDto,
     @CurrentUser() user: JwtPayload,
   ) {
-    await this.authorizationService.assertOrganizationAccess(
+    await this.authorizationService.assertOrganizationWriteAccess(
       user,
       organizationId,
       [OrganizationRole.ORG_ADMIN],
@@ -225,7 +225,7 @@ export class OrganizationsController {
     @Body() body: UpdateOrganizationUserDto,
     @CurrentUser() user: JwtPayload,
   ) {
-    await this.authorizationService.assertOrganizationAccess(
+    await this.authorizationService.assertOrganizationWriteAccess(
       user,
       organizationId,
       [OrganizationRole.ORG_ADMIN, OrganizationRole.OPERATIONS],

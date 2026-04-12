@@ -74,7 +74,7 @@ export class VehiclesController {
     @Body() body: CreateVehicleDto,
     @CurrentUser() user: JwtPayload,
   ) {
-    await this.authorizationService.assertOrganizationAccess(
+    await this.authorizationService.assertOrganizationWriteAccess(
       user,
       organizationId,
       [OrganizationRole.ORG_ADMIN, OrganizationRole.OPERATIONS],
@@ -122,7 +122,7 @@ export class VehiclesController {
     @Body() body: UpdateVehicleDto,
     @CurrentUser() user: JwtPayload,
   ) {
-    await this.authorizationService.assertOrganizationAccess(
+    await this.authorizationService.assertOrganizationWriteAccess(
       user,
       organizationId,
       [OrganizationRole.ORG_ADMIN, OrganizationRole.OPERATIONS],

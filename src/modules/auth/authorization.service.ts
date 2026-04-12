@@ -1,5 +1,5 @@
 import { ForbiddenException, Injectable } from '@nestjs/common';
-import { OrganizationRole, PlatformRole } from '@prisma/client';
+import { OrganizationRole, OrganizationStatus, PlatformRole } from '@prisma/client';
 import { PrismaService } from '../../shared/prisma/prisma.service';
 import type { JwtPayload } from './interfaces/jwt-payload.interface';
 
@@ -43,6 +43,33 @@ export class AuthorizationService {
           'You do not have permission to perform this action',
         );
       }
+    }
+  }
+
+  async assertOrganizationWriteAccess(
+    user: JwtPayload,
+    organizationId: string,
+    allowedRoles?: AllowedRole[],
+  ) {
+    await this.assertOrganizationAccess(user, organizationId, allowedRoles);
+
+    if (user.platformRole === PlatformRole.SUPER_ADMIN) {
+      return;
+    }
+
+    const organization = await this.prisma.organization.findUnique({
+      where: { id: organizationId },
+      select: { status: true },
+    });
+
+    if (!organization) {
+      throw new ForbiddenException('Organization access could not be resolved');
+    }
+
+    if (organization.status !== OrganizationStatus.ACTIVE) {
+      throw new ForbiddenException(
+        'Your organization is still pending approval. Browsing is allowed, but changes are blocked until approval.',
+      );
     }
   }
 
@@ -113,6 +140,34 @@ export class AuthorizationService {
     }
 
     throw new ForbiddenException('You do not have access to this shipment');
+  }
+
+  async assertShipmentWriteAccess(
+    user: JwtPayload,
+    shipmentId: string,
+    options?: {
+      allowedOrganizationRoles?: AllowedRole[];
+      allowAssignedDriver?: boolean;
+    },
+  ) {
+    const shipment = await this.assertShipmentAccess(user, shipmentId, options);
+
+    if (user.platformRole === PlatformRole.SUPER_ADMIN) {
+      return shipment;
+    }
+
+    const organization = await this.prisma.organization.findUnique({
+      where: { id: shipment.organizationId },
+      select: { status: true },
+    });
+
+    if (!organization || organization.status !== OrganizationStatus.ACTIVE) {
+      throw new ForbiddenException(
+        'Your organization is still pending approval. Browsing is allowed, but changes are blocked until approval.',
+      );
+    }
+
+    return shipment;
   }
 
   async assertDriverAccess(

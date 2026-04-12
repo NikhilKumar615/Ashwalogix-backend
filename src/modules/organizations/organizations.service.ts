@@ -41,7 +41,7 @@ export class OrganizationsService {
   ) {}
 
   async listUsers(organizationId: string) {
-    await this.ensureOrganizationIsActive(organizationId);
+    await this.ensureOrganizationExists(organizationId);
 
     return this.prisma.organizationUser.findMany({
       where: { organizationId },
@@ -57,7 +57,7 @@ export class OrganizationsService {
   }
 
   async getUserById(organizationId: string, userId: string) {
-    await this.ensureOrganizationIsActive(organizationId);
+    await this.ensureOrganizationExists(organizationId);
 
     const organizationUser = await this.prisma.organizationUser.findFirst({
       where: {
@@ -285,12 +285,6 @@ export class OrganizationsService {
     input: CreateOrganizationUserDto,
     createdByUserId: string,
   ) {
-    if (input.role === OrganizationRole.ORG_ADMIN) {
-      throw new BadRequestException(
-        'Use the company onboarding flow for the first org admin. This endpoint is intended for company-managed staff accounts.',
-      );
-    }
-
     const existingUser = await this.prisma.user.findFirst({
       where: {
         OR: [
@@ -425,18 +419,24 @@ export class OrganizationsService {
   }
 
   private async ensureOrganizationIsActive(organizationId: string) {
+    const organization = await this.ensureOrganizationExists(organizationId);
+
+    if (organization.status !== OrganizationStatus.ACTIVE) {
+      throw new BadRequestException(
+        'Users can only be managed for active organizations',
+      );
+    }
+
+    return organization;
+  }
+
+  private async ensureOrganizationExists(organizationId: string) {
     const organization = await this.prisma.organization.findUnique({
       where: { id: organizationId },
     });
 
     if (!organization) {
       throw new NotFoundException('Organization not found');
-    }
-
-    if (organization.status !== OrganizationStatus.ACTIVE) {
-      throw new BadRequestException(
-        'Users can only be managed for active organizations',
-      );
     }
 
     return organization;

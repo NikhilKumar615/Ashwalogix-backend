@@ -144,7 +144,7 @@ export class ShipmentsController {
     @Body() body: CreateShipmentDto,
     @CurrentUser() user: JwtPayload,
   ) {
-    await this.authorizationService.assertOrganizationAccess(
+    await this.authorizationService.assertOrganizationWriteAccess(
       user,
       body.organizationId,
       [
@@ -171,7 +171,7 @@ export class ShipmentsController {
     @Body() body: UpdateShipmentDto,
     @CurrentUser() user: JwtPayload,
   ) {
-    await this.authorizationService.assertShipmentAccess(user, shipmentId, {
+    await this.authorizationService.assertShipmentWriteAccess(user, shipmentId, {
       allowedOrganizationRoles: [
         OrganizationRole.ORG_ADMIN,
         OrganizationRole.DISPATCHER,
@@ -196,7 +196,7 @@ export class ShipmentsController {
     @Body() body: AssignDriverDto,
     @CurrentUser() user: JwtPayload,
   ) {
-    await this.authorizationService.assertShipmentAccess(user, shipmentId, {
+    await this.authorizationService.assertShipmentWriteAccess(user, shipmentId, {
       allowedOrganizationRoles: [
         OrganizationRole.ORG_ADMIN,
         OrganizationRole.DISPATCHER,
@@ -256,11 +256,11 @@ export class ShipmentsController {
     @Body() body: StartTrackingSessionDto,
     @CurrentUser() user: JwtPayload,
   ) {
-    await this.authorizationService.assertOrganizationAccess(
+    await this.authorizationService.assertOrganizationWriteAccess(
       user,
       body.organizationId,
     );
-    await this.authorizationService.assertShipmentAccess(user, shipmentId, {
+    await this.authorizationService.assertShipmentWriteAccess(user, shipmentId, {
       allowedOrganizationRoles: [
         OrganizationRole.ORG_ADMIN,
         OrganizationRole.DISPATCHER,
@@ -287,11 +287,11 @@ export class ShipmentsController {
     @Body() body: CreateTrackingPointDto,
     @CurrentUser() user: JwtPayload,
   ) {
-    await this.authorizationService.assertOrganizationAccess(
+    await this.authorizationService.assertOrganizationWriteAccess(
       user,
       body.organizationId,
     );
-    await this.authorizationService.assertShipmentAccess(user, shipmentId, {
+    await this.authorizationService.assertShipmentWriteAccess(user, shipmentId, {
       allowedOrganizationRoles: [
         OrganizationRole.ORG_ADMIN,
         OrganizationRole.DISPATCHER,
@@ -401,11 +401,11 @@ export class ShipmentsController {
     @Body() body: CreateProofOfDeliveryDto,
     @CurrentUser() user: JwtPayload,
   ) {
-    await this.authorizationService.assertOrganizationAccess(
+    await this.authorizationService.assertOrganizationWriteAccess(
       user,
       body.organizationId,
     );
-    await this.authorizationService.assertShipmentAccess(user, shipmentId, {
+    await this.authorizationService.assertShipmentWriteAccess(user, shipmentId, {
       allowedOrganizationRoles: [
         OrganizationRole.ORG_ADMIN,
         OrganizationRole.DISPATCHER,
@@ -431,7 +431,7 @@ export class ShipmentsController {
     @Body() body: ShipmentStatusActionDto,
     @CurrentUser() user: JwtPayload,
   ) {
-    await this.authorizationService.assertOrganizationAccess(
+    await this.authorizationService.assertOrganizationWriteAccess(
       user,
       body.organizationId,
       [
@@ -440,7 +440,7 @@ export class ShipmentsController {
         OrganizationRole.OPERATIONS,
       ],
     );
-    await this.authorizationService.assertShipmentAccess(user, shipmentId, {
+    await this.authorizationService.assertShipmentWriteAccess(user, shipmentId, {
       allowedOrganizationRoles: [
         OrganizationRole.ORG_ADMIN,
         OrganizationRole.DISPATCHER,
@@ -466,11 +466,11 @@ export class ShipmentsController {
     @Body() body: ShipmentStatusActionDto,
     @CurrentUser() user: JwtPayload,
   ) {
-    await this.authorizationService.assertOrganizationAccess(
+    await this.authorizationService.assertOrganizationWriteAccess(
       user,
       body.organizationId,
     );
-    await this.authorizationService.assertShipmentAccess(user, shipmentId, {
+    await this.authorizationService.assertShipmentWriteAccess(user, shipmentId, {
       allowedOrganizationRoles: [
         OrganizationRole.ORG_ADMIN,
         OrganizationRole.DISPATCHER,
@@ -497,11 +497,11 @@ export class ShipmentsController {
     @Body() body: ShipmentStatusActionDto,
     @CurrentUser() user: JwtPayload,
   ) {
-    await this.authorizationService.assertOrganizationAccess(
+    await this.authorizationService.assertOrganizationWriteAccess(
       user,
       body.organizationId,
     );
-    await this.authorizationService.assertShipmentAccess(user, shipmentId, {
+    await this.authorizationService.assertShipmentWriteAccess(user, shipmentId, {
       allowedOrganizationRoles: [
         OrganizationRole.ORG_ADMIN,
         OrganizationRole.DISPATCHER,
@@ -528,11 +528,11 @@ export class ShipmentsController {
     @Body() body: ShipmentStatusActionDto,
     @CurrentUser() user: JwtPayload,
   ) {
-    await this.authorizationService.assertOrganizationAccess(
+    await this.authorizationService.assertOrganizationWriteAccess(
       user,
       body.organizationId,
     );
-    await this.authorizationService.assertShipmentAccess(user, shipmentId, {
+    await this.authorizationService.assertShipmentWriteAccess(user, shipmentId, {
       allowedOrganizationRoles: [
         OrganizationRole.ORG_ADMIN,
         OrganizationRole.DISPATCHER,
@@ -559,11 +559,11 @@ export class ShipmentsController {
     @Body() body: ShipmentStatusActionDto,
     @CurrentUser() user: JwtPayload,
   ) {
-    await this.authorizationService.assertOrganizationAccess(
+    await this.authorizationService.assertOrganizationWriteAccess(
       user,
       body.organizationId,
     );
-    await this.authorizationService.assertShipmentAccess(user, shipmentId, {
+    await this.authorizationService.assertShipmentWriteAccess(user, shipmentId, {
       allowedOrganizationRoles: [
         OrganizationRole.ORG_ADMIN,
         OrganizationRole.DISPATCHER,
@@ -620,7 +620,7 @@ export class ShipmentsController {
     @Body() body: ShipmentStatusActionDto,
     @CurrentUser() user: JwtPayload,
   ) {
-    await this.authorizationService.assertOrganizationAccess(
+    await this.authorizationService.assertOrganizationWriteAccess(
       user,
       body.organizationId,
       [
@@ -629,7 +629,7 @@ export class ShipmentsController {
         OrganizationRole.OPERATIONS,
       ],
     );
-    await this.authorizationService.assertShipmentAccess(user, shipmentId, {
+    await this.authorizationService.assertShipmentWriteAccess(user, shipmentId, {
       allowedOrganizationRoles: [
         OrganizationRole.ORG_ADMIN,
         OrganizationRole.DISPATCHER,
@@ -655,11 +655,11 @@ export class ShipmentsController {
     @Body() body: FailShipmentDto,
     @CurrentUser() user: JwtPayload,
   ) {
-    await this.authorizationService.assertOrganizationAccess(
+    await this.authorizationService.assertOrganizationWriteAccess(
       user,
       body.organizationId,
     );
-    await this.authorizationService.assertShipmentAccess(user, shipmentId, {
+    await this.authorizationService.assertShipmentWriteAccess(user, shipmentId, {
       allowedOrganizationRoles: [
         OrganizationRole.ORG_ADMIN,
         OrganizationRole.DISPATCHER,
@@ -685,7 +685,7 @@ export class ShipmentsController {
     @Body() body: ShipmentStatusActionDto,
     @CurrentUser() user: JwtPayload,
   ) {
-    await this.authorizationService.assertOrganizationAccess(
+    await this.authorizationService.assertOrganizationWriteAccess(
       user,
       body.organizationId,
       [
@@ -694,7 +694,7 @@ export class ShipmentsController {
         OrganizationRole.OPERATIONS,
       ],
     );
-    await this.authorizationService.assertShipmentAccess(user, shipmentId, {
+    await this.authorizationService.assertShipmentWriteAccess(user, shipmentId, {
       allowedOrganizationRoles: [
         OrganizationRole.ORG_ADMIN,
         OrganizationRole.DISPATCHER,

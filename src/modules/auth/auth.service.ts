@@ -74,14 +74,18 @@ export class AuthService {
       );
     }
 
-    const verificationToken = randomUUID();
-    const verificationHours = Number(
-      this.configService.get<string>('EMAIL_VERIFICATION_TTL_HOURS') ?? '24',
-    );
-    const verificationTokenExpiresAt = new Date(
-      Date.now() + verificationHours * 60 * 60 * 1000,
-    );
     const passwordHash = await hash(input.password, 10);
+    const now = new Date();
+
+    // Email verification is temporarily disabled for company-admin signup.
+    // Keep the original token flow nearby so we can restore it later.
+    // const verificationToken = randomUUID();
+    // const verificationHours = Number(
+    //   this.configService.get<string>('EMAIL_VERIFICATION_TTL_HOURS') ?? '24',
+    // );
+    // const verificationTokenExpiresAt = new Date(
+    //   Date.now() + verificationHours * 60 * 60 * 1000,
+    // );
 
     const result = await this.prisma.$transaction(async (tx) => {
       const user = await tx.user.create({
@@ -90,9 +94,10 @@ export class AuthService {
           email: input.email.toLowerCase(),
           phone: input.phone,
           passwordHash,
-          status: UserStatus.PENDING_VERIFICATION,
-          verificationToken,
-          verificationTokenExpiresAt,
+          status: UserStatus.PENDING_APPROVAL,
+          emailVerifiedAt: now,
+          // verificationToken,
+          // verificationTokenExpiresAt,
         },
       });
 
@@ -148,18 +153,19 @@ export class AuthService {
       return { user, organization };
     });
 
-    await this.mailService.sendVerificationEmail({
-      to: result.user.email,
-      fullName: result.user.fullName,
-      token: verificationToken,
-    });
+    // await this.mailService.sendVerificationEmail({
+    //   to: result.user.email,
+    //   fullName: result.user.fullName,
+    //   token: verificationToken,
+    // });
 
     return {
-      message:
-        'Registration created. Verify the email first, then wait for SUPER_ADMIN approval.',
+      message: 'Registration created. Your account is now waiting for SUPER_ADMIN approval.',
       userId: result.user.id,
       organizationId: result.organization.id,
-      verificationToken: this.shouldExposeEmailTokens() ? verificationToken : undefined,
+      // verificationToken: this.shouldExposeEmailTokens()
+      //   ? verificationToken
+      //   : undefined,
     };
   }
 
@@ -1243,12 +1249,6 @@ export class AuthService {
       throw new ForbiddenException('Email verification is still pending');
     }
 
-    if (user.status === UserStatus.PENDING_APPROVAL) {
-      throw new ForbiddenException(
-        'Your account is waiting for SUPER_ADMIN approval',
-      );
-    }
-
     if (user.status === UserStatus.REJECTED) {
       throw new ForbiddenException('Your account has been rejected');
     }
@@ -1261,15 +1261,13 @@ export class AuthService {
       return;
     }
 
-    const hasActiveOrgMembership = user.organizationMembers.some(
-      (membership) =>
-        membership.status === MembershipStatus.ACTIVE &&
-        membership.organization.status === OrganizationStatus.ACTIVE,
+    const hasPortalMembership = user.organizationMembers.some(
+      (membership) => membership.status === MembershipStatus.ACTIVE,
     );
 
-    if (!hasActiveOrgMembership) {
+    if (!hasPortalMembership) {
       throw new ForbiddenException(
-        'No active organization access is available for this account',
+        'No active organization membership is available for this account',
       );
     }
   }
@@ -1748,9 +1746,7 @@ export class AuthService {
     }[];
   }) {
     const activeMemberships = user.organizationMembers.filter(
-      (membership) =>
-        membership.status === MembershipStatus.ACTIVE &&
-        membership.organization.status === OrganizationStatus.ACTIVE,
+      (membership) => membership.status === MembershipStatus.ACTIVE,
     );
 
     const payload: JwtPayload = {

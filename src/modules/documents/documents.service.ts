@@ -96,6 +96,46 @@ export class DocumentsService {
     }
   }
 
+  async uploadPublicRegistrationDocument(input: {
+    documentType: string;
+    fileName: string;
+    mimeType?: string;
+    fileBuffer: Buffer;
+    fileSize?: number;
+  }) {
+    this.ensureBucketConfigured();
+
+    const storageKey = this.buildPublicRegistrationStorageKey({
+      documentType: input.documentType,
+      fileName: input.fileName,
+      mimeType: input.mimeType,
+    });
+
+    const command = new PutObjectCommand({
+      Bucket: this.bucketName,
+      Key: storageKey,
+      Body: input.fileBuffer,
+      ContentType: input.mimeType ?? 'application/octet-stream',
+    });
+
+    try {
+      await this.s3Client.send(command);
+
+      return {
+        bucket: this.bucketName,
+        region: this.region,
+        key: storageKey,
+        fileName: input.fileName,
+        mimeType: input.mimeType ?? 'application/octet-stream',
+        fileSize: input.fileSize ?? input.fileBuffer.length,
+      };
+    } catch (error) {
+      throw new InternalServerErrorException(
+        `Failed to upload file: ${error instanceof Error ? error.message : 'unknown error'}`,
+      );
+    }
+  }
+
   async createDocument(input: CreateDocumentDto) {
     return this.prisma.document.create({
       data: {

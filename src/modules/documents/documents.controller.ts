@@ -49,7 +49,7 @@ export class DocumentsController {
     @Body() body: GenerateUploadUrlDto,
     @CurrentUser() user: JwtPayload,
   ) {
-    await this.authorizationService.assertOrganizationAccess(
+    await this.authorizationService.assertOrganizationWriteAccess(
       user,
       body.organizationId,
     );
@@ -83,7 +83,7 @@ export class DocumentsController {
     @Body() body: CreateDocumentDto,
     @CurrentUser() user: JwtPayload,
   ) {
-    await this.authorizationService.assertOrganizationAccess(
+    await this.authorizationService.assertOrganizationWriteAccess(
       user,
       body.organizationId,
     );

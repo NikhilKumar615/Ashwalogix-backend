@@ -96,7 +96,7 @@ export class DriversController {
     @Body() body: UpdateDriverDto,
     @CurrentUser() user: JwtPayload,
   ) {
-    await this.authorizationService.assertOrganizationAccess(user, organizationId, [
+    await this.authorizationService.assertOrganizationWriteAccess(user, organizationId, [
       OrganizationRole.ORG_ADMIN,
       OrganizationRole.OPERATIONS,
     ]);
@@ -116,7 +116,7 @@ export class DriversController {
     @Body() body: RegenerateDriverPasswordDto,
     @CurrentUser() user: JwtPayload,
   ) {
-    await this.authorizationService.assertOrganizationAccess(user, organizationId, [
+    await this.authorizationService.assertOrganizationWriteAccess(user, organizationId, [
       OrganizationRole.ORG_ADMIN,
       OrganizationRole.OPERATIONS,
     ]);
@@ -136,7 +136,7 @@ export class DriversController {
     @Param('organizationId') organizationId: string,
     @CurrentUser() user: JwtPayload,
   ) {
-    await this.authorizationService.assertOrganizationAccess(user, organizationId, [
+    await this.authorizationService.assertOrganizationWriteAccess(user, organizationId, [
       OrganizationRole.ORG_ADMIN,
       OrganizationRole.OPERATIONS,
     ]);

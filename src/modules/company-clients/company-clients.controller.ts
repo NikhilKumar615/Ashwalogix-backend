@@ -79,7 +79,7 @@ export class CompanyClientsController {
     @Body() body: CreateCompanyClientDto,
     @CurrentUser() user: JwtPayload,
   ) {
-    await this.authorizationService.assertOrganizationAccess(
+    await this.authorizationService.assertOrganizationWriteAccess(
       user,
       organizationId,
       [OrganizationRole.ORG_ADMIN, OrganizationRole.OPERATIONS],
@@ -130,7 +130,7 @@ export class CompanyClientsController {
     @Body() body: UpdateCompanyClientDto,
     @CurrentUser() user: JwtPayload,
   ) {
-    await this.authorizationService.assertOrganizationAccess(
+    await this.authorizationService.assertOrganizationWriteAccess(
       user,
       organizationId,
       [OrganizationRole.ORG_ADMIN, OrganizationRole.OPERATIONS],
@@ -185,7 +185,7 @@ export class CompanyClientsController {
     @Body() body: CreateCompanyClientLocationDto,
     @CurrentUser() user: JwtPayload,
   ) {
-    await this.authorizationService.assertOrganizationAccess(
+    await this.authorizationService.assertOrganizationWriteAccess(
       user,
       organizationId,
       [OrganizationRole.ORG_ADMIN, OrganizationRole.OPERATIONS],
@@ -212,7 +212,7 @@ export class CompanyClientsController {
     @Body() body: UpdateCompanyClientLocationDto,
     @CurrentUser() user: JwtPayload,
   ) {
-    await this.authorizationService.assertOrganizationAccess(
+    await this.authorizationService.assertOrganizationWriteAccess(
       user,
       organizationId,
       [OrganizationRole.ORG_ADMIN, OrganizationRole.OPERATIONS],
