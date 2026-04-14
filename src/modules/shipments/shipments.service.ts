@@ -1,5 +1,6 @@
 import { BadRequestException, Inject, Injectable } from '@nestjs/common';
 import {
+  DocumentEntityType,
   EventSource,
   ProofType,
   Prisma,
@@ -1094,6 +1095,70 @@ export class ShipmentsService {
         await this.closeTrackingSession(tx, shipmentId);
       },
     );
+  }
+
+  async deleteShipment(shipmentId: string, organizationId: string) {
+    const shipment = await this.ensureShipmentExists(shipmentId);
+
+    if (shipment.organizationId !== organizationId) {
+      throw new BadRequestException(
+        'organizationId does not match the shipment organization',
+      );
+    }
+
+    const deletableStatuses = new Set<ShipmentStatus>([
+      ShipmentStatus.DRAFT,
+      ShipmentStatus.PLANNED,
+      ShipmentStatus.CANCELLED,
+    ]);
+
+    if (!deletableStatuses.has(shipment.status)) {
+      throw new BadRequestException(
+        'Only draft, planned, or cancelled shipments can be deleted',
+      );
+    }
+
+    const [proofCount, trackingPointCount, trackingSessionCount] =
+      await Promise.all([
+        this.prisma.proofOfDelivery.count({
+          where: { shipmentId },
+        }),
+        this.prisma.trackingPoint.count({
+          where: { shipmentId },
+        }),
+        this.prisma.trackingSession.count({
+          where: { shipmentId },
+        }),
+      ]);
+
+    if (proofCount > 0 || trackingPointCount > 0 || trackingSessionCount > 0) {
+      throw new BadRequestException(
+        'Shipments with tracking history or proof of delivery cannot be deleted',
+      );
+    }
+
+    await this.prisma.$transaction(async (tx) => {
+      await tx.document.deleteMany({
+        where: {
+          OR: [
+            { shipmentId },
+            {
+              entityType: DocumentEntityType.SHIPMENT,
+              entityId: shipmentId,
+            },
+          ],
+        },
+      });
+
+      await tx.shipment.delete({
+        where: { id: shipmentId },
+      });
+    });
+
+    return {
+      id: shipmentId,
+      deleted: true,
+    };
   }
 
   private validateCreateShipmentInput(input: CreateShipmentDto) {

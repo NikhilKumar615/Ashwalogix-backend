@@ -1,5 +1,9 @@
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
-import { DriverStatus, ShipmentStatus } from '@prisma/client';
+import {
+  DriverStatus,
+  ShipmentAssignmentStatus,
+  ShipmentStatus,
+} from '@prisma/client';
 import { hash } from 'bcryptjs';
 import { randomUUID } from 'crypto';
 import { PrismaService } from '../../shared/prisma/prisma.service';
@@ -206,9 +210,21 @@ export class DriversService {
     const shipments = await this.prisma.shipment.findMany({
       where: {
         organizationId,
-        currentDriverId: driverId,
+        OR: [
+          { currentDriverId: driverId },
+          {
+            assignments: {
+              some: {
+                driverId,
+                assignmentStatus: ShipmentAssignmentStatus.ACTIVE,
+              },
+            },
+          },
+        ],
         status: {
           in: [
+            ShipmentStatus.DRAFT,
+            ShipmentStatus.PLANNED,
             ShipmentStatus.ASSIGNED,
             ShipmentStatus.EN_ROUTE_PICKUP,
             ShipmentStatus.AT_PICKUP,
@@ -223,11 +239,31 @@ export class DriversService {
         companyClient: true,
         sourceLocation: true,
         destinationLocation: true,
+        currentDriver: true,
         currentVehicle: true,
         stops: {
           orderBy: { stopSequence: 'asc' },
         },
         items: true,
+        assignments: {
+          where: {
+            driverId,
+          },
+          include: {
+            driver: true,
+            vehicle: true,
+          },
+          orderBy: { assignedAt: 'desc' },
+        },
+        statusEvents: {
+          include: {
+            driver: true,
+          },
+          orderBy: { eventTime: 'desc' },
+        },
+        proofOfDeliveries: {
+          orderBy: { capturedAt: 'desc' },
+        },
       },
     });
 

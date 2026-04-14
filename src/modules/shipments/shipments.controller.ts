@@ -2,6 +2,7 @@ import {
   UseGuards,
   Body,
   Controller,
+  Delete,
   Get,
   NotFoundException,
   Param,
@@ -703,5 +704,39 @@ export class ShipmentsController {
     });
 
     return this.shipmentsService.cancelShipment(shipmentId, body);
+  }
+
+  @Delete(':id')
+  @ApiOperation({ summary: 'Delete a shipment' })
+  @ApiParam({ name: 'id', type: String })
+  @ApiQuery({ name: 'organizationId', required: true, type: String })
+  @Roles(
+    OrganizationRole.ORG_ADMIN,
+    OrganizationRole.DISPATCHER,
+    OrganizationRole.OPERATIONS,
+  )
+  async deleteShipment(
+    @Param('id') shipmentId: string,
+    @Query('organizationId') organizationId: string,
+    @CurrentUser() user: JwtPayload,
+  ) {
+    await this.authorizationService.assertOrganizationWriteAccess(
+      user,
+      organizationId,
+      [
+        OrganizationRole.ORG_ADMIN,
+        OrganizationRole.DISPATCHER,
+        OrganizationRole.OPERATIONS,
+      ],
+    );
+    await this.authorizationService.assertShipmentWriteAccess(user, shipmentId, {
+      allowedOrganizationRoles: [
+        OrganizationRole.ORG_ADMIN,
+        OrganizationRole.DISPATCHER,
+        OrganizationRole.OPERATIONS,
+      ],
+    });
+
+    return this.shipmentsService.deleteShipment(shipmentId, organizationId);
   }
 }
