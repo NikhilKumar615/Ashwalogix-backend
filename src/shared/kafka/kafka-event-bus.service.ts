@@ -47,8 +47,8 @@ export class KafkaEventBusService
       const config: KafkaConfig = {
         clientId: this.kafkaClientId,
         brokers: this.brokers,
-        connectionTimeout: 3_000,
-        requestTimeout: 5_000,
+        connectionTimeout: 10_000,
+        requestTimeout: 30_000,
       };
       this.kafka = new Kafka(config);
     }
@@ -121,7 +121,12 @@ export class KafkaEventBusService
       return;
     }
 
-    const consumer = this.kafka.consumer({ groupId });
+    const consumer = this.kafka.consumer({
+      groupId,
+      sessionTimeout: 30_000,
+      rebalanceTimeout: 60_000,
+      heartbeatInterval: 3_000,
+    });
     this.consumers.push(consumer);
 
     try {

@@ -4,6 +4,7 @@ import { ConfigService } from '@nestjs/config';
 import type { StringValue } from 'ms';
 import { KafkaModule } from '../../shared/kafka/kafka.module';
 import { PrismaModule } from '../../shared/prisma/prisma.module';
+import { AuthModule } from '../auth/auth.module';
 import { ShipmentsModule } from '../shipments/shipments.module';
 import { TRACKING_PUB_SUB } from './tracking.constants';
 import { TrackingController } from './tracking.controller';
@@ -25,6 +26,7 @@ import { TrackingValidationService } from './tracking-validation.service';
 
 @Module({
   imports: [
+    AuthModule,
     KafkaModule,
     PrismaModule,
     ShipmentsModule,

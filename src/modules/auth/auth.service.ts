@@ -475,6 +475,7 @@ export class AuthService {
     const user = await this.prisma.user.findUnique({
       where: { id: userId },
       include: {
+        driverProfile: true,
         organizationMembers: {
           include: {
             organization: {
@@ -508,6 +509,21 @@ export class AuthService {
       status: user.status,
       emailVerifiedAt: user.emailVerifiedAt,
       approvedAt: user.approvedAt,
+      driverProfile: user.driverProfile
+        ? {
+            id: user.driverProfile.id,
+            organizationId: user.driverProfile.organizationId,
+            driverCode: user.driverProfile.driverCode,
+            fullName: user.driverProfile.fullName,
+            phone: user.driverProfile.phone,
+            email: user.driverProfile.email,
+            status: user.driverProfile.status,
+            employmentType: user.driverProfile.employmentType,
+            homeBase: user.driverProfile.homeBase,
+            licenseNumber: user.driverProfile.licenseNumber,
+            licenseExpiry: user.driverProfile.licenseExpiry,
+          }
+        : null,
       organizationMemberships: user.organizationMembers.map((membership) => ({
         organizationId: membership.organizationId,
         organizationName: membership.organization.name,
@@ -1703,6 +1719,7 @@ export class AuthService {
         email: email.toLowerCase(),
       },
       include: {
+        driverProfile: true,
         organizationMembers: {
           include: {
             organization: true,
@@ -1729,15 +1746,28 @@ export class AuthService {
     }
   }
 
-  private async completeLogin(user: {
-    id: string;
-    fullName: string;
-    email: string;
-    status: UserStatus;
-    platformRole: PlatformRole | null;
-    organizationMembers: {
-      organizationId: string;
-      role: OrganizationRole;
+    private async completeLogin(user: {
+      id: string;
+      fullName: string;
+      email: string;
+      status: UserStatus;
+      platformRole: PlatformRole | null;
+      driverProfile?: {
+        id: string;
+        organizationId: string;
+        driverCode: string;
+        fullName: string;
+        phone: string;
+        email: string | null;
+        status: import('@prisma/client').DriverStatus;
+        employmentType: import('@prisma/client').EmploymentType;
+        homeBase: string | null;
+        licenseNumber: string | null;
+        licenseExpiry: Date | null;
+      } | null;
+      organizationMembers: {
+        organizationId: string;
+        role: OrganizationRole;
       status: MembershipStatus;
       organization: {
         name: string;
@@ -1770,15 +1800,30 @@ export class AuthService {
 
     return {
       accessToken: await this.jwtService.signAsync(payload),
-      user: {
-        id: user.id,
-        fullName: user.fullName,
-        email: user.email,
-        platformRole: user.platformRole,
-        status: user.status,
-        organizationMemberships: activeMemberships.map((membership) => ({
-          organizationId: membership.organizationId,
-          organizationName: membership.organization.name,
+        user: {
+          id: user.id,
+          fullName: user.fullName,
+          email: user.email,
+          platformRole: user.platformRole,
+          status: user.status,
+          driverProfile: user.driverProfile
+            ? {
+                id: user.driverProfile.id,
+                organizationId: user.driverProfile.organizationId,
+                driverCode: user.driverProfile.driverCode,
+                fullName: user.driverProfile.fullName,
+                phone: user.driverProfile.phone,
+                email: user.driverProfile.email,
+                status: user.driverProfile.status,
+                employmentType: user.driverProfile.employmentType,
+                homeBase: user.driverProfile.homeBase,
+                licenseNumber: user.driverProfile.licenseNumber,
+                licenseExpiry: user.driverProfile.licenseExpiry,
+              }
+            : null,
+          organizationMemberships: activeMemberships.map((membership) => ({
+            organizationId: membership.organizationId,
+            organizationName: membership.organization.name,
           role: membership.role,
         })),
       },

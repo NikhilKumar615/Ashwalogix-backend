@@ -1,8 +1,13 @@
-import { Inject, Injectable } from '@nestjs/common';
+import { BadRequestException, ForbiddenException, Inject, Injectable } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
+import { OrganizationRole } from '@prisma/client';
 import { randomUUID } from 'crypto';
 import { TRACKING_EVENT_BUS } from '../../shared/kafka/kafka.constants';
 import type { TrackingEventBus } from '../../shared/kafka/interfaces/tracking-event-bus.interface';
+import { PrismaService } from '../../shared/prisma/prisma.service';
+import { AuthorizationService } from '../auth/authorization.service';
+import type { JwtPayload } from '../auth/interfaces/jwt-payload.interface';
+import { CreateDriverTrackingTokenDto } from './dto/create-driver-tracking-token.dto';
 import { CreateTrackingTestTokenDto } from './dto/create-tracking-test-token.dto';
 import { PublishTestOrderEventDto } from './dto/publish-test-order-event.dto';
 
@@ -10,20 +15,20 @@ import { PublishTestOrderEventDto } from './dto/publish-test-order-event.dto';
 export class TrackingTestingService {
   constructor(
     private readonly jwtService: JwtService,
+    private readonly prisma: PrismaService,
+    private readonly authorizationService: AuthorizationService,
     @Inject(TRACKING_EVENT_BUS)
     private readonly trackingEventBus: TrackingEventBus,
   ) {}
 
   async createToken(input: CreateTrackingTestTokenDto) {
-    const token = await this.jwtService.signAsync({
-      sub: input.subject ?? `${input.role}-swagger-tester`,
+    const token = await this.signTrackingToken({
+      subject: input.subject ?? `${input.role}-swagger-tester`,
       shipmentId: input.shipmentId,
       organizationId: input.organizationId,
       role: input.role,
-      destination: {
-        latitude: input.destinationLatitude,
-        longitude: input.destinationLongitude,
-      },
+      destinationLatitude: input.destinationLatitude,
+      destinationLongitude: input.destinationLongitude,
     });
 
     return {
@@ -41,6 +46,69 @@ export class TrackingTestingService {
         heading: 120,
         timestamp: new Date().toISOString(),
       },
+    };
+  }
+
+  async createDriverToken(user: JwtPayload, input: CreateDriverTrackingTokenDto) {
+    const shipment = await this.authorizationService.assertShipmentAccess(
+      user,
+      input.shipmentId,
+      {
+        allowedOrganizationRoles: [
+          OrganizationRole.ORG_ADMIN,
+          OrganizationRole.DISPATCHER,
+          OrganizationRole.OPERATIONS,
+        ],
+        allowAssignedDriver: true,
+      },
+    );
+
+    const driverProfile = await this.prisma.driver.findFirst({
+      where: {
+        organizationId: shipment.organizationId,
+        userId: user.sub,
+      },
+      select: {
+        id: true,
+        fullName: true,
+      },
+    });
+
+    if (!driverProfile) {
+      throw new ForbiddenException(
+        'The signed-in user is not linked to a driver profile for this organization',
+      );
+    }
+
+    if (shipment.currentDriverId && shipment.currentDriverId !== driverProfile.id) {
+      throw new ForbiddenException('This shipment is assigned to a different driver');
+    }
+
+    const destinationLatitude = input.destinationLatitude;
+    const destinationLongitude = input.destinationLongitude;
+
+    if (destinationLatitude === undefined || destinationLongitude === undefined) {
+      throw new BadRequestException(
+        'Destination coordinates are required for tracking ETA. Send destinationLatitude and destinationLongitude from the driver app or Swagger helper.',
+      );
+    }
+
+    const token = await this.signTrackingToken({
+      subject: user.email ?? driverProfile.fullName,
+      shipmentId: input.shipmentId,
+      organizationId: shipment.organizationId,
+      role: 'rider',
+      destinationLatitude,
+      destinationLongitude,
+    });
+
+    return {
+      token,
+      namespace: '/tracking',
+      event: 'location:update',
+      shipmentId: input.shipmentId,
+      driverId: driverProfile.id,
+      organizationId: shipment.organizationId,
     };
   }
 
@@ -134,5 +202,25 @@ export class TrackingTestingService {
       topic: 'order.events',
       event,
     };
+  }
+
+  private async signTrackingToken(input: {
+    subject: string;
+    shipmentId: string;
+    organizationId: string;
+    role: 'rider' | 'customer';
+    destinationLatitude: number;
+    destinationLongitude: number;
+  }) {
+    return this.jwtService.signAsync({
+      sub: input.subject,
+      shipmentId: input.shipmentId,
+      organizationId: input.organizationId,
+      role: input.role,
+      destination: {
+        latitude: input.destinationLatitude,
+        longitude: input.destinationLongitude,
+      },
+    });
   }
 }
