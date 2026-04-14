@@ -604,7 +604,8 @@ export class ShipmentsService {
       });
 
       const nextStatus =
-        shipment.status === ShipmentStatus.DRAFT
+        shipment.status === ShipmentStatus.DRAFT ||
+        shipment.status === ShipmentStatus.PLANNED
           ? ShipmentStatus.ASSIGNED
           : shipment.status;
 

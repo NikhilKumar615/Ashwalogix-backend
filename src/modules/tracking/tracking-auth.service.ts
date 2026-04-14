@@ -52,11 +52,5 @@ export class TrackingAuthService {
       throw new UnauthorizedException('Invalid tracking token payload');
     }
 
-    if (
-      typeof payload.destination?.latitude !== 'number' ||
-      typeof payload.destination?.longitude !== 'number'
-    ) {
-      throw new UnauthorizedException('Tracking token is missing destination coordinates');
-    }
   }
 }

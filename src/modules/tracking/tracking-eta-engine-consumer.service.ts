@@ -17,6 +17,13 @@ export class TrackingEtaEngineConsumerService implements OnModuleInit {
     await this.trackingEventBus.registerRiderLocationConsumer(
       'tracking-eta-engine',
       async (event) => {
+        if (!event.destination) {
+          this.logger.debug(
+            `ETA engine skipped rider.location for shipment ${event.shipmentId}: destination coordinates are unavailable`,
+          );
+          return;
+        }
+
         const etaSeconds = await this.trackingRoadEtaService.resolveEtaSeconds(
           event.shipmentId,
           {

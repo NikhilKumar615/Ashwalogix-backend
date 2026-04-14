@@ -50,7 +50,7 @@ export class TrackingTestingService {
   }
 
   async createDriverToken(user: JwtPayload, input: CreateDriverTrackingTokenDto) {
-    const shipment = await this.authorizationService.assertShipmentAccess(
+    const shipmentAccess = await this.authorizationService.assertShipmentAccess(
       user,
       input.shipmentId,
       {
@@ -63,9 +63,23 @@ export class TrackingTestingService {
       },
     );
 
+    const shipment = await this.prisma.shipment.findUnique({
+      where: { id: input.shipmentId },
+      select: {
+        id: true,
+        organizationId: true,
+        currentDriverId: true,
+        adminFormData: true,
+      },
+    });
+
+    if (!shipment) {
+      throw new BadRequestException('Shipment not found');
+    }
+
     const driverProfile = await this.prisma.driver.findFirst({
       where: {
-        organizationId: shipment.organizationId,
+        organizationId: shipmentAccess.organizationId,
         userId: user.sub,
       },
       select: {
@@ -84,22 +98,15 @@ export class TrackingTestingService {
       throw new ForbiddenException('This shipment is assigned to a different driver');
     }
 
-    const destinationLatitude = input.destinationLatitude;
-    const destinationLongitude = input.destinationLongitude;
-
-    if (destinationLatitude === undefined || destinationLongitude === undefined) {
-      throw new BadRequestException(
-        'Destination coordinates are required for tracking ETA. Send destinationLatitude and destinationLongitude from the driver app or Swagger helper.',
-      );
-    }
+    const destination = this.resolveTrackingDestination(shipment, input);
 
     const token = await this.signTrackingToken({
       subject: user.email ?? driverProfile.fullName,
       shipmentId: input.shipmentId,
       organizationId: shipment.organizationId,
       role: 'rider',
-      destinationLatitude,
-      destinationLongitude,
+      destinationLatitude: destination?.latitude,
+      destinationLongitude: destination?.longitude,
     });
 
     return {
@@ -209,18 +216,57 @@ export class TrackingTestingService {
     shipmentId: string;
     organizationId: string;
     role: 'rider' | 'customer';
-    destinationLatitude: number;
-    destinationLongitude: number;
+    destinationLatitude?: number;
+    destinationLongitude?: number;
   }) {
     return this.jwtService.signAsync({
       sub: input.subject,
       shipmentId: input.shipmentId,
       organizationId: input.organizationId,
       role: input.role,
-      destination: {
+      ...(input.destinationLatitude !== undefined &&
+      input.destinationLongitude !== undefined
+        ? {
+            destination: {
+              latitude: input.destinationLatitude,
+              longitude: input.destinationLongitude,
+            },
+          }
+        : {}),
+    });
+  }
+
+  private resolveTrackingDestination(
+    shipment: { adminFormData?: unknown },
+    input: CreateDriverTrackingTokenDto,
+  ) {
+    if (
+      input.destinationLatitude !== undefined &&
+      input.destinationLongitude !== undefined
+    ) {
+      return {
         latitude: input.destinationLatitude,
         longitude: input.destinationLongitude,
-      },
-    });
+      };
+    }
+
+    const adminFormData =
+      shipment.adminFormData &&
+      typeof shipment.adminFormData === 'object' &&
+      !Array.isArray(shipment.adminFormData)
+        ? (shipment.adminFormData as Record<string, unknown>)
+        : null;
+
+    const latitude = Number(adminFormData?.destinationLatitude);
+    const longitude = Number(adminFormData?.destinationLongitude);
+
+    if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) {
+      return null;
+    }
+
+    return {
+      latitude,
+      longitude,
+    };
   }
 }

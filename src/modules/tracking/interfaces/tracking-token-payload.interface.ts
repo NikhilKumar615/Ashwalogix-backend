@@ -5,10 +5,10 @@ export type TrackingTokenPayload = {
   shipmentId: string;
   organizationId: string;
   role: TrackingRole;
-  destination: {
+  destination?: {
     latitude: number;
     longitude: number;
-  };
+  } | null;
   email?: string;
   iat?: number;
   exp?: number;
