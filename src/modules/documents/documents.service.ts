@@ -4,7 +4,7 @@ import {
   InternalServerErrorException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
+import { GetObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { DocumentStatus } from '@prisma/client';
 import { randomUUID } from 'crypto';
@@ -160,6 +160,46 @@ export class DocumentsService {
       where: { shipmentId },
       orderBy: { uploadedAt: 'desc' },
     });
+  }
+
+  async getDocumentById(documentId: string) {
+    return this.prisma.document.findUnique({
+      where: { id: documentId },
+    });
+  }
+
+  async generateAccessUrl(documentId: string) {
+    this.ensureBucketConfigured();
+
+    const document = await this.getDocumentById(documentId);
+
+    if (!document) {
+      throw new BadRequestException('Document not found');
+    }
+
+    const command = new GetObjectCommand({
+      Bucket: document.storageBucket || this.bucketName,
+      Key: document.storageKey,
+      ResponseContentDisposition: 'inline',
+      ResponseContentType: document.mimeType ?? 'application/octet-stream',
+    });
+
+    try {
+      const url = await getSignedUrl(this.s3Client, command, {
+        expiresIn: 900,
+      });
+
+      return {
+        documentId: document.id,
+        fileName: document.fileName,
+        mimeType: document.mimeType,
+        url,
+      };
+    } catch (error) {
+      throw new InternalServerErrorException(
+        `Failed to generate access URL: ${error instanceof Error ? error.message : 'unknown error'}`,
+      );
+    }
   }
 
   private buildStorageKey(input: GenerateUploadUrlDto) {

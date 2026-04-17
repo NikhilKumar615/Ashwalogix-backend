@@ -105,6 +105,26 @@ export class ShipmentsController {
     return shipment;
   }
 
+  @Get('tracking/reverse-geocode')
+  @ApiOperation({ summary: 'Reverse geocode tracking coordinates to a readable place label' })
+  @ApiQuery({ name: 'latitude', required: true, type: Number })
+  @ApiQuery({ name: 'longitude', required: true, type: Number })
+  @Roles(
+    OrganizationRole.ORG_ADMIN,
+    OrganizationRole.DISPATCHER,
+    OrganizationRole.OPERATIONS,
+    OrganizationRole.WAREHOUSE,
+    OrganizationRole.DRIVER,
+  )
+  async reverseGeocodeTrackingPoint(
+    @Query('latitude') latitude: number,
+    @Query('longitude') longitude: number,
+  ) {
+    return {
+      label: await this.shipmentsService.reverseGeocodeCoordinates(latitude, longitude),
+    };
+  }
+
   @Get(':id')
   @ApiOperation({ summary: 'Get shipment details' })
   @ApiParam({ name: 'id', type: String })

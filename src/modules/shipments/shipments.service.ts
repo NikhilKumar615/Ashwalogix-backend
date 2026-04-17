@@ -45,6 +45,7 @@ type Coordinate = {
 };
 
 const geocodeCache = new Map<string, Coordinate | null>();
+const reverseGeocodeCache = new Map<string, string | null>();
 
 @Injectable()
 export class ShipmentsService {
@@ -136,6 +137,10 @@ export class ShipmentsService {
           orderBy: { uploadedAt: 'desc' },
         },
         proofOfDeliveries: {
+          include: {
+            photoDocument: true,
+            signatureDocument: true,
+          },
           orderBy: { capturedAt: 'desc' },
         },
       },
@@ -181,6 +186,10 @@ export class ShipmentsService {
           orderBy: { uploadedAt: 'desc' },
         },
         proofOfDeliveries: {
+          include: {
+            photoDocument: true,
+            signatureDocument: true,
+          },
           orderBy: { capturedAt: 'desc' },
         },
       },
@@ -547,6 +556,10 @@ export class ShipmentsService {
             orderBy: { uploadedAt: 'desc' },
           },
           proofOfDeliveries: {
+            include: {
+              photoDocument: true,
+              signatureDocument: true,
+            },
             orderBy: { capturedAt: 'desc' },
           },
         },
@@ -797,15 +810,43 @@ export class ShipmentsService {
     await this.ensureShipmentExists(shipmentId);
 
     const safeLimit =
-      limit && Number.isFinite(limit)
-        ? Math.min(Math.max(Number(limit), 1), 500)
-        : 100;
+      limit !== undefined && limit !== null && Number.isFinite(Number(limit))
+        ? Math.max(Number(limit), 1)
+        : null;
 
     return this.prisma.trackingPoint.findMany({
       where: { shipmentId },
       orderBy: { recordedAt: 'desc' },
-      take: safeLimit,
+      ...(safeLimit ? { take: safeLimit } : {}),
     });
+  }
+
+  async reverseGeocodeCoordinates(
+    latitude: number,
+    longitude: number,
+  ): Promise<string | null> {
+    const coordinate = this.firstValidCoordinate([latitude, longitude]);
+    if (!coordinate) {
+      return null;
+    }
+
+    const cacheKey = `${coordinate.latitude.toFixed(6)},${coordinate.longitude.toFixed(6)}`;
+    if (reverseGeocodeCache.has(cacheKey)) {
+      return reverseGeocodeCache.get(cacheKey) ?? null;
+    }
+
+    try {
+      const googleApiKey = process.env.GOOGLE_MAPS_API_KEY?.trim();
+      const label = googleApiKey
+        ? await this.reverseGeocodeWithGoogle(coordinate, googleApiKey)
+        : await this.reverseGeocodeWithNominatim(coordinate);
+
+      reverseGeocodeCache.set(cacheKey, label);
+      return label;
+    } catch {
+      reverseGeocodeCache.set(cacheKey, null);
+      return null;
+    }
   }
 
   async getTrackingStatus(shipmentId: string) {
@@ -1747,6 +1788,63 @@ export class ShipmentsService {
     const longitude = Number(payload?.[0]?.lon);
 
     return this.firstValidCoordinate([latitude, longitude]);
+  }
+
+  private async reverseGeocodeWithGoogle(
+    coordinate: Coordinate,
+    apiKey: string,
+  ): Promise<string | null> {
+    const url = new URL('https://maps.googleapis.com/maps/api/geocode/json');
+    url.searchParams.set('latlng', `${coordinate.latitude},${coordinate.longitude}`);
+    url.searchParams.set('key', apiKey);
+    url.searchParams.set('region', 'in');
+
+    const response = await fetch(url, {
+      headers: {
+        Accept: 'application/json',
+      },
+    });
+
+    if (!response.ok) {
+      return null;
+    }
+
+    const payload = (await response.json()) as {
+      results?: Array<{ formatted_address?: string }>;
+      status?: string;
+    };
+
+    if (payload.status !== 'OK') {
+      return null;
+    }
+
+    return payload.results?.[0]?.formatted_address?.trim() || null;
+  }
+
+  private async reverseGeocodeWithNominatim(
+    coordinate: Coordinate,
+  ): Promise<string | null> {
+    const url = new URL('https://nominatim.openstreetmap.org/reverse');
+    url.searchParams.set('format', 'jsonv2');
+    url.searchParams.set('lat', String(coordinate.latitude));
+    url.searchParams.set('lon', String(coordinate.longitude));
+
+    const response = await fetch(url, {
+      headers: {
+        Accept: 'application/json',
+        'User-Agent': 'AshwaLogix/1.0 shipment-reverse-geocoder',
+      },
+    });
+
+    if (!response.ok) {
+      return null;
+    }
+
+    const payload = (await response.json()) as {
+      display_name?: string;
+    };
+
+    return payload.display_name?.trim() || null;
   }
 
   private mapCompanyClient<

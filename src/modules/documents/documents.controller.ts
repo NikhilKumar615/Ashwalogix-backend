@@ -129,4 +129,44 @@ export class DocumentsController {
 
     return this.documentsService.getShipmentDocuments(shipmentId);
   }
+
+  @Get(':documentId/access-url')
+  @ApiOperation({ summary: 'Generate a signed access URL for a document' })
+  @ApiParam({ name: 'documentId', type: String })
+  @Roles(
+    OrganizationRole.ORG_ADMIN,
+    OrganizationRole.DISPATCHER,
+    OrganizationRole.OPERATIONS,
+    OrganizationRole.WAREHOUSE,
+    OrganizationRole.DRIVER,
+  )
+  async getDocumentAccessUrl(
+    @Param('documentId') documentId: string,
+    @CurrentUser() user: JwtPayload,
+  ) {
+    const document = await this.documentsService.getDocumentById(documentId);
+
+    if (!document) {
+      throw new BadRequestException('Document not found');
+    }
+
+    await this.authorizationService.assertOrganizationAccess(
+      user,
+      document.organizationId,
+    );
+
+    if (document.shipmentId) {
+      await this.authorizationService.assertShipmentAccess(user, document.shipmentId, {
+        allowedOrganizationRoles: [
+          OrganizationRole.ORG_ADMIN,
+          OrganizationRole.DISPATCHER,
+          OrganizationRole.OPERATIONS,
+          OrganizationRole.WAREHOUSE,
+        ],
+        allowAssignedDriver: true,
+      });
+    }
+
+    return this.documentsService.generateAccessUrl(documentId);
+  }
 }
