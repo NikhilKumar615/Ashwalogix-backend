@@ -15,6 +15,13 @@ import {
 } from '../../shared/codes/entity-code.util';
 import { UpdateDriverDto } from './dto/update-driver.dto';
 
+type Coordinate = {
+  latitude: number;
+  longitude: number;
+};
+
+const geocodeCache = new Map<string, Coordinate | null>();
+
 @Injectable()
 export class DriversService {
   constructor(private readonly prisma: PrismaService) {}
@@ -267,7 +274,9 @@ export class DriversService {
       },
     });
 
-    return shipments.map((shipment) => this.mapShipmentCompanyClient(shipment));
+    return Promise.all(
+      shipments.map((shipment) => this.enrichShipmentCoordinates(shipment)),
+    );
   }
 
   async getShipmentHistory(driverId: string, organizationId: string) {
@@ -304,7 +313,9 @@ export class DriversService {
       },
     });
 
-    return shipments.map((shipment) => this.mapShipmentCompanyClient(shipment));
+    return Promise.all(
+      shipments.map((shipment) => this.enrichShipmentCoordinates(shipment)),
+    );
   }
 
   private async ensureDriverExists(driverId: string, organizationId: string) {
@@ -388,6 +399,287 @@ export class DriversService {
       ...rest,
       companyClient: this.mapCompanyClient(companyClient),
     };
+  }
+
+  private async enrichShipmentCoordinates<
+    T extends {
+      adminFormData?: unknown;
+      sourceLocation?: Record<string, unknown> | null;
+      destinationLocation?: Record<string, unknown> | null;
+      sourceAddressSnapshot?: unknown;
+      destinationAddressSnapshot?: unknown;
+      stops?: Array<Record<string, unknown>> | null;
+      companyClient?: { companyClientCode?: string } | null;
+    },
+  >(shipment: T) {
+    const mappedShipment = this.mapShipmentCompanyClient(shipment);
+    const resolvedPickupCoordinates = await this.resolveShipmentCoordinate(
+      shipment,
+      'pickup',
+    );
+    const resolvedDestinationCoordinates = await this.resolveShipmentCoordinate(
+      shipment,
+      'destination',
+    );
+
+    return {
+      ...mappedShipment,
+      resolvedPickupCoordinates,
+      resolvedDestinationCoordinates,
+    };
+  }
+
+  private async resolveShipmentCoordinate(
+    shipment: {
+      adminFormData?: unknown;
+      sourceLocation?: Record<string, unknown> | null;
+      destinationLocation?: Record<string, unknown> | null;
+      sourceAddressSnapshot?: unknown;
+      destinationAddressSnapshot?: unknown;
+      stops?: Array<Record<string, unknown>> | null;
+    },
+    kind: 'pickup' | 'destination',
+  ) {
+    const formData =
+      shipment.adminFormData &&
+      typeof shipment.adminFormData === 'object' &&
+      !Array.isArray(shipment.adminFormData)
+        ? (shipment.adminFormData as Record<string, unknown>)
+        : {};
+    const stopType = kind === 'pickup' ? 'PICKUP' : 'DELIVERY';
+    const stop =
+      shipment.stops?.find((candidate) => candidate.stopType === stopType) || null;
+    const location =
+      kind === 'pickup' ? shipment.sourceLocation : shipment.destinationLocation;
+    const snapshotValue =
+      kind === 'pickup'
+        ? shipment.sourceAddressSnapshot
+        : shipment.destinationAddressSnapshot;
+    const snapshot =
+      snapshotValue &&
+      typeof snapshotValue === 'object' &&
+      !Array.isArray(snapshotValue)
+        ? (snapshotValue as Record<string, unknown>)
+        : null;
+
+    const directCoordinate = this.firstValidCoordinate(
+      [
+        formData[kind === 'pickup' ? 'originLatitude' : 'destinationLatitude'],
+        formData[kind === 'pickup' ? 'originLongitude' : 'destinationLongitude'],
+      ],
+      [
+        formData[kind === 'pickup' ? 'pickupLatitude' : 'receiverLatitude'],
+        formData[kind === 'pickup' ? 'pickupLongitude' : 'receiverLongitude'],
+      ],
+      [snapshot?.latitude, snapshot?.longitude],
+      [stop?.latitude, stop?.longitude],
+      [location?.latitude, location?.longitude],
+    );
+
+    if (directCoordinate) {
+      return directCoordinate;
+    }
+
+    const addressCandidates = this.buildAddressCandidates({
+      formData,
+      stop,
+      location,
+      snapshot,
+      kind,
+    });
+
+    for (const candidate of addressCandidates) {
+      const geocodedCoordinate = await this.geocodeAddress(candidate);
+      if (geocodedCoordinate) {
+        return geocodedCoordinate;
+      }
+    }
+
+    return null;
+  }
+
+  private firstValidCoordinate(
+    ...pairs: Array<[unknown, unknown] | null | undefined>
+  ): Coordinate | null {
+    for (const pair of pairs) {
+      if (!pair) {
+        continue;
+      }
+
+      const latitude = Number(pair[0]);
+      const longitude = Number(pair[1]);
+
+      if (
+        Number.isFinite(latitude) &&
+        Number.isFinite(longitude) &&
+        !(latitude === 0 && longitude === 0)
+      ) {
+        return { latitude, longitude };
+      }
+    }
+
+    return null;
+  }
+
+  private buildAddressCandidates(input: {
+    formData: Record<string, unknown>;
+    stop: Record<string, unknown> | null;
+    location: Record<string, unknown> | null | undefined;
+    snapshot: Record<string, unknown> | null | undefined;
+    kind: 'pickup' | 'destination';
+  }) {
+    const rawCandidates = [
+      [
+        input.location?.name,
+        input.location?.addressLine1,
+        input.location?.addressLine2,
+        input.location?.city,
+        input.location?.state,
+        input.location?.postalCode,
+        input.location?.country,
+      ],
+      [
+        input.stop?.locationName,
+        input.stop?.addressLine1,
+        input.stop?.addressLine2,
+        input.stop?.city,
+        input.stop?.state,
+        input.stop?.postalCode,
+        input.stop?.country,
+      ],
+      [
+        input.snapshot?.name,
+        input.snapshot?.addressLine1,
+        input.snapshot?.addressLine2,
+        input.snapshot?.city,
+        input.snapshot?.state,
+        input.snapshot?.postalCode,
+        input.snapshot?.country,
+      ],
+      [
+        input.formData[
+          input.kind === 'pickup' ? 'originName' : 'destinationName'
+        ],
+        input.formData[
+          input.kind === 'pickup' ? 'originAddress' : 'deliveryAddress'
+        ],
+        input.formData[
+          input.kind === 'pickup' ? 'originCity' : 'destinationCity'
+        ],
+        input.formData[
+          input.kind === 'pickup' ? 'originState' : 'destinationState'
+        ],
+        input.formData[
+          input.kind === 'pickup' ? 'originPincode' : 'destinationPincode'
+        ],
+        input.formData[
+          input.kind === 'pickup' ? 'originCountry' : 'destinationCountry'
+        ],
+      ],
+    ];
+
+    return [...new Set(
+      rawCandidates
+        .map((parts) =>
+          parts
+            .map((part) => String(part || '').trim())
+            .filter(Boolean)
+            .join(', '),
+        )
+        .filter(Boolean)
+        .map((candidate) =>
+          /\bindia\b/i.test(candidate) ? candidate : `${candidate}, India`,
+        ),
+    )];
+  }
+
+  private async geocodeAddress(address: string): Promise<Coordinate | null> {
+    const normalizedAddress = address.trim();
+    if (!normalizedAddress) {
+      return null;
+    }
+
+    if (geocodeCache.has(normalizedAddress)) {
+      return geocodeCache.get(normalizedAddress) ?? null;
+    }
+
+    try {
+      const googleApiKey = process.env.GOOGLE_MAPS_API_KEY?.trim();
+      const coordinate = googleApiKey
+        ? await this.geocodeWithGoogle(normalizedAddress, googleApiKey)
+        : await this.geocodeWithNominatim(normalizedAddress);
+
+      geocodeCache.set(normalizedAddress, coordinate);
+      return coordinate;
+    } catch {
+      geocodeCache.set(normalizedAddress, null);
+      return null;
+    }
+  }
+
+  private async geocodeWithGoogle(
+    address: string,
+    apiKey: string,
+  ): Promise<Coordinate | null> {
+    const url = new URL('https://maps.googleapis.com/maps/api/geocode/json');
+    url.searchParams.set('address', address);
+    url.searchParams.set('key', apiKey);
+    url.searchParams.set('region', 'in');
+
+    const response = await fetch(url, {
+      headers: {
+        Accept: 'application/json',
+      },
+    });
+
+    if (!response.ok) {
+      return null;
+    }
+
+    const payload = (await response.json()) as {
+      results?: Array<{
+        geometry?: { location?: { lat?: number; lng?: number } };
+      }>;
+      status?: string;
+    };
+
+    if (payload.status !== 'OK') {
+      return null;
+    }
+
+    const latitude = Number(payload.results?.[0]?.geometry?.location?.lat);
+    const longitude = Number(payload.results?.[0]?.geometry?.location?.lng);
+
+    return this.firstValidCoordinate([latitude, longitude]);
+  }
+
+  private async geocodeWithNominatim(address: string): Promise<Coordinate | null> {
+    const url = new URL('https://nominatim.openstreetmap.org/search');
+    url.searchParams.set('format', 'jsonv2');
+    url.searchParams.set('limit', '1');
+    url.searchParams.set('countrycodes', 'in');
+    url.searchParams.set('q', address);
+
+    const response = await fetch(url, {
+      headers: {
+        Accept: 'application/json',
+        'User-Agent': 'AshwaLogix/1.0 shipment-coordinate-resolver',
+      },
+    });
+
+    if (!response.ok) {
+      return null;
+    }
+
+    const payload = (await response.json()) as Array<{
+      lat?: string;
+      lon?: string;
+    }>;
+
+    const latitude = Number(payload?.[0]?.lat);
+    const longitude = Number(payload?.[0]?.lon);
+
+    return this.firstValidCoordinate([latitude, longitude]);
   }
 
   private mapCompanyClient<
