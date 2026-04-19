@@ -30,6 +30,7 @@ import { CreateShipmentDto } from './dto/create-shipment.dto';
 import { CreateProofOfDeliveryDto } from './dto/create-proof-of-delivery.dto';
 import { CreateTrackingPointDto } from './dto/create-tracking-point.dto';
 import { FailShipmentDto } from './dto/fail-shipment.dto';
+import { ManualShipmentStatusDto } from './dto/manual-shipment-status.dto';
 import { ShipmentStatusActionDto } from './dto/shipment-status-action.dto';
 import { StartTrackingSessionDto } from './dto/start-tracking-session.dto';
 import { UpdateShipmentDto } from './dto/update-shipment.dto';
@@ -785,6 +786,40 @@ export class ShipmentsController {
     });
 
     return this.shipmentsService.cancelShipment(shipmentId, body);
+  }
+
+  @Post(':id/manual-status')
+  @ApiOperation({ summary: 'Manually update shipment status as an admin' })
+  @ApiParam({ name: 'id', type: String })
+  @ApiBody({ type: ManualShipmentStatusDto })
+  @Roles(
+    OrganizationRole.ORG_ADMIN,
+    OrganizationRole.DISPATCHER,
+    OrganizationRole.OPERATIONS,
+  )
+  async manuallyUpdateShipmentStatus(
+    @Param('id') shipmentId: string,
+    @Body() body: ManualShipmentStatusDto,
+    @CurrentUser() user: JwtPayload,
+  ) {
+    await this.authorizationService.assertOrganizationWriteAccess(
+      user,
+      body.organizationId,
+      [
+        OrganizationRole.ORG_ADMIN,
+        OrganizationRole.DISPATCHER,
+        OrganizationRole.OPERATIONS,
+      ],
+    );
+    await this.authorizationService.assertShipmentWriteAccess(user, shipmentId, {
+      allowedOrganizationRoles: [
+        OrganizationRole.ORG_ADMIN,
+        OrganizationRole.DISPATCHER,
+        OrganizationRole.OPERATIONS,
+      ],
+    });
+
+    return this.shipmentsService.manuallyUpdateShipmentStatus(shipmentId, body);
   }
 
   @Delete(':id')

@@ -9,6 +9,7 @@ import {
   ShipmentAssignmentStatus,
   ShipmentStatus,
   ShipmentType,
+  StopType,
   StopStatus,
   TrackingSessionStatus,
 } from '@prisma/client';
@@ -29,6 +30,7 @@ import { CreateShipmentDto } from './dto/create-shipment.dto';
 import { CreateProofOfDeliveryDto } from './dto/create-proof-of-delivery.dto';
 import { CreateTrackingPointDto } from './dto/create-tracking-point.dto';
 import { FailShipmentDto } from './dto/fail-shipment.dto';
+import { ManualShipmentStatusDto } from './dto/manual-shipment-status.dto';
 import { ShipmentStatusActionDto } from './dto/shipment-status-action.dto';
 import { StartTrackingSessionDto } from './dto/start-tracking-session.dto';
 import { UpdateShipmentDto } from './dto/update-shipment.dto';
@@ -255,8 +257,28 @@ export class ShipmentsService {
     this.validateCreateShipmentInput(input);
 
     const status = ShipmentStatus.DRAFT;
-    const shipmentCode = await this.generateShipmentCode(input.organizationId);
+    const requestedShipmentCode = input.shipmentCode?.trim().toUpperCase();
+    const shipmentCode =
+      requestedShipmentCode || (await this.generateShipmentCode(input.organizationId));
     const resolvedCompanyClientId = input.companyClientId;
+
+    if (requestedShipmentCode) {
+      const existingShipment = await this.prisma.shipment.findUnique({
+        where: {
+          organizationId_shipmentCode: {
+            organizationId: input.organizationId,
+            shipmentCode: requestedShipmentCode,
+          },
+        },
+        select: { id: true },
+      });
+
+      if (existingShipment) {
+        throw new BadRequestException(
+          `Shipment code ${requestedShipmentCode} already exists`,
+        );
+      }
+    }
 
     const shipment = await this.prisma.shipment.create({
       data: {
@@ -1302,6 +1324,128 @@ export class ShipmentsService {
     );
   }
 
+  async manuallyUpdateShipmentStatus(
+    shipmentId: string,
+    input: ManualShipmentStatusDto,
+  ) {
+    const shipment = await this.ensureShipmentExists(shipmentId);
+
+    if (shipment.organizationId !== input.organizationId) {
+      throw new BadRequestException(
+        'organizationId does not match the shipment organization',
+      );
+    }
+
+    if (!Object.values(ShipmentStatus).includes(input.status)) {
+      throw new BadRequestException('status is invalid');
+    }
+
+    if (shipment.status === input.status) {
+      return this.getShipmentById(shipmentId);
+    }
+
+    const result = await this.prisma.$transaction(async (tx) => {
+      const now = new Date();
+      const shipmentUpdate: Prisma.ShipmentUpdateInput = {
+        status: input.status,
+      };
+      const pickupStartedStatuses = new Set<ShipmentStatus>([
+        ShipmentStatus.PICKED_UP,
+        ShipmentStatus.IN_TRANSIT,
+      ]);
+      const deliveryCompletedStatuses = new Set<ShipmentStatus>([
+        ShipmentStatus.DELIVERED,
+        ShipmentStatus.COMPLETED,
+      ]);
+      const terminalStatuses = new Set<ShipmentStatus>([
+        ShipmentStatus.DELIVERED,
+        ShipmentStatus.COMPLETED,
+        ShipmentStatus.FAILED,
+        ShipmentStatus.CANCELLED,
+      ]);
+      const pickupStopStatuses = new Set<ShipmentStatus>([
+        ShipmentStatus.AT_PICKUP,
+        ShipmentStatus.PICKED_UP,
+      ]);
+      const deliveryStopStatuses = new Set<ShipmentStatus>([
+        ShipmentStatus.AT_DELIVERY,
+        ShipmentStatus.DELIVERED,
+        ShipmentStatus.COMPLETED,
+      ]);
+
+      if (pickupStartedStatuses.has(input.status) && !shipment.actualPickupAt) {
+        shipmentUpdate.actualPickupAt = now;
+      }
+
+      if (deliveryCompletedStatuses.has(input.status) && !shipment.actualDeliveryAt) {
+        shipmentUpdate.actualDeliveryAt = now;
+      }
+
+      if (terminalStatuses.has(input.status)) {
+        await this.closeTrackingSession(tx, shipmentId);
+      }
+
+      await tx.shipment.update({
+        where: { id: shipmentId },
+        data: shipmentUpdate,
+      });
+
+      if (pickupStopStatuses.has(input.status)) {
+        await tx.shipmentStop.updateMany({
+          where: { shipmentId, stopType: StopType.PICKUP },
+          data: {
+            status:
+              input.status === ShipmentStatus.PICKED_UP
+                ? StopStatus.COMPLETED
+                : StopStatus.ARRIVED,
+            actualArrivalAt: now,
+            actualDepartureAt:
+              input.status === ShipmentStatus.PICKED_UP ? now : undefined,
+          },
+        });
+      }
+
+      if (deliveryStopStatuses.has(input.status)) {
+        await tx.shipmentStop.updateMany({
+          where: { shipmentId, stopType: StopType.DELIVERY },
+          data: {
+            status:
+              input.status === ShipmentStatus.AT_DELIVERY
+                ? StopStatus.ARRIVED
+                : StopStatus.COMPLETED,
+            actualArrivalAt: now,
+            actualDepartureAt:
+              input.status === ShipmentStatus.AT_DELIVERY ? undefined : now,
+          },
+        });
+      }
+
+      const event = {
+        organizationId: input.organizationId,
+        shipmentId,
+        eventType: 'shipment_status_manual_update',
+        fromStatus: shipment.status,
+        toStatus: input.status,
+        source: EventSource.ADMIN,
+        notes: input.notes || `Status manually changed to ${input.status}`,
+        metadata: {
+          manual: true,
+        },
+      };
+
+      await tx.shipmentStatusEvent.create({
+        data: event,
+      });
+
+      return {
+        orderEvent: this.toOrderEventMessage(event),
+      };
+    });
+
+    await this.publishOrderEventSafe(result.orderEvent);
+    return this.getShipmentById(shipmentId);
+  }
+
   async deleteShipment(shipmentId: string, organizationId: string) {
     const shipment = await this.ensureShipmentExists(shipmentId);
 
@@ -1379,6 +1523,7 @@ export class ShipmentsService {
 
     if (
       input.shipmentMode === ShipmentMode.BUSINESS &&
+      input.shipmentType !== ShipmentType.INBOUND &&
       !resolvedCompanyClientId
     ) {
       throw new BadRequestException(
