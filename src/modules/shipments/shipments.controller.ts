@@ -380,6 +380,33 @@ export class ShipmentsController {
     return this.shipmentsService.getTrackingHistory(shipmentId, limit);
   }
 
+  @Get(':id/tracking/snapped-route')
+  @ApiOperation({ summary: 'Get cached road-snapped tracking route for a shipment' })
+  @ApiParam({ name: 'id', type: String })
+  @Roles(
+    OrganizationRole.ORG_ADMIN,
+    OrganizationRole.DISPATCHER,
+    OrganizationRole.OPERATIONS,
+    OrganizationRole.WAREHOUSE,
+    OrganizationRole.DRIVER,
+  )
+  async getSnappedTrackingRoute(
+    @Param('id') shipmentId: string,
+    @CurrentUser() user: JwtPayload,
+  ) {
+    await this.authorizationService.assertShipmentAccess(user, shipmentId, {
+      allowedOrganizationRoles: [
+        OrganizationRole.ORG_ADMIN,
+        OrganizationRole.DISPATCHER,
+        OrganizationRole.OPERATIONS,
+        OrganizationRole.WAREHOUSE,
+      ],
+      allowAssignedDriver: true,
+    });
+
+    return this.shipmentsService.getSnappedTrackingRoute(shipmentId);
+  }
+
   @Get(':id/tracking/status')
   @ApiOperation({ summary: 'Get current trip tracking status for a shipment' })
   @ApiParam({ name: 'id', type: String })
@@ -470,6 +497,40 @@ export class ShipmentsController {
     });
 
     return this.shipmentsService.planShipment(shipmentId, body);
+  }
+
+  @Post(':id/confirm')
+  @ApiOperation({ summary: 'Confirm a draft shipment' })
+  @ApiParam({ name: 'id', type: String })
+  @ApiBody({ type: ShipmentStatusActionDto })
+  @Roles(
+    OrganizationRole.ORG_ADMIN,
+    OrganizationRole.DISPATCHER,
+    OrganizationRole.OPERATIONS,
+  )
+  async confirmShipment(
+    @Param('id') shipmentId: string,
+    @Body() body: ShipmentStatusActionDto,
+    @CurrentUser() user: JwtPayload,
+  ) {
+    await this.authorizationService.assertOrganizationWriteAccess(
+      user,
+      body.organizationId,
+      [
+        OrganizationRole.ORG_ADMIN,
+        OrganizationRole.DISPATCHER,
+        OrganizationRole.OPERATIONS,
+      ],
+    );
+    await this.authorizationService.assertShipmentWriteAccess(user, shipmentId, {
+      allowedOrganizationRoles: [
+        OrganizationRole.ORG_ADMIN,
+        OrganizationRole.DISPATCHER,
+        OrganizationRole.OPERATIONS,
+      ],
+    });
+
+    return this.shipmentsService.confirmShipment(shipmentId, body);
   }
 
   @Post(':id/mark-at-pickup')

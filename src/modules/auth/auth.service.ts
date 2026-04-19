@@ -530,6 +530,7 @@ export class AuthService {
         organizationStatus: membership.organization.status,
         role: membership.role,
         membershipStatus: membership.status,
+        sectionAccess: membership.sectionAccess,
         organization: {
           id: membership.organization.id,
           name: membership.organization.name,
@@ -1768,12 +1769,13 @@ export class AuthService {
       organizationMembers: {
         organizationId: string;
         role: OrganizationRole;
-      status: MembershipStatus;
-      organization: {
-        name: string;
-        status: OrganizationStatus;
-      };
-    }[];
+        status: MembershipStatus;
+        sectionAccess: Prisma.JsonValue | null;
+        organization: {
+          name: string;
+          status: OrganizationStatus;
+        };
+      }[];
   }) {
     const activeMemberships = user.organizationMembers.filter(
       (membership) => membership.status === MembershipStatus.ACTIVE,
@@ -1790,6 +1792,7 @@ export class AuthService {
       memberships: activeMemberships.map((membership) => ({
         organizationId: membership.organizationId,
         role: membership.role,
+        sectionAccess: membership.sectionAccess,
       })),
     };
 
@@ -1824,8 +1827,11 @@ export class AuthService {
           organizationMemberships: activeMemberships.map((membership) => ({
             organizationId: membership.organizationId,
             organizationName: membership.organization.name,
-          role: membership.role,
-        })),
+            organizationStatus: membership.organization.status,
+            role: membership.role,
+            membershipStatus: membership.status,
+            sectionAccess: membership.sectionAccess,
+          })),
       },
     };
   }

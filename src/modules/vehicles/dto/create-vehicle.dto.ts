@@ -1,5 +1,5 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
-import { VehicleOwnerType, VehicleStatus } from '@prisma/client';
+import { VehicleCapacityWeightUnit, VehicleOwnerType, VehicleStatus } from '@prisma/client';
 import { IsEnum, IsNumber, IsOptional, IsString, Min } from 'class-validator';
 
 export class CreateVehicleDto {
@@ -17,11 +17,10 @@ export class CreateVehicleDto {
   @Min(0)
   capacityWeight?: number;
 
-  @ApiPropertyOptional()
+  @ApiPropertyOptional({ enum: VehicleCapacityWeightUnit })
   @IsOptional()
-  @IsNumber()
-  @Min(0)
-  capacityVolume?: number;
+  @IsEnum(VehicleCapacityWeightUnit)
+  capacityWeightUnit?: VehicleCapacityWeightUnit;
 
   @ApiPropertyOptional({ enum: VehicleOwnerType })
   @IsOptional()

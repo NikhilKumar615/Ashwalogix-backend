@@ -7,7 +7,10 @@ import {
   IsString,
   Matches,
   MinLength,
+  ValidateNested,
 } from 'class-validator';
+import { Type } from 'class-transformer';
+import { SectionAccessDto } from './section-access.dto';
 
 export class UpdateOrganizationUserDto {
   @ApiPropertyOptional()
@@ -43,4 +46,10 @@ export class UpdateOrganizationUserDto {
   @IsOptional()
   @IsEnum(MembershipStatus)
   membershipStatus?: MembershipStatus;
+
+  @ApiPropertyOptional({ type: SectionAccessDto })
+  @IsOptional()
+  @ValidateNested()
+  @Type(() => SectionAccessDto)
+  sectionAccess?: SectionAccessDto;
 }

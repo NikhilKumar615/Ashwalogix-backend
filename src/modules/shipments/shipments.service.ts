@@ -44,8 +44,45 @@ type Coordinate = {
   longitude: number;
 };
 
+type TrackingRoutePoint = Coordinate & {
+  id?: string;
+  accuracy?: number | null;
+  recordedAt?: Date | string | null;
+};
+
+type SnappedRouteResponse = {
+  source: 'google_roads' | 'google_directions' | 'osrm' | 'raw';
+  points: Coordinate[];
+  rawPointCount: number;
+  routedPointCount: number;
+  cached: boolean;
+  providerErrors?: string[];
+};
+
+type SnappedRouteCacheEntry = {
+  expiresAt: number;
+  response: SnappedRouteResponse;
+};
+
+const OSRM_MATCH_BASE_URL = 'https://router.project-osrm.org/match/v1/driving';
+const OSRM_ROUTE_BASE_URL = 'https://router.project-osrm.org/route/v1/driving';
+const GOOGLE_DIRECTIONS_BASE_URL =
+  'https://maps.googleapis.com/maps/api/directions/json';
+const GOOGLE_ROADS_SNAP_BASE_URL = 'https://roads.googleapis.com/v1/snapToRoads';
+const ROUTE_CACHE_TTL_MS = 5 * 60 * 1000;
+const ROUTE_BATCH_SIZE = 20;
+const ROUTE_CONCURRENCY = 2;
+const GOOGLE_ROADS_POINT_BATCH_SIZE = 100;
+const GOOGLE_DIRECTIONS_POINT_BATCH_SIZE = 25;
+const MIN_ROUTE_POINT_DISTANCE_METRES = 5;
+const MIN_SNAP_POINT_DISTANCE_METRES = 35;
+const MAX_SNAP_POINTS = 220;
+const MAX_ROUTE_POINT_ACCURACY_METRES = 50;
+const MAX_ROUTE_CACHE_ENTRIES = 80;
+
 const geocodeCache = new Map<string, Coordinate | null>();
 const reverseGeocodeCache = new Map<string, string | null>();
+const snappedRouteCache = new Map<string, SnappedRouteCacheEntry>();
 
 @Injectable()
 export class ShipmentsService {
@@ -217,7 +254,7 @@ export class ShipmentsService {
   async createShipment(input: CreateShipmentDto) {
     this.validateCreateShipmentInput(input);
 
-    const status = input.initialStatus ?? ShipmentStatus.DRAFT;
+    const status = ShipmentStatus.DRAFT;
     const shipmentCode = await this.generateShipmentCode(input.organizationId);
     const resolvedCompanyClientId = input.companyClientId;
 
@@ -626,7 +663,6 @@ export class ShipmentsService {
       });
 
       const nextStatus =
-        shipment.status === ShipmentStatus.DRAFT ||
         shipment.status === ShipmentStatus.PLANNED
           ? ShipmentStatus.ASSIGNED
           : shipment.status;
@@ -821,6 +857,111 @@ export class ShipmentsService {
     });
   }
 
+  async getSnappedTrackingRoute(shipmentId: string): Promise<SnappedRouteResponse> {
+    await this.ensureShipmentExists(shipmentId);
+
+    const trackingPoints = await this.prisma.trackingPoint.findMany({
+      where: { shipmentId },
+      orderBy: { recordedAt: 'asc' },
+      select: {
+        id: true,
+        latitude: true,
+        longitude: true,
+        accuracy: true,
+        recordedAt: true,
+      },
+    });
+    const routePoints = this.filterRoutePoints(
+      trackingPoints.map((point) => this.toTrackingRoutePoint(point)),
+    );
+    const latestPoint = trackingPoints[trackingPoints.length - 1] || null;
+    const cacheKey = [
+      shipmentId,
+      trackingPoints.length,
+      latestPoint?.id || 'none',
+      latestPoint?.recordedAt?.toISOString() || 'none',
+    ].join(':');
+    const cachedRoute = snappedRouteCache.get(cacheKey);
+
+    if (cachedRoute && cachedRoute.expiresAt > Date.now()) {
+      return {
+        ...cachedRoute.response,
+        cached: true,
+      };
+    }
+
+    const fallbackResponse: SnappedRouteResponse = {
+      source: 'raw',
+      points: routePoints,
+      rawPointCount: routePoints.length,
+      routedPointCount: routePoints.length,
+      cached: false,
+    };
+
+    if (routePoints.length < 2) {
+      this.setSnappedRouteCache(cacheKey, fallbackResponse);
+      return fallbackResponse;
+    }
+
+    const hasGoogleDirections = Boolean(process.env.GOOGLE_MAPS_API_KEY?.trim());
+
+    try {
+      const points = hasGoogleDirections
+        ? await this.fetchGoogleRoadsRoute(routePoints)
+        : await this.fetchOsrmSnappedRoute(routePoints);
+      const response: SnappedRouteResponse = {
+        source: hasGoogleDirections ? 'google_roads' : 'osrm',
+        points,
+        rawPointCount: routePoints.length,
+        routedPointCount: points.length,
+        cached: false,
+      };
+      this.setSnappedRouteCache(cacheKey, response);
+      return response;
+    } catch (primaryError) {
+      const providerErrors = [this.toProviderErrorMessage('primary', primaryError)];
+      if (!hasGoogleDirections) {
+        fallbackResponse.providerErrors = providerErrors;
+        this.setSnappedRouteCache(cacheKey, fallbackResponse);
+        return fallbackResponse;
+      }
+
+      try {
+        const points = await this.fetchGoogleDirectionsRoute(routePoints);
+        const response: SnappedRouteResponse = {
+          source: 'google_directions',
+          points,
+          rawPointCount: routePoints.length,
+          routedPointCount: points.length,
+          cached: false,
+        };
+        this.setSnappedRouteCache(cacheKey, response);
+        return response;
+      } catch (directionsError) {
+        providerErrors.push(
+          this.toProviderErrorMessage('google_directions', directionsError),
+        );
+        try {
+          const points = await this.fetchOsrmSnappedRoute(routePoints);
+          const response: SnappedRouteResponse = {
+            source: 'osrm',
+            points,
+            rawPointCount: routePoints.length,
+            routedPointCount: points.length,
+            cached: false,
+          };
+          this.setSnappedRouteCache(cacheKey, response);
+          return response;
+        } catch (osrmError) {
+          providerErrors.push(this.toProviderErrorMessage('osrm', osrmError));
+          fallbackResponse.providerErrors = providerErrors;
+          this.setSnappedRouteCache(cacheKey, fallbackResponse);
+          return fallbackResponse;
+        }
+      }
+    }
+  }
+
   async reverseGeocodeCoordinates(
     latitude: number,
     longitude: number,
@@ -949,13 +1090,26 @@ export class ShipmentsService {
   }
 
   async planShipment(shipmentId: string, input: ShipmentStatusActionDto) {
+    return this.confirmShipment(shipmentId, input);
+  }
+
+  async confirmShipment(shipmentId: string, input: ShipmentStatusActionDto) {
+    const activeAssignment = await this.prisma.shipmentAssignment.findFirst({
+      where: {
+        shipmentId,
+        organizationId: input.organizationId,
+        assignmentStatus: ShipmentAssignmentStatus.ACTIVE,
+      },
+      select: { id: true },
+    });
+
     return this.transitionShipmentStatus(
       shipmentId,
       input.organizationId,
-      ShipmentStatus.PLANNED,
-      ['shipment_planned'],
+      activeAssignment ? ShipmentStatus.ASSIGNED : ShipmentStatus.PLANNED,
+      ['shipment_confirmed'],
       [ShipmentStatus.DRAFT],
-      input.notes ?? 'Shipment planned',
+      input.notes ?? 'Shipment confirmed',
     );
   }
 
@@ -1627,6 +1781,491 @@ export class ShipmentsService {
     }
 
     return null;
+  }
+
+  private toTrackingRoutePoint(point: {
+    id: string;
+    latitude: unknown;
+    longitude: unknown;
+    accuracy?: unknown;
+    recordedAt?: Date | string | null;
+  }): TrackingRoutePoint {
+    return {
+      id: point.id,
+      latitude: Number(point.latitude),
+      longitude: Number(point.longitude),
+      accuracy:
+        point.accuracy !== null && point.accuracy !== undefined
+          ? Number(point.accuracy)
+          : null,
+      recordedAt: point.recordedAt ?? null,
+    };
+  }
+
+  private filterRoutePoints(points: TrackingRoutePoint[]) {
+    const routePoints: TrackingRoutePoint[] = [];
+
+    for (const point of points) {
+      if (!this.isValidCoordinate(point)) {
+        continue;
+      }
+
+      if (
+        Number.isFinite(point.accuracy) &&
+        Number(point.accuracy) > MAX_ROUTE_POINT_ACCURACY_METRES
+      ) {
+        continue;
+      }
+
+      const previous = routePoints[routePoints.length - 1];
+      if (
+        previous &&
+        this.calculateDistanceMetres(previous, point) < MIN_ROUTE_POINT_DISTANCE_METRES
+      ) {
+        continue;
+      }
+
+      routePoints.push(point);
+    }
+
+    return routePoints;
+  }
+
+  private simplifyRoutePointsForSnapping(points: TrackingRoutePoint[]) {
+    if (points.length <= 2) {
+      return points;
+    }
+
+    const distanceFiltered = [points[0]];
+
+    for (const point of points.slice(1, -1)) {
+      const previous = distanceFiltered[distanceFiltered.length - 1];
+      if (this.calculateDistanceMetres(previous, point) >= MIN_SNAP_POINT_DISTANCE_METRES) {
+        distanceFiltered.push(point);
+      }
+    }
+
+    const lastPoint = points[points.length - 1];
+    if (
+      this.calculateDistanceMetres(
+        distanceFiltered[distanceFiltered.length - 1],
+        lastPoint,
+      ) > 0
+    ) {
+      distanceFiltered.push(lastPoint);
+    }
+
+    if (distanceFiltered.length <= MAX_SNAP_POINTS) {
+      return distanceFiltered;
+    }
+
+    const sampled: TrackingRoutePoint[] = [];
+    const lastIndex = distanceFiltered.length - 1;
+    for (let index = 0; index < MAX_SNAP_POINTS; index += 1) {
+      const sourceIndex = Math.round((index * lastIndex) / (MAX_SNAP_POINTS - 1));
+      const point = distanceFiltered[sourceIndex];
+      const previous = sampled[sampled.length - 1];
+      if (
+        !previous ||
+        previous.latitude !== point.latitude ||
+        previous.longitude !== point.longitude
+      ) {
+        sampled.push(point);
+      }
+    }
+
+    return sampled;
+  }
+
+  private async fetchOsrmSnappedRoute(points: TrackingRoutePoint[]) {
+    const snapPoints = this.simplifyRoutePointsForSnapping(points);
+    const chunks = this.chunkRoutePoints(snapPoints, ROUTE_BATCH_SIZE);
+    const snappedChunks = await this.mapWithConcurrency(
+      chunks,
+      ROUTE_CONCURRENCY,
+      (chunk) => this.fetchOsrmSegment(chunk),
+    );
+    const route = this.mergeRouteChunks(snappedChunks);
+
+    if (route.length < 2) {
+      throw new Error('OSRM returned too few route points');
+    }
+
+    return route;
+  }
+
+  private async fetchOsrmSegment(points: TrackingRoutePoint[]) {
+    try {
+      return await this.fetchOsrmMatchSegment(points);
+    } catch {
+      return this.fetchOsrmRouteSegment(points);
+    }
+  }
+
+  private async fetchOsrmMatchSegment(points: TrackingRoutePoint[]) {
+    const coordinates = this.toOsrmCoordinates(points);
+    const radiuses = points
+      .map((point) => {
+        const accuracy = Number.isFinite(point.accuracy)
+          ? Math.max(Number(point.accuracy), 5)
+          : 25;
+        return Math.min(Math.round(accuracy), MAX_ROUTE_POINT_ACCURACY_METRES);
+      })
+      .join(';');
+    const response = await fetch(
+      `${OSRM_MATCH_BASE_URL}/${coordinates}?geometries=polyline&overview=full&tidy=true&radiuses=${radiuses}`,
+      {
+        headers: { Accept: 'application/json' },
+        signal: AbortSignal.timeout(8_000),
+      },
+    );
+
+    if (!response.ok) {
+      throw new Error(`OSRM Match returned HTTP ${response.status}`);
+    }
+
+    const payload = (await response.json()) as {
+      code?: string;
+      message?: string;
+      matchings?: Array<{ geometry?: string }>;
+    };
+    const route = this.decodeRouteGeometries(
+      payload.matchings?.map((matching) => matching.geometry) ?? [],
+    );
+
+    if (route.length < 2) {
+      throw new Error(payload.message || payload.code || 'OSRM Match returned no geometry');
+    }
+
+    return route;
+  }
+
+  private async fetchOsrmRouteSegment(points: TrackingRoutePoint[]) {
+    const coordinates = this.toOsrmCoordinates(points);
+    const response = await fetch(
+      `${OSRM_ROUTE_BASE_URL}/${coordinates}?geometries=polyline&overview=full&continue_straight=false`,
+      {
+        headers: { Accept: 'application/json' },
+        signal: AbortSignal.timeout(8_000),
+      },
+    );
+
+    if (!response.ok) {
+      throw new Error(`OSRM Route returned HTTP ${response.status}`);
+    }
+
+    const payload = (await response.json()) as {
+      code?: string;
+      message?: string;
+      routes?: Array<{ geometry?: string }>;
+    };
+    const route = this.decodeRouteGeometries(
+      payload.routes?.map((routeItem) => routeItem.geometry) ?? [],
+    );
+
+    if (route.length < 2) {
+      throw new Error(payload.message || payload.code || 'OSRM Route returned no geometry');
+    }
+
+    return route;
+  }
+
+  private async fetchGoogleRoadsRoute(points: TrackingRoutePoint[]) {
+    const googleApiKey = process.env.GOOGLE_MAPS_API_KEY?.trim();
+    if (!googleApiKey) {
+      throw new Error('GOOGLE_MAPS_API_KEY is not configured');
+    }
+
+    const snapPoints = this.simplifyRoutePointsForSnapping(points);
+    const chunks = this.chunkRoutePoints(snapPoints, GOOGLE_ROADS_POINT_BATCH_SIZE);
+    const snappedChunks = await this.mapWithConcurrency(chunks, 1, (chunk) =>
+      this.fetchGoogleRoadsSegment(chunk, googleApiKey),
+    );
+    const route = this.mergeRouteChunks(snappedChunks);
+
+    if (route.length < 2) {
+      throw new Error('Google Roads returned too few route points');
+    }
+
+    return route;
+  }
+
+  private async fetchGoogleRoadsSegment(
+    points: TrackingRoutePoint[],
+    apiKey: string,
+  ) {
+    const url = new URL(GOOGLE_ROADS_SNAP_BASE_URL);
+    url.searchParams.set(
+      'path',
+      points.map((point) => `${point.latitude},${point.longitude}`).join('|'),
+    );
+    url.searchParams.set('interpolate', 'true');
+    url.searchParams.set('key', apiKey);
+
+    const response = await fetch(url, {
+      headers: { Accept: 'application/json' },
+      signal: AbortSignal.timeout(10_000),
+    });
+
+    if (!response.ok) {
+      throw new Error(`Google Roads returned HTTP ${response.status}`);
+    }
+
+    const payload = (await response.json()) as {
+      error?: { message?: string; status?: string };
+      snappedPoints?: Array<{
+        location?: { latitude?: number; longitude?: number };
+      }>;
+    };
+
+    if (payload.error) {
+      throw new Error(
+        payload.error.message || payload.error.status || 'Google Roads returned an error',
+      );
+    }
+
+    const route =
+      payload.snappedPoints
+        ?.map((point) => ({
+          latitude: Number(point.location?.latitude),
+          longitude: Number(point.location?.longitude),
+        }))
+        .filter((point) => this.isValidCoordinate(point)) ?? [];
+
+    if (route.length < 2) {
+      throw new Error('Google Roads returned no snapped geometry');
+    }
+
+    return route;
+  }
+
+  private async fetchGoogleDirectionsRoute(points: TrackingRoutePoint[]) {
+    const googleApiKey = process.env.GOOGLE_MAPS_API_KEY?.trim();
+    if (!googleApiKey) {
+      throw new Error('GOOGLE_MAPS_API_KEY is not configured');
+    }
+
+    const snapPoints = this.simplifyRoutePointsForSnapping(points);
+    const chunks = this.chunkRoutePoints(
+      snapPoints,
+      GOOGLE_DIRECTIONS_POINT_BATCH_SIZE,
+    );
+    const routedChunks = await this.mapWithConcurrency(chunks, 1, (chunk) =>
+      this.fetchGoogleDirectionsSegment(chunk, googleApiKey),
+    );
+    const route = this.mergeRouteChunks(routedChunks);
+
+    if (route.length < 2) {
+      throw new Error('Google Directions returned too few route points');
+    }
+
+    return route;
+  }
+
+  private async fetchGoogleDirectionsSegment(
+    points: TrackingRoutePoint[],
+    apiKey: string,
+  ) {
+    const origin = points[0];
+    const destination = points[points.length - 1];
+    const waypoints = points.slice(1, -1);
+    const url = new URL(GOOGLE_DIRECTIONS_BASE_URL);
+
+    url.searchParams.set('origin', `${origin.latitude},${origin.longitude}`);
+    url.searchParams.set(
+      'destination',
+      `${destination.latitude},${destination.longitude}`,
+    );
+    url.searchParams.set('mode', 'driving');
+    url.searchParams.set('region', 'in');
+    url.searchParams.set('key', apiKey);
+    if (waypoints.length) {
+      url.searchParams.set(
+        'waypoints',
+        waypoints
+          .map((point) => `${point.latitude},${point.longitude}`)
+          .join('|'),
+      );
+    }
+
+    const response = await fetch(url, {
+      headers: { Accept: 'application/json' },
+      signal: AbortSignal.timeout(10_000),
+    });
+
+    if (!response.ok) {
+      throw new Error(`Google Directions returned HTTP ${response.status}`);
+    }
+
+    const payload = (await response.json()) as {
+      status?: string;
+      error_message?: string;
+      routes?: Array<{ overview_polyline?: { points?: string } }>;
+    };
+    const encodedPolyline = payload.routes?.[0]?.overview_polyline?.points;
+
+    if (payload.status !== 'OK' || !encodedPolyline) {
+      throw new Error(
+        payload.error_message || payload.status || 'Google Directions returned no geometry',
+      );
+    }
+
+    return this.decodePolyline(encodedPolyline);
+  }
+
+  private chunkRoutePoints<T>(points: T[], batchSize: number) {
+    const chunks: T[][] = [];
+
+    for (let index = 0; index < points.length; index += batchSize - 1) {
+      const chunk = points.slice(index, index + batchSize);
+      if (chunk.length >= 2) {
+        chunks.push(chunk);
+      }
+    }
+
+    return chunks;
+  }
+
+  private async mapWithConcurrency<T, R>(
+    items: T[],
+    concurrency: number,
+    mapper: (item: T) => Promise<R>,
+  ) {
+    const results = new Array<R>(items.length);
+    let nextIndex = 0;
+
+    async function worker() {
+      while (nextIndex < items.length) {
+        const currentIndex = nextIndex;
+        nextIndex += 1;
+        results[currentIndex] = await mapper(items[currentIndex]);
+      }
+    }
+
+    const workerCount = Math.min(Math.max(concurrency, 1), items.length);
+    await Promise.all(Array.from({ length: workerCount }, () => worker()));
+
+    return results;
+  }
+
+  private mergeRouteChunks(chunks: Coordinate[][]) {
+    const route: Coordinate[] = [];
+
+    chunks.flat().forEach((point) => {
+      const previous = route[route.length - 1];
+      if (!previous || this.calculateDistanceMetres(previous, point) >= 1) {
+        route.push(point);
+      }
+    });
+
+    return route;
+  }
+
+  private decodeRouteGeometries(geometries: Array<string | undefined>) {
+    return geometries.flatMap((geometry) =>
+      geometry ? this.decodePolyline(geometry) : [],
+    );
+  }
+
+  private decodePolyline(polyline: string) {
+    const coordinates: Coordinate[] = [];
+    let index = 0;
+    let latitude = 0;
+    let longitude = 0;
+
+    while (index < polyline.length) {
+      const latitudeDelta = this.decodePolylineValue(polyline, index);
+      index = latitudeDelta.nextIndex;
+      latitude += latitudeDelta.value;
+
+      const longitudeDelta = this.decodePolylineValue(polyline, index);
+      index = longitudeDelta.nextIndex;
+      longitude += longitudeDelta.value;
+
+      coordinates.push({
+        latitude: latitude / 100000,
+        longitude: longitude / 100000,
+      });
+    }
+
+    return coordinates.filter((point) => this.isValidCoordinate(point));
+  }
+
+  private decodePolylineValue(polyline: string, startIndex: number) {
+    let result = 0;
+    let shift = 0;
+    let index = startIndex;
+    let byte = 0;
+
+    do {
+      byte = polyline.charCodeAt(index) - 63;
+      result |= (byte & 0x1f) << shift;
+      shift += 5;
+      index += 1;
+    } while (byte >= 0x20 && index < polyline.length);
+
+    return {
+      value: result & 1 ? ~(result >> 1) : result >> 1,
+      nextIndex: index,
+    };
+  }
+
+  private toOsrmCoordinates(points: TrackingRoutePoint[]) {
+    return points
+      .map((point) => `${point.longitude.toFixed(6)},${point.latitude.toFixed(6)}`)
+      .join(';');
+  }
+
+  private isValidCoordinate(point: Coordinate | null | undefined) {
+    return (
+      !!point &&
+      Number.isFinite(point.latitude) &&
+      Number.isFinite(point.longitude) &&
+      !(point.latitude === 0 && point.longitude === 0)
+    );
+  }
+
+  private calculateDistanceMetres(start: Coordinate, end: Coordinate) {
+    const earthRadiusMetres = 6371000;
+    const latitudeDelta = this.toRadians(end.latitude - start.latitude);
+    const longitudeDelta = this.toRadians(end.longitude - start.longitude);
+    const startLatitude = this.toRadians(start.latitude);
+    const endLatitude = this.toRadians(end.latitude);
+    const haversine =
+      Math.sin(latitudeDelta / 2) ** 2 +
+      Math.cos(startLatitude) *
+        Math.cos(endLatitude) *
+        Math.sin(longitudeDelta / 2) ** 2;
+
+    return (
+      2 *
+      earthRadiusMetres *
+      Math.atan2(Math.sqrt(haversine), Math.sqrt(1 - haversine))
+    );
+  }
+
+  private toRadians(value: number) {
+    return (value * Math.PI) / 180;
+  }
+
+  private toProviderErrorMessage(provider: string, error: unknown) {
+    const message = error instanceof Error ? error.message : 'unknown error';
+    return `${provider}: ${message}`;
+  }
+
+  private setSnappedRouteCache(cacheKey: string, response: SnappedRouteResponse) {
+    snappedRouteCache.set(cacheKey, {
+      expiresAt: Date.now() + ROUTE_CACHE_TTL_MS,
+      response,
+    });
+
+    while (snappedRouteCache.size > MAX_ROUTE_CACHE_ENTRIES) {
+      const oldestKey = snappedRouteCache.keys().next().value;
+      if (!oldestKey) {
+        return;
+      }
+      snappedRouteCache.delete(oldestKey);
+    }
   }
 
   private buildAddressCandidates(input: {

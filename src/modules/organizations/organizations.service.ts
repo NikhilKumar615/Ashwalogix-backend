@@ -28,7 +28,21 @@ import { CreateOrganizationUserDto } from './dto/create-organization-user.dto';
 import { RegisterCompanyDriverDto } from './dto/register-company-driver.dto';
 import { RegisterDispatcherDto } from './dto/register-dispatcher.dto';
 import { RegisterOrganizationStaffDto } from './dto/register-organization-staff.dto';
+import { SectionAccessDto } from './dto/section-access.dto';
 import { UpdateOrganizationUserDto } from './dto/update-organization-user.dto';
+
+const PORTAL_SECTION_KEYS = [
+  'dashboard',
+  'clients',
+  'shipments',
+  'warehouses',
+  'drivers',
+  'vehicles',
+  'users',
+  'documents',
+  'track',
+  'account',
+];
 
 @Injectable()
 export class OrganizationsService {
@@ -131,6 +145,7 @@ export class OrganizationsService {
         phone: input.phone,
         password: input.password,
         role: OrganizationRole.DISPATCHER,
+        sectionAccess: input.sectionAccess,
       },
       createdByUserId,
     );
@@ -151,6 +166,7 @@ export class OrganizationsService {
         phone: input.phone,
         password: input.password,
         role: OrganizationRole.WAREHOUSE,
+        sectionAccess: input.sectionAccess,
       },
       createdByUserId,
     );
@@ -171,6 +187,7 @@ export class OrganizationsService {
         phone: input.phone,
         password: input.password,
         role: OrganizationRole.OPERATIONS,
+        sectionAccess: input.sectionAccess,
       },
       createdByUserId,
     );
@@ -195,6 +212,7 @@ export class OrganizationsService {
         licenseNumber: input.licenseNumber,
         driverCode: input.driverCode,
         homeBase: input.homeBase,
+        sectionAccess: input.sectionAccess,
       },
       createdByUserId,
     );
@@ -255,6 +273,13 @@ export class OrganizationsService {
         },
         data: {
           status: input.membershipStatus,
+          sectionAccess:
+            input.sectionAccess === undefined
+              ? undefined
+              : (this.normalizeSectionAccess(
+                  organizationUser.role,
+                  input.sectionAccess,
+                ) as Prisma.InputJsonValue),
         },
       });
 
@@ -333,6 +358,10 @@ export class OrganizationsService {
           userId: user.id,
           role: input.role,
           status: MembershipStatus.ACTIVE,
+          sectionAccess: this.normalizeSectionAccess(
+            input.role,
+            input.sectionAccess,
+          ) as Prisma.InputJsonValue,
         },
       });
 
@@ -416,6 +445,38 @@ export class OrganizationsService {
         'A different user already exists with this email or phone',
       );
     }
+  }
+
+  private normalizeSectionAccess(
+    role: OrganizationRole,
+    input?: SectionAccessDto,
+  ) {
+    if (role === OrganizationRole.ORG_ADMIN || !input || input.fullAccess) {
+      return {
+        fullAccess: true,
+        sections: [],
+      };
+    }
+
+    const allowedSections = new Set(PORTAL_SECTION_KEYS);
+    const sections = Array.from(
+      new Set(
+        (input.sections || [])
+          .map((section) => section.trim().toLowerCase())
+          .filter((section) => allowedSections.has(section)),
+      ),
+    );
+
+    if (!sections.length) {
+      throw new BadRequestException(
+        'Select at least one portal section or enable full access',
+      );
+    }
+
+    return {
+      fullAccess: false,
+      sections,
+    };
   }
 
   private async ensureOrganizationIsActive(organizationId: string) {

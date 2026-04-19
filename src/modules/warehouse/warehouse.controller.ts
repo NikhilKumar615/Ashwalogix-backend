@@ -1,6 +1,8 @@
 import {
+  BadRequestException,
   Body,
   Controller,
+  Delete,
   Get,
   Param,
   Patch,
@@ -10,6 +12,7 @@ import {
 } from '@nestjs/common';
 import {
   InventoryItemStatus,
+  InventoryMovementType,
   OrganizationRole,
   WarehouseStatus,
 } from '@prisma/client';
@@ -29,8 +32,11 @@ import { RolesGuard } from '../auth/guards/roles.guard';
 import type { JwtPayload } from '../auth/interfaces/jwt-payload.interface';
 import { CreateInventoryItemDto } from './dto/create-inventory-item.dto';
 import { CreateInventoryMovementDto } from './dto/create-inventory-movement.dto';
+import { CreateStorageLocationDto } from './dto/create-storage-location.dto';
+import { ReverseInventoryMovementDto } from './dto/reverse-inventory-movement.dto';
 import { CreateWarehouseDto } from './dto/create-warehouse.dto';
 import { UpdateInventoryItemDto } from './dto/update-inventory-item.dto';
+import { UpdateStorageLocationDto } from './dto/update-storage-location.dto';
 import { UpdateWarehouseDto } from './dto/update-warehouse.dto';
 import { WarehouseService } from './warehouse.service';
 
@@ -233,6 +239,28 @@ export class WarehouseController {
     );
   }
 
+  @Delete('inventory-items/:inventoryItemId')
+  @ApiOperation({ summary: 'Delete an inventory item if it has no stock or movement history' })
+  @ApiParam({ name: 'organizationId', type: String })
+  @ApiParam({ name: 'inventoryItemId', type: String })
+  @Roles(OrganizationRole.ORG_ADMIN, OrganizationRole.OPERATIONS, OrganizationRole.WAREHOUSE)
+  async deleteInventoryItem(
+    @Param('organizationId') organizationId: string,
+    @Param('inventoryItemId') inventoryItemId: string,
+    @CurrentUser() user: JwtPayload,
+  ) {
+    await this.authorizationService.assertOrganizationWriteAccess(user, organizationId, [
+      OrganizationRole.ORG_ADMIN,
+      OrganizationRole.OPERATIONS,
+      OrganizationRole.WAREHOUSE,
+    ]);
+
+    return this.warehouseService.deleteInventoryItem(
+      organizationId,
+      inventoryItemId,
+    );
+  }
+
   @Get('warehouses/:warehouseId/stock')
   @ApiOperation({ summary: 'Get stock snapshot for a warehouse' })
   @ApiParam({ name: 'organizationId', type: String })
@@ -256,6 +284,112 @@ export class WarehouseController {
     ]);
 
     return this.warehouseService.getWarehouseStock(organizationId, warehouseId);
+  }
+
+  @Get('warehouses/:warehouseId/stock/alerts')
+  @ApiOperation({ summary: 'Get low and out-of-stock alerts for a warehouse' })
+  @ApiParam({ name: 'organizationId', type: String })
+  @ApiParam({ name: 'warehouseId', type: String })
+  @Roles(
+    OrganizationRole.ORG_ADMIN,
+    OrganizationRole.OPERATIONS,
+    OrganizationRole.WAREHOUSE,
+    OrganizationRole.DISPATCHER,
+  )
+  async getWarehouseStockAlerts(
+    @Param('organizationId') organizationId: string,
+    @Param('warehouseId') warehouseId: string,
+    @CurrentUser() user: JwtPayload,
+  ) {
+    await this.authorizationService.assertOrganizationAccess(user, organizationId, [
+      OrganizationRole.ORG_ADMIN,
+      OrganizationRole.OPERATIONS,
+      OrganizationRole.WAREHOUSE,
+      OrganizationRole.DISPATCHER,
+    ]);
+
+    return this.warehouseService.getWarehouseStockAlerts(
+      organizationId,
+      warehouseId,
+    );
+  }
+
+  @Get('warehouses/:warehouseId/storage-locations')
+  @ApiOperation({ summary: 'List storage locations for a warehouse' })
+  @ApiParam({ name: 'organizationId', type: String })
+  @ApiParam({ name: 'warehouseId', type: String })
+  @Roles(
+    OrganizationRole.ORG_ADMIN,
+    OrganizationRole.OPERATIONS,
+    OrganizationRole.WAREHOUSE,
+    OrganizationRole.DISPATCHER,
+  )
+  async listStorageLocations(
+    @Param('organizationId') organizationId: string,
+    @Param('warehouseId') warehouseId: string,
+    @CurrentUser() user: JwtPayload,
+  ) {
+    await this.authorizationService.assertOrganizationAccess(user, organizationId, [
+      OrganizationRole.ORG_ADMIN,
+      OrganizationRole.OPERATIONS,
+      OrganizationRole.WAREHOUSE,
+      OrganizationRole.DISPATCHER,
+    ]);
+
+    return this.warehouseService.listStorageLocations(organizationId, warehouseId);
+  }
+
+  @Post('warehouses/:warehouseId/storage-locations')
+  @ApiOperation({ summary: 'Create a storage location for a warehouse' })
+  @ApiParam({ name: 'organizationId', type: String })
+  @ApiParam({ name: 'warehouseId', type: String })
+  @ApiBody({ type: CreateStorageLocationDto })
+  @Roles(OrganizationRole.ORG_ADMIN, OrganizationRole.OPERATIONS, OrganizationRole.WAREHOUSE)
+  async createStorageLocation(
+    @Param('organizationId') organizationId: string,
+    @Param('warehouseId') warehouseId: string,
+    @Body() body: CreateStorageLocationDto,
+    @CurrentUser() user: JwtPayload,
+  ) {
+    await this.authorizationService.assertOrganizationWriteAccess(user, organizationId, [
+      OrganizationRole.ORG_ADMIN,
+      OrganizationRole.OPERATIONS,
+      OrganizationRole.WAREHOUSE,
+    ]);
+
+    return this.warehouseService.createStorageLocation(
+      organizationId,
+      warehouseId,
+      body,
+    );
+  }
+
+  @Patch('warehouses/:warehouseId/storage-locations/:id')
+  @ApiOperation({ summary: 'Update or deactivate a storage location' })
+  @ApiParam({ name: 'organizationId', type: String })
+  @ApiParam({ name: 'warehouseId', type: String })
+  @ApiParam({ name: 'id', type: String })
+  @ApiBody({ type: UpdateStorageLocationDto })
+  @Roles(OrganizationRole.ORG_ADMIN, OrganizationRole.OPERATIONS, OrganizationRole.WAREHOUSE)
+  async updateStorageLocation(
+    @Param('organizationId') organizationId: string,
+    @Param('warehouseId') warehouseId: string,
+    @Param('id') id: string,
+    @Body() body: UpdateStorageLocationDto,
+    @CurrentUser() user: JwtPayload,
+  ) {
+    await this.authorizationService.assertOrganizationWriteAccess(user, organizationId, [
+      OrganizationRole.ORG_ADMIN,
+      OrganizationRole.OPERATIONS,
+      OrganizationRole.WAREHOUSE,
+    ]);
+
+    return this.warehouseService.updateStorageLocation(
+      organizationId,
+      warehouseId,
+      id,
+      body,
+    );
   }
 
   @Get('inventory-movements')
@@ -305,6 +439,45 @@ export class WarehouseController {
       OrganizationRole.WAREHOUSE,
     ]);
 
+    if (body.movementType === InventoryMovementType.TRANSFER) {
+      if (!body.destinationWarehouseId) {
+        throw new BadRequestException(
+          'Destination warehouse is required for transfer movements',
+        );
+      }
+
+      if (body.destinationWarehouseId === body.warehouseId) {
+        throw new BadRequestException(
+          'Source and destination warehouses must be different for a transfer',
+        );
+      }
+    }
+
     return this.warehouseService.createInventoryMovement(organizationId, body);
+  }
+
+  @Post('inventory-movements/:movementId/reverse')
+  @ApiOperation({ summary: 'Reverse an inventory movement' })
+  @ApiParam({ name: 'organizationId', type: String })
+  @ApiParam({ name: 'movementId', type: String })
+  @ApiBody({ type: ReverseInventoryMovementDto })
+  @Roles(OrganizationRole.ORG_ADMIN, OrganizationRole.OPERATIONS, OrganizationRole.WAREHOUSE)
+  async reverseInventoryMovement(
+    @Param('organizationId') organizationId: string,
+    @Param('movementId') movementId: string,
+    @Body() body: ReverseInventoryMovementDto,
+    @CurrentUser() user: JwtPayload,
+  ) {
+    await this.authorizationService.assertOrganizationWriteAccess(user, organizationId, [
+      OrganizationRole.ORG_ADMIN,
+      OrganizationRole.OPERATIONS,
+      OrganizationRole.WAREHOUSE,
+    ]);
+
+    return this.warehouseService.reverseInventoryMovement(
+      organizationId,
+      movementId,
+      body,
+    );
   }
 }
