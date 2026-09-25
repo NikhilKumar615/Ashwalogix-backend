@@ -36,7 +36,9 @@ export class DocumentsController {
   ) {}
 
   @Post('upload-url')
-  @ApiOperation({ summary: 'Generate a presigned S3 upload URL for a document' })
+  @ApiOperation({
+    summary: 'Generate a signed Cloudinary upload target for a document',
+  })
   @ApiBody({ type: GenerateUploadUrlDto })
   @Roles(
     OrganizationRole.ORG_ADMIN,
@@ -61,9 +63,13 @@ export class DocumentsController {
         );
       }
 
-      await this.authorizationService.assertShipmentAccess(user, body.shipmentId, {
-        allowAssignedDriver: true,
-      });
+      await this.authorizationService.assertShipmentAccess(
+        user,
+        body.shipmentId,
+        {
+          allowAssignedDriver: true,
+        },
+      );
     }
 
     return this.documentsService.generateUploadUrl(body);
@@ -95,9 +101,13 @@ export class DocumentsController {
         );
       }
 
-      await this.authorizationService.assertShipmentAccess(user, body.shipmentId, {
-        allowAssignedDriver: true,
-      });
+      await this.authorizationService.assertShipmentAccess(
+        user,
+        body.shipmentId,
+        {
+          allowAssignedDriver: true,
+        },
+      );
     }
 
     return this.documentsService.createDocument(body);
@@ -156,15 +166,19 @@ export class DocumentsController {
     );
 
     if (document.shipmentId) {
-      await this.authorizationService.assertShipmentAccess(user, document.shipmentId, {
-        allowedOrganizationRoles: [
-          OrganizationRole.ORG_ADMIN,
-          OrganizationRole.DISPATCHER,
-          OrganizationRole.OPERATIONS,
-          OrganizationRole.WAREHOUSE,
-        ],
-        allowAssignedDriver: true,
-      });
+      await this.authorizationService.assertShipmentAccess(
+        user,
+        document.shipmentId,
+        {
+          allowedOrganizationRoles: [
+            OrganizationRole.ORG_ADMIN,
+            OrganizationRole.DISPATCHER,
+            OrganizationRole.OPERATIONS,
+            OrganizationRole.WAREHOUSE,
+          ],
+          allowAssignedDriver: true,
+        },
+      );
     }
 
     return this.documentsService.generateAccessUrl(documentId);

@@ -19,7 +19,7 @@ export class PublicDocumentsController {
   @Post('public-upload-url')
   @ApiOperation({
     summary:
-      'Generate a presigned upload URL for public onboarding documents before registration',
+      'Generate a signed Cloudinary upload target for public onboarding documents before registration',
   })
   @ApiBody({ type: GeneratePublicUploadUrlDto })
   async generatePublicUploadUrl(@Body() body: GeneratePublicUploadUrlDto) {
@@ -30,7 +30,7 @@ export class PublicDocumentsController {
   @UseInterceptors(FileInterceptor('file'))
   @ApiOperation({
     summary:
-      'Upload a public onboarding document through the backend to avoid browser-side storage CORS issues',
+      'Upload a public onboarding document through the backend to avoid browser-side Cloudinary CORS issues',
   })
   async uploadPublicDocument(
     @UploadedFile()

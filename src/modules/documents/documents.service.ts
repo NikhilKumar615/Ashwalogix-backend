@@ -4,8 +4,7 @@ import {
   InternalServerErrorException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { GetObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
-import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
+import { v2 as cloudinary } from 'cloudinary';
 import { DocumentStatus } from '@prisma/client';
 import { randomUUID } from 'crypto';
 import { PrismaService } from '../../shared/prisma/prisma.service';
@@ -15,85 +14,38 @@ import { GeneratePublicUploadUrlDto } from './dto/generate-public-upload-url.dto
 
 @Injectable()
 export class DocumentsService {
-  private readonly bucketName: string;
-  private readonly region: string;
-  private readonly s3Client: S3Client;
+  private readonly cloudName: string;
+  private readonly apiKey: string;
+  private readonly apiSecret: string;
 
   constructor(
     private readonly prisma: PrismaService,
     private readonly configService: ConfigService,
   ) {
-    this.bucketName = this.configService.get<string>('AWS_S3_BUCKET') ?? '';
-    this.region = this.configService.get<string>('AWS_REGION') ?? 'us-east-1';
+    this.cloudName =
+      this.configService.get<string>('CLOUDINARY_CLOUD_NAME') ?? '';
+    this.apiKey = this.configService.get<string>('CLOUDINARY_API_KEY') ?? '';
+    this.apiSecret =
+      this.configService.get<string>('CLOUDINARY_API_SECRET') ?? '';
 
-    const accessKeyId = this.configService.get<string>('AWS_ACCESS_KEY_ID');
-    const secretAccessKey = this.configService.get<string>(
-      'AWS_SECRET_ACCESS_KEY',
-    );
-
-    this.s3Client = new S3Client({
-      region: this.region,
-      credentials:
-        accessKeyId && secretAccessKey
-          ? { accessKeyId, secretAccessKey }
-          : undefined,
-    });
+    if (this.cloudName && this.apiKey && this.apiSecret) {
+      cloudinary.config({
+        cloud_name: this.cloudName,
+        api_key: this.apiKey,
+        api_secret: this.apiSecret,
+        secure: true,
+      });
+    }
   }
 
   async generateUploadUrl(input: GenerateUploadUrlDto) {
-    this.ensureBucketConfigured();
-
-    const storageKey = this.buildStorageKey(input);
-    const command = new PutObjectCommand({
-      Bucket: this.bucketName,
-      Key: storageKey,
-      ContentType: input.mimeType ?? 'application/octet-stream',
-    });
-
-    try {
-      const uploadUrl = await getSignedUrl(this.s3Client, command, {
-        expiresIn: 900,
-      });
-
-      return {
-        bucket: this.bucketName,
-        region: this.region,
-        key: storageKey,
-        uploadUrl,
-      };
-    } catch (error) {
-      throw new InternalServerErrorException(
-        `Failed to generate upload URL: ${error instanceof Error ? error.message : 'unknown error'}`,
-      );
-    }
+    return this.createSignedUploadTarget(this.buildStorageKey(input));
   }
 
   async generatePublicUploadUrl(input: GeneratePublicUploadUrlDto) {
-    this.ensureBucketConfigured();
-
-    const storageKey = this.buildPublicRegistrationStorageKey(input);
-    const command = new PutObjectCommand({
-      Bucket: this.bucketName,
-      Key: storageKey,
-      ContentType: input.mimeType ?? 'application/octet-stream',
-    });
-
-    try {
-      const uploadUrl = await getSignedUrl(this.s3Client, command, {
-        expiresIn: 900,
-      });
-
-      return {
-        bucket: this.bucketName,
-        region: this.region,
-        key: storageKey,
-        uploadUrl,
-      };
-    } catch (error) {
-      throw new InternalServerErrorException(
-        `Failed to generate upload URL: ${error instanceof Error ? error.message : 'unknown error'}`,
-      );
-    }
+    return this.createSignedUploadTarget(
+      this.buildPublicRegistrationStorageKey(input),
+    );
   }
 
   async uploadPublicRegistrationDocument(input: {
@@ -103,35 +55,47 @@ export class DocumentsService {
     fileBuffer: Buffer;
     fileSize?: number;
   }) {
-    this.ensureBucketConfigured();
-
+    this.ensureCloudinaryConfigured();
     const storageKey = this.buildPublicRegistrationStorageKey({
       documentType: input.documentType,
       fileName: input.fileName,
       mimeType: input.mimeType,
     });
 
-    const command = new PutObjectCommand({
-      Bucket: this.bucketName,
-      Key: storageKey,
-      Body: input.fileBuffer,
-      ContentType: input.mimeType ?? 'application/octet-stream',
-    });
-
     try {
-      await this.s3Client.send(command);
+      const result = await new Promise<{ public_id: string }>(
+        (resolve, reject) => {
+          const stream = cloudinary.uploader.upload_stream(
+            {
+              resource_type: 'raw',
+              type: 'authenticated',
+              public_id: storageKey,
+              overwrite: false,
+            },
+            (error, uploadResult) => {
+              if (error || !uploadResult) {
+                reject(
+                  error ??
+                    new Error('Cloudinary did not return an upload result'),
+                );
+                return;
+              }
+              resolve({ public_id: uploadResult.public_id });
+            },
+          );
+          stream.end(input.fileBuffer);
+        },
+      );
 
-      return {
-        bucket: this.bucketName,
-        region: this.region,
-        key: storageKey,
+      return this.storageMetadata({
+        key: result.public_id,
         fileName: input.fileName,
-        mimeType: input.mimeType ?? 'application/octet-stream',
+        mimeType: input.mimeType,
         fileSize: input.fileSize ?? input.fileBuffer.length,
-      };
+      });
     } catch (error) {
       throw new InternalServerErrorException(
-        `Failed to upload file: ${error instanceof Error ? error.message : 'unknown error'}`,
+        `Failed to upload file to Cloudinary: ${error instanceof Error ? error.message : 'unknown error'}`,
       );
     }
   }
@@ -163,32 +127,27 @@ export class DocumentsService {
   }
 
   async getDocumentById(documentId: string) {
-    return this.prisma.document.findUnique({
-      where: { id: documentId },
-    });
+    return this.prisma.document.findUnique({ where: { id: documentId } });
   }
 
   async generateAccessUrl(documentId: string) {
-    this.ensureBucketConfigured();
-
+    this.ensureCloudinaryConfigured();
     const document = await this.getDocumentById(documentId);
-
     if (!document) {
       throw new BadRequestException('Document not found');
     }
 
-    const command = new GetObjectCommand({
-      Bucket: document.storageBucket || this.bucketName,
-      Key: document.storageKey,
-      ResponseContentDisposition: 'inline',
-      ResponseContentType: document.mimeType ?? 'application/octet-stream',
-    });
-
     try {
-      const url = await getSignedUrl(this.s3Client, command, {
-        expiresIn: 900,
-      });
-
+      const url = cloudinary.utils.private_download_url(
+        document.storageKey,
+        '',
+        {
+          resource_type: 'raw',
+          type: 'authenticated',
+          expires_at: Math.floor(Date.now() / 1000) + 900,
+          attachment: false,
+        },
+      );
       return {
         documentId: document.id,
         fileName: document.fileName,
@@ -197,9 +156,48 @@ export class DocumentsService {
       };
     } catch (error) {
       throw new InternalServerErrorException(
-        `Failed to generate access URL: ${error instanceof Error ? error.message : 'unknown error'}`,
+        `Failed to generate document access URL: ${error instanceof Error ? error.message : 'unknown error'}`,
       );
     }
+  }
+
+  private createSignedUploadTarget(storageKey: string) {
+    this.ensureCloudinaryConfigured();
+    const timestamp = Math.floor(Date.now() / 1000);
+    const uploadFields = {
+      api_key: this.apiKey,
+      timestamp: String(timestamp),
+      public_id: storageKey,
+      type: 'authenticated',
+      signature: cloudinary.utils.api_sign_request(
+        { public_id: storageKey, timestamp, type: 'authenticated' },
+        this.apiSecret,
+      ),
+    };
+
+    return {
+      ...this.storageMetadata({ key: storageKey }),
+      uploadUrl: `https://api.cloudinary.com/v1_1/${this.cloudName}/raw/upload`,
+      uploadMethod: 'POST' as const,
+      uploadFields,
+    };
+  }
+
+  private storageMetadata(input: {
+    key: string;
+    fileName?: string;
+    mimeType?: string;
+    fileSize?: number;
+  }) {
+    return {
+      bucket: this.cloudName,
+      storageBucket: this.cloudName,
+      key: input.key,
+      storageKey: input.key,
+      fileName: input.fileName,
+      mimeType: input.mimeType ?? 'application/octet-stream',
+      fileSize: input.fileSize,
+    };
   }
 
   private buildStorageKey(input: GenerateUploadUrlDto) {
@@ -224,10 +222,10 @@ export class DocumentsService {
     ].join('/');
   }
 
-  private ensureBucketConfigured() {
-    if (!this.bucketName) {
+  private ensureCloudinaryConfigured() {
+    if (!this.cloudName || !this.apiKey || !this.apiSecret) {
       throw new BadRequestException(
-        'AWS_S3_BUCKET is not configured in the environment',
+        'CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, and CLOUDINARY_API_SECRET must be configured',
       );
     }
   }
