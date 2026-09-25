@@ -2,7 +2,7 @@ export type TrackingBroadcastPayload = {
   shipmentId: string;
   latitude: number;
   longitude: number;
-  etaSeconds: number;
+  etaSeconds: number | null;
   timestamp: string;
 };
 

@@ -2,6 +2,7 @@ import {
   UseGuards,
   Body,
   Controller,
+  Delete,
   Get,
   NotFoundException,
   Param,
@@ -29,6 +30,7 @@ import { CreateShipmentDto } from './dto/create-shipment.dto';
 import { CreateProofOfDeliveryDto } from './dto/create-proof-of-delivery.dto';
 import { CreateTrackingPointDto } from './dto/create-tracking-point.dto';
 import { FailShipmentDto } from './dto/fail-shipment.dto';
+import { ManualShipmentStatusDto } from './dto/manual-shipment-status.dto';
 import { ShipmentStatusActionDto } from './dto/shipment-status-action.dto';
 import { StartTrackingSessionDto } from './dto/start-tracking-session.dto';
 import { UpdateShipmentDto } from './dto/update-shipment.dto';
@@ -102,6 +104,26 @@ export class ShipmentsController {
     }
 
     return shipment;
+  }
+
+  @Get('tracking/reverse-geocode')
+  @ApiOperation({ summary: 'Reverse geocode tracking coordinates to a readable place label' })
+  @ApiQuery({ name: 'latitude', required: true, type: Number })
+  @ApiQuery({ name: 'longitude', required: true, type: Number })
+  @Roles(
+    OrganizationRole.ORG_ADMIN,
+    OrganizationRole.DISPATCHER,
+    OrganizationRole.OPERATIONS,
+    OrganizationRole.WAREHOUSE,
+    OrganizationRole.DRIVER,
+  )
+  async reverseGeocodeTrackingPoint(
+    @Query('latitude') latitude: number,
+    @Query('longitude') longitude: number,
+  ) {
+    return {
+      label: await this.shipmentsService.reverseGeocodeCoordinates(latitude, longitude),
+    };
   }
 
   @Get(':id')
@@ -359,6 +381,33 @@ export class ShipmentsController {
     return this.shipmentsService.getTrackingHistory(shipmentId, limit);
   }
 
+  @Get(':id/tracking/snapped-route')
+  @ApiOperation({ summary: 'Get cached road-snapped tracking route for a shipment' })
+  @ApiParam({ name: 'id', type: String })
+  @Roles(
+    OrganizationRole.ORG_ADMIN,
+    OrganizationRole.DISPATCHER,
+    OrganizationRole.OPERATIONS,
+    OrganizationRole.WAREHOUSE,
+    OrganizationRole.DRIVER,
+  )
+  async getSnappedTrackingRoute(
+    @Param('id') shipmentId: string,
+    @CurrentUser() user: JwtPayload,
+  ) {
+    await this.authorizationService.assertShipmentAccess(user, shipmentId, {
+      allowedOrganizationRoles: [
+        OrganizationRole.ORG_ADMIN,
+        OrganizationRole.DISPATCHER,
+        OrganizationRole.OPERATIONS,
+        OrganizationRole.WAREHOUSE,
+      ],
+      allowAssignedDriver: true,
+    });
+
+    return this.shipmentsService.getSnappedTrackingRoute(shipmentId);
+  }
+
   @Get(':id/tracking/status')
   @ApiOperation({ summary: 'Get current trip tracking status for a shipment' })
   @ApiParam({ name: 'id', type: String })
@@ -449,6 +498,40 @@ export class ShipmentsController {
     });
 
     return this.shipmentsService.planShipment(shipmentId, body);
+  }
+
+  @Post(':id/confirm')
+  @ApiOperation({ summary: 'Confirm a draft shipment' })
+  @ApiParam({ name: 'id', type: String })
+  @ApiBody({ type: ShipmentStatusActionDto })
+  @Roles(
+    OrganizationRole.ORG_ADMIN,
+    OrganizationRole.DISPATCHER,
+    OrganizationRole.OPERATIONS,
+  )
+  async confirmShipment(
+    @Param('id') shipmentId: string,
+    @Body() body: ShipmentStatusActionDto,
+    @CurrentUser() user: JwtPayload,
+  ) {
+    await this.authorizationService.assertOrganizationWriteAccess(
+      user,
+      body.organizationId,
+      [
+        OrganizationRole.ORG_ADMIN,
+        OrganizationRole.DISPATCHER,
+        OrganizationRole.OPERATIONS,
+      ],
+    );
+    await this.authorizationService.assertShipmentWriteAccess(user, shipmentId, {
+      allowedOrganizationRoles: [
+        OrganizationRole.ORG_ADMIN,
+        OrganizationRole.DISPATCHER,
+        OrganizationRole.OPERATIONS,
+      ],
+    });
+
+    return this.shipmentsService.confirmShipment(shipmentId, body);
   }
 
   @Post(':id/mark-at-pickup')
@@ -703,5 +786,73 @@ export class ShipmentsController {
     });
 
     return this.shipmentsService.cancelShipment(shipmentId, body);
+  }
+
+  @Post(':id/manual-status')
+  @ApiOperation({ summary: 'Manually update shipment status as an admin' })
+  @ApiParam({ name: 'id', type: String })
+  @ApiBody({ type: ManualShipmentStatusDto })
+  @Roles(
+    OrganizationRole.ORG_ADMIN,
+    OrganizationRole.DISPATCHER,
+    OrganizationRole.OPERATIONS,
+  )
+  async manuallyUpdateShipmentStatus(
+    @Param('id') shipmentId: string,
+    @Body() body: ManualShipmentStatusDto,
+    @CurrentUser() user: JwtPayload,
+  ) {
+    await this.authorizationService.assertOrganizationWriteAccess(
+      user,
+      body.organizationId,
+      [
+        OrganizationRole.ORG_ADMIN,
+        OrganizationRole.DISPATCHER,
+        OrganizationRole.OPERATIONS,
+      ],
+    );
+    await this.authorizationService.assertShipmentWriteAccess(user, shipmentId, {
+      allowedOrganizationRoles: [
+        OrganizationRole.ORG_ADMIN,
+        OrganizationRole.DISPATCHER,
+        OrganizationRole.OPERATIONS,
+      ],
+    });
+
+    return this.shipmentsService.manuallyUpdateShipmentStatus(shipmentId, body);
+  }
+
+  @Delete(':id')
+  @ApiOperation({ summary: 'Delete a shipment' })
+  @ApiParam({ name: 'id', type: String })
+  @ApiQuery({ name: 'organizationId', required: true, type: String })
+  @Roles(
+    OrganizationRole.ORG_ADMIN,
+    OrganizationRole.DISPATCHER,
+    OrganizationRole.OPERATIONS,
+  )
+  async deleteShipment(
+    @Param('id') shipmentId: string,
+    @Query('organizationId') organizationId: string,
+    @CurrentUser() user: JwtPayload,
+  ) {
+    await this.authorizationService.assertOrganizationWriteAccess(
+      user,
+      organizationId,
+      [
+        OrganizationRole.ORG_ADMIN,
+        OrganizationRole.DISPATCHER,
+        OrganizationRole.OPERATIONS,
+      ],
+    );
+    await this.authorizationService.assertShipmentWriteAccess(user, shipmentId, {
+      allowedOrganizationRoles: [
+        OrganizationRole.ORG_ADMIN,
+        OrganizationRole.DISPATCHER,
+        OrganizationRole.OPERATIONS,
+      ],
+    });
+
+    return this.shipmentsService.deleteShipment(shipmentId, organizationId);
   }
 }

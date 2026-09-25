@@ -29,6 +29,12 @@ export class CreateInventoryItemDto {
   @IsOptional()
   @IsNumber()
   @Min(0)
+  rate?: number;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsNumber()
+  @Min(0)
   minThreshold?: number;
 
   @ApiPropertyOptional()

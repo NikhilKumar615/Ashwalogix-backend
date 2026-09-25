@@ -7,5 +7,6 @@ export type JwtPayload = {
   memberships: {
     organizationId: string;
     role: string;
+    sectionAccess?: unknown;
   }[];
 };

@@ -1,5 +1,10 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
-import { Prisma, VehicleOwnerType, VehicleStatus } from '@prisma/client';
+import {
+  Prisma,
+  VehicleCapacityWeightUnit,
+  VehicleOwnerType,
+  VehicleStatus,
+} from '@prisma/client';
 import { PrismaService } from '../../shared/prisma/prisma.service';
 import { CreateVehicleDto } from './dto/create-vehicle.dto';
 import { UpdateVehicleDto } from './dto/update-vehicle.dto';
@@ -29,23 +34,25 @@ export class VehiclesService {
   }
 
   async createVehicle(organizationId: string, input: CreateVehicleDto) {
-    return this.prisma.vehicle.create({
-      data: {
-        organizationId,
-        vehicleNumber: input.vehicleNumber.toUpperCase(),
-        vehicleType: input.vehicleType,
-        capacityWeight:
-          input.capacityWeight !== undefined
-            ? new Prisma.Decimal(input.capacityWeight)
-            : undefined,
-        capacityVolume:
-          input.capacityVolume !== undefined
-            ? new Prisma.Decimal(input.capacityVolume)
-            : undefined,
-        ownerType: input.ownerType ?? VehicleOwnerType.OWNED,
-        status: input.status ?? VehicleStatus.ACTIVE,
-        notes: input.notes,
-      },
+    return this.prisma.$transaction(async (tx) => {
+      const vehicleCode = await this.generateVehicleCode(tx, organizationId);
+
+      return tx.vehicle.create({
+        data: {
+          organizationId,
+          vehicleCode,
+          vehicleNumber: input.vehicleNumber.toUpperCase(),
+          vehicleType: input.vehicleType,
+          capacityWeight:
+            input.capacityWeight !== undefined
+              ? new Prisma.Decimal(input.capacityWeight)
+              : undefined,
+          capacityWeightUnit: input.capacityWeightUnit ?? VehicleCapacityWeightUnit.KG,
+          ownerType: input.ownerType ?? VehicleOwnerType.OWNED,
+          status: input.status ?? VehicleStatus.ACTIVE,
+          notes: input.notes,
+        },
+      });
     });
   }
 
@@ -102,10 +109,7 @@ export class VehiclesService {
           input.capacityWeight !== undefined
             ? new Prisma.Decimal(input.capacityWeight)
             : undefined,
-        capacityVolume:
-          input.capacityVolume !== undefined
-            ? new Prisma.Decimal(input.capacityVolume)
-            : undefined,
+        capacityWeightUnit: input.capacityWeightUnit,
         ownerType: input.ownerType,
         status: input.status,
         notes: input.notes,
@@ -126,6 +130,44 @@ export class VehiclesService {
     }
 
     return vehicle;
+  }
+
+  private async generateVehicleCode(
+    tx: Prisma.TransactionClient,
+    organizationId: string,
+  ) {
+    const organization = await tx.organization.findUnique({
+      where: { id: organizationId },
+      select: { name: true },
+    });
+
+    const orgToken = this.buildCodeToken(organization?.name || 'ORG', 3);
+    const prefix = `${orgToken}-VEH-`;
+
+    const existingCodes = await tx.vehicle.findMany({
+      where: {
+        organizationId,
+        vehicleCode: {
+          startsWith: prefix,
+        },
+      },
+      select: { vehicleCode: true },
+    });
+
+    const nextSequence =
+      existingCodes.reduce((highest, vehicle) => {
+        const match = vehicle.vehicleCode?.match(/-(\d{3,})$/);
+        const numericPart = match ? Number(match[1]) : 0;
+        return numericPart > highest ? numericPart : highest;
+      }, 0) + 1;
+
+    return `${prefix}${String(nextSequence).padStart(3, '0')}`;
+  }
+
+  private buildCodeToken(value: string, length: number) {
+    const normalized = value.replace(/[^A-Za-z0-9]/g, '').toUpperCase();
+    const base = normalized || 'X'.repeat(length);
+    return base.slice(0, length).padEnd(length, 'X');
   }
 
   private mapShipmentCompanyClient<

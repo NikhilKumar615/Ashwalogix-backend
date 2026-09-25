@@ -1,5 +1,14 @@
-import { ApiProperty } from '@nestjs/swagger';
-import { IsEmail, IsString, Matches, MinLength } from 'class-validator';
+import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
+import { Type } from 'class-transformer';
+import {
+  IsEmail,
+  IsOptional,
+  IsString,
+  Matches,
+  MinLength,
+  ValidateNested,
+} from 'class-validator';
+import { SectionAccessDto } from './section-access.dto';
 
 export class RegisterDispatcherDto {
   @ApiProperty()
@@ -21,4 +30,10 @@ export class RegisterDispatcherDto {
     message: 'password must contain at least one letter and one number',
   })
   password!: string;
+
+  @ApiPropertyOptional({ type: SectionAccessDto })
+  @IsOptional()
+  @ValidateNested()
+  @Type(() => SectionAccessDto)
+  sectionAccess?: SectionAccessDto;
 }

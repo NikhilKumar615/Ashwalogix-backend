@@ -7,7 +7,10 @@ import {
   IsString,
   Matches,
   MinLength,
+  ValidateNested,
 } from 'class-validator';
+import { Type } from 'class-transformer';
+import { SectionAccessDto } from './section-access.dto';
 
 export class CreateOrganizationUserDto {
   @ApiProperty()
@@ -55,4 +58,10 @@ export class CreateOrganizationUserDto {
   @IsOptional()
   @IsString()
   homeBase?: string;
+
+  @ApiPropertyOptional({ type: SectionAccessDto })
+  @IsOptional()
+  @ValidateNested()
+  @Type(() => SectionAccessDto)
+  sectionAccess?: SectionAccessDto;
 }

@@ -1,5 +1,12 @@
-import { Body, Controller, Get, Post } from '@nestjs/common';
-import { ApiBody, ApiOperation, ApiTags } from '@nestjs/swagger';
+import { Body, Controller, Get, Post, UseGuards } from '@nestjs/common';
+import { OrganizationRole } from '@prisma/client';
+import { ApiBearerAuth, ApiBody, ApiOperation, ApiTags } from '@nestjs/swagger';
+import { CurrentUser } from '../auth/decorators/current-user.decorator';
+import { Roles } from '../auth/decorators/roles.decorator';
+import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
+import { RolesGuard } from '../auth/guards/roles.guard';
+import type { JwtPayload } from '../auth/interfaces/jwt-payload.interface';
+import { CreateDriverTrackingTokenDto } from './dto/create-driver-tracking-token.dto';
 import { CreateTrackingTestTokenDto } from './dto/create-tracking-test-token.dto';
 import { PublishTestOrderEventDto } from './dto/publish-test-order-event.dto';
 import { TrackingTestingService } from './tracking-testing.service';
@@ -24,6 +31,26 @@ export class TrackingController {
   @ApiBody({ type: CreateTrackingTestTokenDto })
   createTestToken(@Body() body: CreateTrackingTestTokenDto) {
     return this.trackingTestingService.createToken(body);
+  }
+
+  @Post('driver-token')
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary: 'Generate a rider tracking JWT for the authenticated driver app',
+  })
+  @ApiBody({ type: CreateDriverTrackingTokenDto })
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles(
+    OrganizationRole.ORG_ADMIN,
+    OrganizationRole.DISPATCHER,
+    OrganizationRole.OPERATIONS,
+    OrganizationRole.DRIVER,
+  )
+  createDriverToken(
+    @CurrentUser() user: JwtPayload,
+    @Body() body: CreateDriverTrackingTokenDto,
+  ) {
+    return this.trackingTestingService.createDriverToken(user, body);
   }
 
   @Get('kafka-contract')

@@ -3,10 +3,10 @@ export type RiderLocationEvent = {
   shipmentId: string;
   organizationId: string;
   riderUserId: string;
-  destination: {
+  destination?: {
     latitude: number;
     longitude: number;
-  };
+  } | null;
   location: {
     latitude: number;
     longitude: number;

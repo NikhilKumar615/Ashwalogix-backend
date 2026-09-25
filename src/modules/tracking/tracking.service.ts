@@ -98,11 +98,13 @@ export class TrackingService {
       eventTimestamp.getTime(),
     );
 
-    const etaSeconds = await this.trackingRoadEtaService.resolveEtaSeconds(
-      token.shipmentId,
-      smoothed,
-      token.destination,
-    );
+    const etaSeconds = token.destination
+      ? await this.trackingRoadEtaService.resolveEtaSeconds(
+          token.shipmentId,
+          smoothed,
+          token.destination,
+        )
+      : null;
 
     const update = {
       shipmentId: token.shipmentId,
@@ -123,7 +125,7 @@ export class TrackingService {
       shipmentId: token.shipmentId,
       organizationId: token.organizationId,
       riderUserId: token.sub,
-      destination: token.destination,
+      destination: token.destination ?? null,
       location: {
         latitude: smoothed.latitude,
         longitude: smoothed.longitude,

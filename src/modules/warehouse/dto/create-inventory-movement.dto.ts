@@ -1,5 +1,6 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { InventoryMovementType } from '@prisma/client';
+import { Type } from 'class-transformer';
 import {
   IsEnum,
   IsNumber,
@@ -23,6 +24,7 @@ export class CreateInventoryMovementDto {
   movementType!: InventoryMovementType;
 
   @ApiProperty()
+  @Type(() => Number)
   @IsNumber()
   @Min(0.01)
   quantity!: number;
@@ -31,6 +33,21 @@ export class CreateInventoryMovementDto {
   @IsOptional()
   @IsString()
   storageLocation?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsUUID()
+  storageLocationId?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsUUID()
+  destinationWarehouseId?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  destinationStorageLocation?: string;
 
   @ApiPropertyOptional()
   @IsOptional()
