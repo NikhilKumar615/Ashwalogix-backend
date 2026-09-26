@@ -334,21 +334,28 @@ export class AuthService {
     const now = new Date();
     const expiresAt = new Date(now.getTime() + ttlMinutes * 60 * 1000);
 
-    await this.prisma.user.update({
-      where: { id: user.id },
-      data: {
-        loginOtpHash: await hash(otp, 10),
-        loginOtpExpiresAt: expiresAt,
-        loginOtpRequestedAt: now,
-      },
-    });
+    try {
+      await this.prisma.user.update({
+        where: { id: user.id },
+        data: {
+          loginOtpHash: await hash(otp, 10),
+          loginOtpExpiresAt: expiresAt,
+          loginOtpRequestedAt: now,
+        },
+      });
 
-    await this.mailService.sendSuperAdminOtpEmail({
-      to: user.email,
-      fullName: user.fullName,
-      otp,
-      expiresInMinutes: ttlMinutes,
-    });
+      await this.mailService.sendSuperAdminOtpEmail({
+        to: user.email,
+        fullName: user.fullName,
+        otp,
+        expiresInMinutes: ttlMinutes,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const stack = error instanceof Error ? error.stack : undefined;
+      this.logger.error(`Super-admin OTP request failed: ${message}`, stack);
+      throw error;
+    }
 
     return {
       message: 'OTP sent to your email address',

@@ -219,17 +219,35 @@ export class MailService {
       return;
     }
 
-    const { error } = await this.resend.emails.send({
-      from: this.fromEmail,
-      to: input.to,
-      replyTo: this.replyToEmail ?? undefined,
-      subject: input.subject,
-      html: input.html,
-      text: input.text,
-    });
-    if (error) {
+    try {
+      const { error } = await this.resend.emails.send({
+        from: this.fromEmail,
+        to: input.to,
+        replyTo: this.replyToEmail ?? undefined,
+        subject: input.subject,
+        html: input.html,
+        text: input.text,
+      });
+
+      if (error) {
+        // Resend reports delivery/configuration failures in the response rather
+        // than throwing. Log the provider reason server-side, but do not expose
+        // provider details to unauthenticated clients.
+        this.logger.error(`Resend rejected email delivery: ${error.message}`);
+        throw new InternalServerErrorException(
+          'Unable to send the email. Please try again later.',
+        );
+      }
+    } catch (error) {
+      if (error instanceof InternalServerErrorException) {
+        throw error;
+      }
+
+      const message = error instanceof Error ? error.message : String(error);
+      const stack = error instanceof Error ? error.stack : undefined;
+      this.logger.error(`Resend email request failed: ${message}`, stack);
       throw new InternalServerErrorException(
-        `Failed to send email: ${error.message}`,
+        'Unable to send the email. Please try again later.',
       );
     }
   }
