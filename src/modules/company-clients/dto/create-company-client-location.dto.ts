@@ -3,6 +3,7 @@ import {
   IsBoolean,
   IsOptional,
   IsString,
+  Matches,
 } from 'class-validator';
 
 export class CreateCompanyClientLocationDto {
@@ -58,6 +59,7 @@ export class CreateCompanyClientLocationDto {
   @ApiPropertyOptional()
   @IsOptional()
   @IsString()
+  @Matches(/^\d{10}$/, { message: 'contactPhone must contain exactly 10 digits' })
   contactPhone?: string;
 
   @ApiPropertyOptional()

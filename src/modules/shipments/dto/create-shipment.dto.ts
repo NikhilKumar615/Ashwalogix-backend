@@ -12,6 +12,7 @@ import {
   IsEnum,
   IsISO8601,
   IsNumber,
+  Matches,
   IsObject,
   IsOptional,
   IsString,
@@ -184,6 +185,7 @@ export class CreateShipmentDto {
   @ApiPropertyOptional()
   @IsOptional()
   @IsString()
+  @Matches(/^\d{10}$/, { message: 'internalSenderPhone must contain exactly 10 digits' })
   internalSenderPhone?: string;
 
   @ApiPropertyOptional()
@@ -199,6 +201,7 @@ export class CreateShipmentDto {
   @ApiPropertyOptional()
   @IsOptional()
   @IsString()
+  @Matches(/^\d{10}$/, { message: 'internalReceiverPhone must contain exactly 10 digits' })
   internalReceiverPhone?: string;
 
   @ApiPropertyOptional()

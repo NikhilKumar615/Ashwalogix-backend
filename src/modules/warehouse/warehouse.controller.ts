@@ -27,9 +27,11 @@ import {
 import { AuthorizationService } from '../auth/authorization.service';
 import { CurrentUser } from '../auth/decorators/current-user.decorator';
 import { Roles } from '../auth/decorators/roles.decorator';
+import { SectionAccess } from '../auth/decorators/section-access.decorator';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { RolesGuard } from '../auth/guards/roles.guard';
 import type { JwtPayload } from '../auth/interfaces/jwt-payload.interface';
+import { DeleteResourceDto } from '../../shared/dto/delete-resource.dto';
 import { CreateInventoryItemDto } from './dto/create-inventory-item.dto';
 import { CreateInventoryMovementDto } from './dto/create-inventory-movement.dto';
 import { CreateStorageLocationDto } from './dto/create-storage-location.dto';
@@ -43,6 +45,7 @@ import { WarehouseService } from './warehouse.service';
 @ApiTags('Warehouse')
 @ApiBearerAuth()
 @UseGuards(JwtAuthGuard, RolesGuard)
+@SectionAccess('warehouses')
 @Controller('organizations/:organizationId')
 export class WarehouseController {
   constructor(
@@ -140,6 +143,23 @@ export class WarehouseController {
       warehouseId,
       body,
     );
+  }
+
+  @Delete('warehouses/:warehouseId')
+  @ApiOperation({ summary: 'Delete an empty warehouse with an audit reason' })
+  @ApiBody({ type: DeleteResourceDto })
+  @Roles(OrganizationRole.ORG_ADMIN, OrganizationRole.OPERATIONS)
+  async deleteWarehouse(
+    @Param('organizationId') organizationId: string,
+    @Param('warehouseId') warehouseId: string,
+    @Body() body: DeleteResourceDto,
+    @CurrentUser() user: JwtPayload,
+  ) {
+    await this.authorizationService.assertOrganizationWriteAccess(user, organizationId, [
+      OrganizationRole.ORG_ADMIN,
+      OrganizationRole.OPERATIONS,
+    ]);
+    return this.warehouseService.deleteWarehouse(organizationId, warehouseId, body.reason, user.sub);
   }
 
   @Get('inventory-items')

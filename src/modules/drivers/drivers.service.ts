@@ -151,6 +151,19 @@ export class DriversService {
     };
   }
 
+  async deleteDriver(driverId: string, organizationId: string, reason: string, deletedByUserId: string) {
+    const driver = await this.ensureDriverExists(driverId, organizationId);
+    const assignmentCount = await this.prisma.shipmentAssignment.count({ where: { driverId } });
+    if (assignmentCount) {
+      throw new BadRequestException('Drivers with assignment history cannot be deleted. Set their status to inactive instead.');
+    }
+    await this.prisma.$transaction(async (tx) => {
+      await tx.deletionAudit.create({ data: { organizationId, entityType: 'DRIVER', entityId: driver.id, entityLabel: driver.fullName, reason: reason.trim(), deletedByUserId } });
+      await tx.driver.delete({ where: { id: driverId } });
+    });
+    return { id: driverId, deleted: true };
+  }
+
   async normalizeDriverCodes(organizationId: string) {
     const organization = await this.prisma.organization.findUnique({
       where: { id: organizationId },

@@ -353,6 +353,7 @@ model User {
   platformRole        PlatformRole?      @map("platform_role")
   status              UserStatus         @default(PENDING_VERIFICATION)
   emailVerifiedAt     DateTime?          @map("email_verified_at")
+  emailVerificationSuspendedAt DateTime? @map("email_verification_suspended_at")
   verificationToken   String?            @unique @map("verification_token")
   verificationTokenExpiresAt DateTime?   @map("verification_token_expires_at")
   loginOtpHash        String?            @map("login_otp_hash")
@@ -374,6 +375,21 @@ model User {
   updatedAt           DateTime           @updatedAt @map("updated_at")
 
   @@map("users")
+}
+
+model DeletionAudit {
+  id              String   @id @default(uuid()) @db.Uuid
+  organizationId  String?  @map("organization_id") @db.Uuid
+  entityType      String   @map("entity_type")
+  entityId        String   @map("entity_id")
+  entityLabel     String?  @map("entity_label")
+  reason          String
+  deletedByUserId String?  @map("deleted_by_user_id") @db.Uuid
+  createdAt       DateTime @default(now()) @map("created_at")
+
+  @@index([organizationId])
+  @@index([entityType, entityId])
+  @@map("deletion_audits")
 }
 
 model PlatformSettingsRevision {

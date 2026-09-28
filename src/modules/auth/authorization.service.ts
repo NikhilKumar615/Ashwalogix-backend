@@ -38,12 +38,24 @@ export class AuthorizationService {
           ),
       );
 
-      if (!hasAllowedRole) {
+      if (!hasAllowedRole && !this.hasAnySectionAccess(user, organizationId)) {
         throw new ForbiddenException(
           'You do not have permission to perform this action',
         );
       }
     }
+  }
+
+  private hasAnySectionAccess(user: JwtPayload, organizationId: string) {
+    return user.memberships.some((membership) => {
+      if (membership.organizationId !== organizationId) return false;
+      const access = membership.sectionAccess as { fullAccess?: boolean; sections?: unknown } | null;
+      return access?.fullAccess === true ||
+        (Array.isArray(access?.sections) &&
+          (user.requestedSection
+            ? access.sections.includes(user.requestedSection)
+            : access.sections.length > 0));
+    });
   }
 
   async assertOrganizationWriteAccess(
@@ -122,11 +134,19 @@ export class AuthorizationService {
           Object.values(OrganizationRole).includes(role as OrganizationRole),
       );
 
-      const hasAllowedRole = user.membershipRoles.some((role) =>
-        allowedOrganizationRoles.includes(role as OrganizationRole),
+      const hasAllowedRole = user.memberships.some(
+        (membership) =>
+          membership.organizationId === shipment.organizationId &&
+          allowedOrganizationRoles.includes(
+            membership.role as OrganizationRole,
+          ),
       );
 
       if (hasAllowedRole) {
+        return shipment;
+      }
+
+      if (this.hasAnySectionAccess(user, shipment.organizationId)) {
         return shipment;
       }
     }
@@ -177,6 +197,10 @@ export class AuthorizationService {
     allowedOrganizationRoles?: AllowedRole[],
   ) {
     if (user.platformRole === PlatformRole.SUPER_ADMIN) {
+      return;
+    }
+
+    if (this.hasAnySectionAccess(user, organizationId)) {
       return;
     }
 

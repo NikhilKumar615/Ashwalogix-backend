@@ -2,6 +2,7 @@ import { BadRequestException, Inject, Injectable } from '@nestjs/common';
 import {
   DocumentEntityType,
   EventSource,
+  MembershipStatus,
   ProofType,
   Prisma,
   ShipmentMode,
@@ -12,6 +13,7 @@ import {
   StopType,
   StopStatus,
   TrackingSessionStatus,
+  UserStatus,
 } from '@prisma/client';
 import { randomUUID } from 'crypto';
 import { TRACKING_EVENT_BUS } from '../../shared/kafka/kafka.constants';
@@ -20,6 +22,7 @@ import type {
   TrackingEventBus,
 } from '../../shared/kafka/interfaces/tracking-event-bus.interface';
 import { PrismaService } from '../../shared/prisma/prisma.service';
+import { MailService } from '../mail/mail.service';
 import {
   buildBusinessPrefix,
   formatRollingAlphaCode,
@@ -90,6 +93,7 @@ const snappedRouteCache = new Map<string, SnappedRouteCacheEntry>();
 export class ShipmentsService {
   constructor(
     private readonly prisma: PrismaService,
+    private readonly mailService: MailService,
     @Inject(TRACKING_EVENT_BUS)
     private readonly trackingEventBus: TrackingEventBus,
   ) {}
@@ -238,7 +242,9 @@ export class ShipmentsService {
       return null;
     }
 
-    return this.enrichShipmentCoordinates(shipment);
+    const enrichedShipment = await this.enrichShipmentCoordinates(shipment);
+    await this.sendShipmentUpdateEmail(shipment, 'Shipment created', 'A new shipment has been created and is ready for planning.');
+    return enrichedShipment;
   }
 
   async getShipmentTimeline(id: string) {
@@ -386,7 +392,9 @@ export class ShipmentsService {
       },
     });
 
-    return this.enrichShipmentCoordinates(shipment);
+    const enrichedShipment = await this.enrichShipmentCoordinates(shipment);
+    await this.sendShipmentUpdateEmail(shipment, 'Shipment updated', 'Shipment details have been updated.');
+    return enrichedShipment;
   }
 
   async updateShipment(shipmentId: string, input: UpdateShipmentDto) {
@@ -1508,6 +1516,50 @@ export class ShipmentsService {
       id: shipmentId,
       deleted: true,
     };
+  }
+
+  private async sendShipmentUpdateEmail(
+    shipment: {
+      organizationId: string;
+      shipmentCode: string;
+      companyClient?: {
+        contactEmail?: string | null;
+        contactPerson?: string | null;
+        name?: string | null;
+      } | null;
+    },
+    title: string,
+    message: string,
+  ) {
+    try {
+      const verifiedMembers = await this.prisma.organizationUser.findMany({
+        where: {
+          organizationId: shipment.organizationId,
+          status: MembershipStatus.ACTIVE,
+          user: {
+            emailVerifiedAt: { not: null },
+            status: UserStatus.ACTIVE,
+          },
+        },
+        select: {
+          user: { select: { email: true, fullName: true } },
+        },
+      });
+
+      await Promise.allSettled(
+        verifiedMembers.map(({ user }) =>
+          this.mailService.sendOperationalUpdateEmail({
+            to: user.email,
+            recipientName: user.fullName,
+            title,
+            message,
+            reference: shipment.shipmentCode,
+          }),
+        ),
+      );
+    } catch {
+      // A notification failure must not roll back a successfully saved shipment.
+    }
   }
 
   private validateCreateShipmentInput(input: CreateShipmentDto) {

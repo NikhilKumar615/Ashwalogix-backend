@@ -77,15 +77,11 @@ export class AuthService {
     const passwordHash = await hash(input.password, 10);
     const now = new Date();
 
-    // Email verification is temporarily disabled for company-admin signup.
-    // Keep the original token flow nearby so we can restore it later.
-    // const verificationToken = randomUUID();
-    // const verificationHours = Number(
-    //   this.configService.get<string>('EMAIL_VERIFICATION_TTL_HOURS') ?? '24',
-    // );
-    // const verificationTokenExpiresAt = new Date(
-    //   Date.now() + verificationHours * 60 * 60 * 1000,
-    // );
+    const verificationToken = randomUUID();
+    const verificationHours = this.getVerificationLinkHours();
+    const verificationTokenExpiresAt = new Date(
+      Date.now() + verificationHours * 60 * 60 * 1000,
+    );
 
     const result = await this.prisma.$transaction(async (tx) => {
       const user = await tx.user.create({
@@ -94,10 +90,10 @@ export class AuthService {
           email: input.email.toLowerCase(),
           phone: input.phone,
           passwordHash,
+          // Verification is required for email updates, not for initial access.
           status: UserStatus.PENDING_APPROVAL,
-          emailVerifiedAt: now,
-          // verificationToken,
-          // verificationTokenExpiresAt,
+          verificationToken,
+          verificationTokenExpiresAt,
         },
       });
 
@@ -153,19 +149,23 @@ export class AuthService {
       return { user, organization };
     });
 
-    // await this.mailService.sendVerificationEmail({
-    //   to: result.user.email,
-    //   fullName: result.user.fullName,
-    //   token: verificationToken,
-    // });
+    try {
+      await this.mailService.sendVerificationEmail({
+        to: result.user.email,
+        fullName: result.user.fullName,
+        token: verificationToken,
+      });
+    } catch (error) {
+      this.logger.error(
+        `Registration ${result.user.id} was created but its verification email could not be sent.`,
+        error instanceof Error ? error.stack : undefined,
+      );
+    }
 
     return {
-      message: 'Registration created. Your account is now waiting for SUPER_ADMIN approval.',
+      message: 'Registration created. You can sign in while approval is pending. Please verify your email within 72 hours to continue receiving access and email updates.',
       userId: result.user.id,
       organizationId: result.organization.id,
-      // verificationToken: this.shouldExposeEmailTokens()
-      //   ? verificationToken
-      //   : undefined,
     };
   }
 
@@ -274,19 +274,27 @@ export class AuthService {
       throw new BadRequestException('Verification token has expired');
     }
 
+    const wasSuspendedForEmailVerification =
+      user.emailVerificationSuspendedAt !== null;
     const updatedUser = await this.prisma.user.update({
       where: { id: user.id },
       data: {
         emailVerifiedAt: new Date(),
         verificationToken: null,
         verificationTokenExpiresAt: null,
-        status: UserStatus.PENDING_APPROVAL,
+        status: wasSuspendedForEmailVerification
+          ? UserStatus.ACTIVE
+          : user.status === UserStatus.PENDING_VERIFICATION
+            ? UserStatus.PENDING_APPROVAL
+            : user.status,
+        emailVerificationSuspendedAt: null,
       },
     });
 
     return {
-      message:
-        'Email verified successfully. Your account is now waiting for SUPER_ADMIN approval.',
+      message: wasSuspendedForEmailVerification
+        ? 'Email verified successfully. Your temporary suspension has been removed and you can sign in again.'
+        : 'Email verified successfully. You will now receive account and shipment updates by email.',
       userId: updatedUser.id,
       status: updatedUser.status,
     };
@@ -300,7 +308,7 @@ export class AuthService {
       throw new UnauthorizedException('Invalid email or password');
     }
 
-    this.assertUserCanLogin(user);
+    await this.assertUserCanLogin(user);
 
     if (user.platformRole === PlatformRole.SUPER_ADMIN) {
       throw new ForbiddenException(
@@ -318,7 +326,7 @@ export class AuthService {
     if (!user) {
       throw new UnauthorizedException('Invalid email or password');
     }
-    this.assertUserCanLogin(user);
+    await this.assertUserCanLogin(user);
 
     if (user.platformRole !== PlatformRole.SUPER_ADMIN) {
       throw new ForbiddenException(
@@ -371,7 +379,7 @@ export class AuthService {
       throw new UnauthorizedException('Invalid email or OTP');
     }
 
-    this.assertUserCanLogin(user);
+    await this.assertUserCanLogin(user);
 
     if (user.platformRole !== PlatformRole.SUPER_ADMIN) {
       throw new ForbiddenException(
@@ -515,6 +523,14 @@ export class AuthService {
       platformRole: user.platformRole,
       status: user.status,
       emailVerifiedAt: user.emailVerifiedAt,
+      emailVerificationLinkExpiresAt: user.verificationTokenExpiresAt,
+      emailVerificationDeadline: user.emailVerifiedAt
+        ? null
+        : new Date(
+            user.createdAt.getTime() +
+              this.getVerificationSuspensionHours() * 60 * 60 * 1000,
+          ),
+      emailVerificationSuspendedAt: user.emailVerificationSuspendedAt,
       approvedAt: user.approvedAt,
       driverProfile: user.driverProfile
         ? {
@@ -1254,31 +1270,50 @@ export class AuthService {
     };
   }
 
-  private assertUserCanLogin(user: {
+  private async assertUserCanLogin(user: {
+    id: string;
     status: UserStatus;
     emailVerifiedAt: Date | null;
+    emailVerificationSuspendedAt: Date | null;
+    createdAt: Date;
     platformRole: PlatformRole | null;
     organizationMembers: {
       organization: { status: OrganizationStatus };
       status: MembershipStatus;
     }[];
   }) {
-    if (!user.emailVerifiedAt) {
-      throw new ForbiddenException(
-        'Verify your email before attempting to log in',
-      );
+    if (user.status === UserStatus.SUSPENDED) {
+      if (user.emailVerificationSuspendedAt) {
+        throw new ForbiddenException(
+          'Your account is temporarily suspended until you verify your email. Use the verification link sent during onboarding.',
+        );
+      }
+      throw new ForbiddenException('Your account is suspended');
     }
 
-    if (user.status === UserStatus.PENDING_VERIFICATION) {
-      throw new ForbiddenException('Email verification is still pending');
+    const verificationDeadline = new Date(
+      user.createdAt.getTime() +
+        this.getVerificationSuspensionHours() * 60 * 60 * 1000,
+    );
+    if (
+      !user.emailVerifiedAt &&
+      user.platformRole !== PlatformRole.SUPER_ADMIN &&
+      verificationDeadline <= new Date()
+    ) {
+      await this.prisma.user.update({
+        where: { id: user.id },
+        data: {
+          status: UserStatus.SUSPENDED,
+          emailVerificationSuspendedAt: new Date(),
+        },
+      });
+      throw new ForbiddenException(
+        'Your account is temporarily suspended until you verify your email. Use the verification link sent during onboarding.',
+      );
     }
 
     if (user.status === UserStatus.REJECTED) {
       throw new ForbiddenException('Your account has been rejected');
-    }
-
-    if (user.status === UserStatus.SUSPENDED) {
-      throw new ForbiddenException('Your account is suspended');
     }
 
     if (user.platformRole === PlatformRole.SUPER_ADMIN) {
@@ -1294,6 +1329,19 @@ export class AuthService {
         'No active organization membership is available for this account',
       );
     }
+  }
+
+  private getVerificationLinkHours() {
+    return Number(
+      this.configService.get<string>('EMAIL_VERIFICATION_TTL_HOURS') ?? '168',
+    );
+  }
+
+  private getVerificationSuspensionHours() {
+    return Number(
+      this.configService.get<string>('EMAIL_VERIFICATION_SUSPEND_AFTER_HOURS') ??
+        '72',
+    );
   }
 
   private async syncOrganizationSubscription(

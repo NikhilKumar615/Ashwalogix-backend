@@ -1,4 +1,4 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
 import {
   Prisma,
   VehicleCapacityWeightUnit,
@@ -115,6 +115,19 @@ export class VehiclesService {
         notes: input.notes,
       },
     });
+  }
+
+  async deleteVehicle(organizationId: string, vehicleId: string, reason: string, deletedByUserId: string) {
+    const vehicle = await this.ensureVehicleExists(organizationId, vehicleId);
+    const assignmentCount = await this.prisma.shipmentAssignment.count({ where: { vehicleId } });
+    if (assignmentCount) {
+      throw new BadRequestException('Vehicles with assignment history cannot be deleted. Set their status to inactive instead.');
+    }
+    await this.prisma.$transaction(async (tx) => {
+      await tx.deletionAudit.create({ data: { organizationId, entityType: 'VEHICLE', entityId: vehicle.id, entityLabel: vehicle.vehicleNumber, reason: reason.trim(), deletedByUserId } });
+      await tx.vehicle.delete({ where: { id: vehicleId } });
+    });
+    return { id: vehicleId, deleted: true };
   }
 
   private async ensureVehicleExists(organizationId: string, vehicleId: string) {

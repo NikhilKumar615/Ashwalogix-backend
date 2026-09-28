@@ -1,6 +1,7 @@
 import {
   Body,
   Controller,
+  Delete,
   Get,
   Param,
   Patch,
@@ -20,9 +21,11 @@ import {
 import { AuthorizationService } from '../auth/authorization.service';
 import { CurrentUser } from '../auth/decorators/current-user.decorator';
 import { Roles } from '../auth/decorators/roles.decorator';
+import { SectionAccess } from '../auth/decorators/section-access.decorator';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { RolesGuard } from '../auth/guards/roles.guard';
 import type { JwtPayload } from '../auth/interfaces/jwt-payload.interface';
+import { DeleteResourceDto } from '../../shared/dto/delete-resource.dto';
 import { CompanyClientsService } from './company-clients.service';
 import { CreateCompanyClientDto } from './dto/create-company-client.dto';
 import { CreateCompanyClientLocationDto } from './dto/create-company-client-location.dto';
@@ -32,6 +35,7 @@ import { UpdateCompanyClientLocationDto } from './dto/update-company-client-loca
 @ApiTags('Company Clients')
 @ApiBearerAuth()
 @UseGuards(JwtAuthGuard, RolesGuard)
+@SectionAccess('clients')
 @Controller('organizations/:organizationId/company-clients')
 export class CompanyClientsController {
   constructor(
@@ -140,6 +144,32 @@ export class CompanyClientsController {
       organizationId,
       companyClientId,
       body,
+    );
+  }
+
+  @Delete(':companyClientId')
+  @ApiOperation({ summary: 'Delete a company client with an audit reason' })
+  @ApiParam({ name: 'organizationId', type: String })
+  @ApiParam({ name: 'companyClientId', type: String })
+  @ApiBody({ type: DeleteResourceDto })
+  @Roles(OrganizationRole.ORG_ADMIN, OrganizationRole.OPERATIONS)
+  async deleteCompanyClient(
+    @Param('organizationId') organizationId: string,
+    @Param('companyClientId') companyClientId: string,
+    @Body() body: DeleteResourceDto,
+    @CurrentUser() user: JwtPayload,
+  ) {
+    await this.authorizationService.assertOrganizationWriteAccess(
+      user,
+      organizationId,
+      [OrganizationRole.ORG_ADMIN, OrganizationRole.OPERATIONS],
+    );
+
+    return this.companyClientsService.deleteCompanyClient(
+      organizationId,
+      companyClientId,
+      body.reason,
+      user.sub,
     );
   }
 

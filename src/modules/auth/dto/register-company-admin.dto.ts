@@ -55,6 +55,7 @@ export class RegisterCompanyAdminDto {
 
   @ApiProperty()
   @IsString()
+  @Matches(/^\d{10}$/, { message: 'phone must contain exactly 10 digits' })
   phone!: string;
 
   @ApiProperty()
@@ -79,6 +80,7 @@ export class RegisterCompanyAdminDto {
 
   @ApiProperty()
   @IsString()
+  @Matches(/^\d{10}$/, { message: 'organizationPhone must contain exactly 10 digits' })
   organizationPhone!: string;
 
   @ApiProperty()

@@ -1,6 +1,7 @@
 import {
   Body,
   Controller,
+  Delete,
   Get,
   NotFoundException,
   Param,
@@ -19,9 +20,11 @@ import {
 import { AuthorizationService } from '../auth/authorization.service';
 import { CurrentUser } from '../auth/decorators/current-user.decorator';
 import { Roles } from '../auth/decorators/roles.decorator';
+import { SectionAccess } from '../auth/decorators/section-access.decorator';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { RolesGuard } from '../auth/guards/roles.guard';
 import type { JwtPayload } from '../auth/interfaces/jwt-payload.interface';
+import { DeleteResourceDto } from '../../shared/dto/delete-resource.dto';
 import { CreateOrganizationUserDto } from './dto/create-organization-user.dto';
 import { RegisterCompanyDriverDto } from './dto/register-company-driver.dto';
 import { RegisterDispatcherDto } from './dto/register-dispatcher.dto';
@@ -32,6 +35,7 @@ import { OrganizationsService } from './organizations.service';
 @ApiTags('Organizations')
 @ApiBearerAuth()
 @UseGuards(JwtAuthGuard, RolesGuard)
+@SectionAccess('users')
 @Controller('organizations')
 export class OrganizationsController {
   constructor(
@@ -236,5 +240,19 @@ export class OrganizationsController {
       userId,
       body,
     );
+  }
+
+  @Delete(':organizationId/users/:userId')
+  @ApiOperation({ summary: 'Remove an organization user with an audit reason' })
+  @ApiBody({ type: DeleteResourceDto })
+  @Roles(OrganizationRole.ORG_ADMIN)
+  async deleteOrganizationUser(
+    @Param('organizationId') organizationId: string,
+    @Param('userId') userId: string,
+    @Body() body: DeleteResourceDto,
+    @CurrentUser() user: JwtPayload,
+  ) {
+    await this.authorizationService.assertOrganizationWriteAccess(user, organizationId, [OrganizationRole.ORG_ADMIN]);
+    return this.organizationsService.deleteOrganizationUser(organizationId, userId, body.reason, user.sub);
   }
 }

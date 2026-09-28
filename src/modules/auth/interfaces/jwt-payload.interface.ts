@@ -9,4 +9,6 @@ export type JwtPayload = {
     role: string;
     sectionAccess?: unknown;
   }[];
+  /** Set by RolesGuard for the current request; it is never stored in a token. */
+  requestedSection?: string;
 };

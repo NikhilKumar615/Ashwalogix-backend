@@ -22,6 +22,7 @@ import {
 import { AuthorizationService } from '../auth/authorization.service';
 import { CurrentUser } from '../auth/decorators/current-user.decorator';
 import { Roles } from '../auth/decorators/roles.decorator';
+import { SectionAccess } from '../auth/decorators/section-access.decorator';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { RolesGuard } from '../auth/guards/roles.guard';
 import type { JwtPayload } from '../auth/interfaces/jwt-payload.interface';
@@ -39,6 +40,7 @@ import { ShipmentsService } from './shipments.service';
 @ApiTags('Shipments')
 @ApiBearerAuth()
 @UseGuards(JwtAuthGuard, RolesGuard)
+@SectionAccess('shipments')
 @Controller('shipments')
 export class ShipmentsController {
   constructor(

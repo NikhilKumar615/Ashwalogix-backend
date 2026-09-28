@@ -6,6 +6,7 @@ import {
   IsISO8601,
   IsOptional,
   IsString,
+  Matches,
 } from 'class-validator';
 
 export class UpdateDriverDto {
@@ -17,6 +18,7 @@ export class UpdateDriverDto {
   @ApiPropertyOptional()
   @IsOptional()
   @IsString()
+  @Matches(/^\d{10}$/, { message: 'phone must contain exactly 10 digits' })
   phone?: string;
 
   @ApiPropertyOptional()

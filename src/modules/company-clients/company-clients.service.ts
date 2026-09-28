@@ -101,6 +101,46 @@ export class CompanyClientsService {
     return this.mapCompanyClientResponse(companyClient);
   }
 
+  async deleteCompanyClient(
+    organizationId: string,
+    companyClientId: string,
+    reason: string,
+    deletedByUserId: string,
+  ) {
+    const companyClient = await this.prisma.companyClient.findFirst({
+      where: { id: companyClientId, organizationId },
+      include: { _count: { select: { shipments: true } } },
+    });
+
+    if (!companyClient) {
+      throw new NotFoundException('Company client not found');
+    }
+    if (companyClient._count.shipments) {
+      throw new BadRequestException(
+        'Clients with shipment history cannot be deleted. Set the client status to inactive instead.',
+      );
+    }
+
+    await this.prisma.$transaction(async (tx) => {
+      await tx.companyClientLocation.deleteMany({
+        where: { organizationId, companyClientId },
+      });
+      await tx.deletionAudit.create({
+        data: {
+          organizationId,
+          entityType: 'COMPANY_CLIENT',
+          entityId: companyClient.id,
+          entityLabel: companyClient.name,
+          reason: reason.trim(),
+          deletedByUserId,
+        },
+      });
+      await tx.companyClient.delete({ where: { id: companyClientId } });
+    });
+
+    return { id: companyClientId, deleted: true };
+  }
+
   async listCompanyClientLocations(
     organizationId: string,
     companyClientId: string,

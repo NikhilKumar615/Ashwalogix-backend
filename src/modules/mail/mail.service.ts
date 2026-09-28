@@ -43,13 +43,13 @@ export class MailService {
       html: this.wrapTemplate({
         title: 'Verify your email',
         intro: `Hello ${this.escape(input.fullName)},`,
-        body: 'Use the button below to verify your account and continue the onboarding process.',
+        body: 'Use the button below to verify your email. You can use Ashwa Logix while verification is pending, but email updates begin after verification. Please verify within 72 hours to avoid a temporary account suspension.',
         ctaLabel: 'Verify email',
         ctaUrl: verificationUrl,
         footer:
-          'If the button does not work, open the link shown below in your browser.',
+          'This verification link remains valid for seven days. If the button does not work, open the link shown below in your browser.',
       }),
-      text: `Hello ${input.fullName}, verify your Ashwa Logix account here: ${verificationUrl}`,
+      text: `Hello ${input.fullName}, verify your Ashwa Logix account here: ${verificationUrl}. You can use Ashwa Logix while verification is pending, but email updates begin after verification. Please verify within 72 hours to avoid a temporary account suspension.`,
     });
   }
 
@@ -250,6 +250,26 @@ export class MailService {
         'Unable to send the email. Please try again later.',
       );
     }
+  }
+
+  async sendOperationalUpdateEmail(input: {
+    to: string;
+    recipientName?: string | null;
+    title: string;
+    message: string;
+    reference?: string | null;
+  }) {
+    await this.sendEmail({
+      to: input.to,
+      subject: `${input.title}${input.reference ? ` · ${input.reference}` : ''}`,
+      html: this.wrapTemplate({
+        title: input.title,
+        intro: `Hello ${this.escape(input.recipientName || 'there')},`,
+        body: this.escape(input.message),
+        footer: 'This is an automated update from Ashwa Logix.',
+      }),
+      text: `Hello ${input.recipientName || 'there'}, ${input.message}${input.reference ? ` Reference: ${input.reference}.` : ''}`,
+    });
   }
 
   private wrapTemplate(input: {

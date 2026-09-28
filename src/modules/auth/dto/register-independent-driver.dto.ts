@@ -60,6 +60,7 @@ export class RegisterIndependentDriverDto {
     description: 'Primary login/contact number for the driver',
   })
   @IsString()
+  @Matches(/^\d{10}$/, { message: 'phone must contain exactly 10 digits' })
   phone!: string;
 
   @ApiPropertyOptional()

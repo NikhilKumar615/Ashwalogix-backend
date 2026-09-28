@@ -305,6 +305,34 @@ export class OrganizationsService {
     });
   }
 
+  async deleteOrganizationUser(
+    organizationId: string,
+    userId: string,
+    reason: string,
+    deletedByUserId: string,
+  ) {
+    if (userId === deletedByUserId) {
+      throw new BadRequestException('You cannot remove your own account. Transfer administration first.');
+    }
+    const organization = await this.ensureOrganizationIsActive(organizationId);
+    if (organization.ownerUserId === userId) {
+      throw new BadRequestException('The organization owner cannot be removed. Transfer ownership first.');
+    }
+    const membership = await this.prisma.organizationUser.findFirst({
+      where: { organizationId, userId },
+      include: { user: true },
+    });
+    if (!membership) throw new NotFoundException('Organization user not found');
+
+    await this.prisma.$transaction(async (tx) => {
+      await tx.deletionAudit.create({
+        data: { organizationId, entityType: 'ORGANIZATION_USER', entityId: userId, entityLabel: membership.user.fullName, reason: reason.trim(), deletedByUserId },
+      });
+      await tx.organizationUser.delete({ where: { organizationId_userId: { organizationId, userId } } });
+    });
+    return { id: userId, deleted: true };
+  }
+
   private async createUserWithinOrganization(
     organization: { id: string; name: string; state: string | null },
     input: CreateOrganizationUserDto,
@@ -335,6 +363,13 @@ export class OrganizationsService {
     const resetPasswordTokenExpiresAt = new Date(
       Date.now() + resetHours * 60 * 60 * 1000,
     );
+    const verificationToken = randomUUID();
+    const verificationHours = Number(
+      this.configService.get<string>('EMAIL_VERIFICATION_TTL_HOURS') ?? '168',
+    );
+    const verificationTokenExpiresAt = new Date(
+      Date.now() + verificationHours * 60 * 60 * 1000,
+    );
 
     const createdUser = await this.prisma.$transaction(async (tx) => {
       const user = await tx.user.create({
@@ -344,7 +379,8 @@ export class OrganizationsService {
           phone: input.phone,
           passwordHash,
           status: UserStatus.ACTIVE,
-          emailVerifiedAt: now,
+          verificationToken,
+          verificationTokenExpiresAt,
           approvedAt: now,
           approvedByUserId: createdByUserId,
           resetPasswordToken,
@@ -397,6 +433,19 @@ export class OrganizationsService {
 
     if (!createdUser) {
       throw new BadRequestException('Organization user could not be created');
+    }
+
+    try {
+      await this.mailService.sendVerificationEmail({
+        to: createdUser.email,
+        fullName: createdUser.fullName,
+        token: verificationToken,
+      });
+    } catch (error) {
+      this.logger.error(
+        `Organization user ${createdUser.id} was created but its verification email could not be sent.`,
+        error instanceof Error ? error.stack : undefined,
+      );
     }
 
     if (input.role !== OrganizationRole.DRIVER) {

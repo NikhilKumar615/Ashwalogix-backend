@@ -21,6 +21,7 @@ export class RegisterOrganizationStaffDto {
 
   @ApiProperty()
   @IsString()
+  @Matches(/^\d{10}$/, { message: 'phone must contain exactly 10 digits' })
   phone!: string;
 
   @ApiProperty()

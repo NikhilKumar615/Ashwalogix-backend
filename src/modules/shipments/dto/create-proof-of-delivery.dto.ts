@@ -1,6 +1,6 @@
 import { ProofType } from '@prisma/client';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
-import { IsEnum, IsOptional, IsString, IsUUID } from 'class-validator';
+import { IsEnum, IsOptional, IsString, IsUUID, Matches } from 'class-validator';
 
 export class CreateProofOfDeliveryDto {
   @ApiProperty()
@@ -29,6 +29,7 @@ export class CreateProofOfDeliveryDto {
   @ApiPropertyOptional()
   @IsOptional()
   @IsString()
+  @Matches(/^\d{10}$/, { message: 'receiverPhone must contain exactly 10 digits' })
   receiverPhone?: string;
 
   @ApiPropertyOptional()

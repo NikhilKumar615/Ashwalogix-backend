@@ -80,6 +80,24 @@ export class WarehouseService {
     });
   }
 
+  async deleteWarehouse(organizationId: string, warehouseId: string, reason: string, deletedByUserId: string) {
+    const warehouse = await this.getWarehouseById(organizationId, warehouseId);
+    const [stockCount, movementCount, destinationMovementCount] = await Promise.all([
+      this.prisma.inventoryStock.count({ where: { organizationId, warehouseId } }),
+      this.prisma.inventoryMovement.count({ where: { organizationId, warehouseId } }),
+      this.prisma.inventoryMovement.count({ where: { organizationId, destinationWarehouseId: warehouseId } }),
+    ]);
+    if (stockCount || movementCount || destinationMovementCount) {
+      throw new BadRequestException('Warehouses with inventory or movement history cannot be deleted. Empty or transfer stock first.');
+    }
+    await this.prisma.$transaction(async (tx) => {
+      await tx.storageLocation.deleteMany({ where: { warehouseId } });
+      await tx.deletionAudit.create({ data: { organizationId, entityType: 'WAREHOUSE', entityId: warehouse.id, entityLabel: warehouse.name, reason: reason.trim(), deletedByUserId } });
+      await tx.warehouse.delete({ where: { id: warehouseId } });
+    });
+    return { id: warehouseId, deleted: true };
+  }
+
   private async generateWarehouseCode(organizationId: string) {
     const organization = await this.prisma.organization.findUnique({
       where: { id: organizationId },

@@ -1,6 +1,7 @@
 import {
   Body,
   Controller,
+  Delete,
   Get,
   Param,
   Patch,
@@ -20,9 +21,11 @@ import {
 import { AuthorizationService } from '../auth/authorization.service';
 import { CurrentUser } from '../auth/decorators/current-user.decorator';
 import { Roles } from '../auth/decorators/roles.decorator';
+import { SectionAccess } from '../auth/decorators/section-access.decorator';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { RolesGuard } from '../auth/guards/roles.guard';
 import type { JwtPayload } from '../auth/interfaces/jwt-payload.interface';
+import { DeleteResourceDto } from '../../shared/dto/delete-resource.dto';
 import { CreateVehicleDto } from './dto/create-vehicle.dto';
 import { UpdateVehicleDto } from './dto/update-vehicle.dto';
 import { VehiclesService } from './vehicles.service';
@@ -30,6 +33,7 @@ import { VehiclesService } from './vehicles.service';
 @ApiTags('Vehicles')
 @ApiBearerAuth()
 @UseGuards(JwtAuthGuard, RolesGuard)
+@SectionAccess('vehicles')
 @Controller('organizations/:organizationId/vehicles')
 export class VehiclesController {
   constructor(
@@ -129,5 +133,19 @@ export class VehiclesController {
     );
 
     return this.vehiclesService.updateVehicle(organizationId, vehicleId, body);
+  }
+
+  @Delete(':vehicleId')
+  @ApiOperation({ summary: 'Delete a vehicle with an audit reason' })
+  @ApiBody({ type: DeleteResourceDto })
+  @Roles(OrganizationRole.ORG_ADMIN, OrganizationRole.OPERATIONS)
+  async deleteVehicle(
+    @Param('organizationId') organizationId: string,
+    @Param('vehicleId') vehicleId: string,
+    @Body() body: DeleteResourceDto,
+    @CurrentUser() user: JwtPayload,
+  ) {
+    await this.authorizationService.assertOrganizationWriteAccess(user, organizationId, [OrganizationRole.ORG_ADMIN, OrganizationRole.OPERATIONS]);
+    return this.vehiclesService.deleteVehicle(organizationId, vehicleId, body.reason, user.sub);
   }
 }

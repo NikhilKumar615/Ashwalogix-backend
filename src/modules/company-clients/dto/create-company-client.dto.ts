@@ -1,6 +1,6 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { ClientStatus } from '@prisma/client';
-import { IsBoolean, IsEmail, IsEnum, IsOptional, IsString } from 'class-validator';
+import { IsBoolean, IsEmail, IsEnum, IsOptional, IsString, Matches } from 'class-validator';
 
 export class CreateCompanyClientDto {
   @ApiProperty({ description: 'Business-facing code for this company client' })
@@ -74,6 +74,7 @@ export class CreateCompanyClientDto {
   @ApiPropertyOptional()
   @IsOptional()
   @IsString()
+  @Matches(/^\d{10}$/, { message: 'contactPhone must contain exactly 10 digits' })
   contactPhone?: string;
 
   @ApiPropertyOptional()
