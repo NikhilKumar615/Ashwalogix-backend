@@ -37,6 +37,7 @@ import { ManualShipmentStatusDto } from './dto/manual-shipment-status.dto';
 import { ShipmentStatusActionDto } from './dto/shipment-status-action.dto';
 import { StartTrackingSessionDto } from './dto/start-tracking-session.dto';
 import { UpdateShipmentDto } from './dto/update-shipment.dto';
+import { ValidateShipmentLocationDto } from './dto/validate-shipment-location.dto';
 
 type ListShipmentsParams = {
   organizationId?: string;
@@ -261,6 +262,7 @@ export class ShipmentsService {
 
   async createShipment(input: CreateShipmentDto) {
     this.validateCreateShipmentInput(input);
+    await this.normalizeRequiredRouteCoordinates(input);
 
     const status = ShipmentStatus.DRAFT;
     const requestedShipmentCode = input.shipmentCode?.trim().toUpperCase();
@@ -484,6 +486,7 @@ export class ShipmentsService {
     };
 
     this.validateCreateShipmentInput(normalizedInput);
+    await this.normalizeRequiredRouteCoordinates(normalizedInput);
 
     const shipment = await this.prisma.$transaction(async (tx) => {
       if (input.items) {
@@ -660,6 +663,17 @@ export class ShipmentsService {
 
   async assignDriver(shipmentId: string, input: AssignDriverDto) {
     const shipment = await this.ensureShipmentExists(shipmentId);
+    const shipmentWithRoute = await this.getShipmentById(shipmentId);
+
+    if (
+      !shipmentWithRoute?.resolvedPickupCoordinates ||
+      !shipmentWithRoute.resolvedDestinationCoordinates
+    ) {
+      throw new BadRequestException(
+        'A verified pickup and delivery location are required before assigning a driver.',
+      );
+    }
+
     await this.ensureDriverExists(input.driverId, input.organizationId);
 
     if (input.vehicleId) {
@@ -2535,6 +2549,117 @@ export class ShipmentsService {
           /\bindia\b/i.test(candidate) ? candidate : `${candidate}, India`,
         ),
     )];
+  }
+
+  async validateShipmentLocation(input: ValidateShipmentLocationDto) {
+    const address = this.buildRequiredLocationAddress({
+      locationName: input.locationName,
+      addressLine1: input.addressLine1,
+      city: input.city,
+      state: input.state,
+      postalCode: input.postalCode,
+    });
+    const coordinate = await this.geocodeAddress(address);
+
+    if (!coordinate) {
+      throw new BadRequestException(
+        'We could not find this location. Enter the building, street/landmark, city, and correct 6-digit PIN, then try again.',
+      );
+    }
+
+    return {
+      address,
+      latitude: coordinate.latitude,
+      longitude: coordinate.longitude,
+      verifiedAt: new Date().toISOString(),
+    };
+  }
+
+  private async normalizeRequiredRouteCoordinates(input: CreateShipmentDto) {
+    const adminFormData =
+      input.adminFormData &&
+      typeof input.adminFormData === 'object' &&
+      !Array.isArray(input.adminFormData)
+        ? (input.adminFormData as Record<string, unknown>)
+        : {};
+
+    // Code-only inbound drafts may be created before route information arrives.
+    // They still cannot be assigned because assignDriver checks both resolved pins.
+    const hasRouteInformation = Boolean(
+      input.stops?.length ||
+        adminFormData.originAddress ||
+        adminFormData.deliveryAddress,
+    );
+    if (!hasRouteInformation) {
+      return;
+    }
+
+    const pickup = await this.resolveRequiredStopCoordinate(input, 'PICKUP');
+    const delivery = await this.resolveRequiredStopCoordinate(input, 'DELIVERY');
+
+    input.adminFormData = {
+      ...adminFormData,
+      originLatitude: String(pickup.latitude),
+      originLongitude: String(pickup.longitude),
+      destinationLatitude: String(delivery.latitude),
+      destinationLongitude: String(delivery.longitude),
+      pickupLocationVerifiedAt: new Date().toISOString(),
+      deliveryLocationVerifiedAt: new Date().toISOString(),
+    };
+  }
+
+  private async resolveRequiredStopCoordinate(
+    input: CreateShipmentDto,
+    stopType: 'PICKUP' | 'DELIVERY',
+  ) {
+    const stop = input.stops?.find((candidate) => candidate.stopType === stopType);
+    const isPickup = stopType === 'PICKUP';
+    const adminFormData =
+      input.adminFormData &&
+      typeof input.adminFormData === 'object' &&
+      !Array.isArray(input.adminFormData)
+        ? (input.adminFormData as Record<string, unknown>)
+        : {};
+
+    const address = this.buildRequiredLocationAddress({
+      locationName: stop?.locationName || adminFormData[isPickup ? 'originName' : 'destinationName'],
+      addressLine1: stop?.addressLine1 || adminFormData[isPickup ? 'originAddress' : 'deliveryAddress'],
+      city: stop?.city || adminFormData[isPickup ? 'originCity' : 'destinationCity'],
+      state: stop?.state || adminFormData[isPickup ? 'originState' : 'destinationState'],
+      postalCode: stop?.postalCode || adminFormData[isPickup ? 'originPincode' : 'destinationPincode'],
+    });
+    const coordinate = await this.geocodeAddress(address);
+
+    if (!coordinate) {
+      throw new BadRequestException(
+        `A valid ${isPickup ? 'pickup' : 'delivery'} location is required before this shipment can be created or assigned. Verify the street address and 6-digit PIN.`,
+      );
+    }
+
+    return coordinate;
+  }
+
+  private buildRequiredLocationAddress(input: {
+    locationName?: unknown;
+    addressLine1?: unknown;
+    city?: unknown;
+    state?: unknown;
+    postalCode?: unknown;
+  }) {
+    const addressLine1 = String(input.addressLine1 || '').trim();
+    const city = String(input.city || '').trim();
+    const postalCode = String(input.postalCode || '').trim();
+
+    if (!addressLine1 || !city || !/^\d{6}$/.test(postalCode)) {
+      throw new BadRequestException(
+        'Every pickup and delivery stop needs a street address, city, and valid 6-digit PIN before it can be routed.',
+      );
+    }
+
+    return [input.locationName, addressLine1, city, input.state, postalCode, 'India']
+      .map((value) => String(value || '').trim())
+      .filter(Boolean)
+      .join(', ');
   }
 
   private async geocodeAddress(address: string): Promise<Coordinate | null> {

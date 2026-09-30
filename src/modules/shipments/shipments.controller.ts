@@ -35,6 +35,7 @@ import { ManualShipmentStatusDto } from './dto/manual-shipment-status.dto';
 import { ShipmentStatusActionDto } from './dto/shipment-status-action.dto';
 import { StartTrackingSessionDto } from './dto/start-tracking-session.dto';
 import { UpdateShipmentDto } from './dto/update-shipment.dto';
+import { ValidateShipmentLocationDto } from './dto/validate-shipment-location.dto';
 import { ShipmentsService } from './shipments.service';
 
 @ApiTags('Shipments')
@@ -126,6 +127,31 @@ export class ShipmentsController {
     return {
       label: await this.shipmentsService.reverseGeocodeCoordinates(latitude, longitude),
     };
+  }
+
+  @Post('validate-location')
+  @ApiOperation({ summary: 'Validate and pin a pickup or delivery location before shipment creation' })
+  @ApiBody({ type: ValidateShipmentLocationDto })
+  @Roles(
+    OrganizationRole.ORG_ADMIN,
+    OrganizationRole.DISPATCHER,
+    OrganizationRole.OPERATIONS,
+  )
+  async validateShipmentLocation(
+    @Body() body: ValidateShipmentLocationDto,
+    @CurrentUser() user: JwtPayload,
+  ) {
+    await this.authorizationService.assertOrganizationWriteAccess(
+      user,
+      body.organizationId,
+      [
+        OrganizationRole.ORG_ADMIN,
+        OrganizationRole.DISPATCHER,
+        OrganizationRole.OPERATIONS,
+      ],
+    );
+
+    return this.shipmentsService.validateShipmentLocation(body);
   }
 
   @Get(':id')
