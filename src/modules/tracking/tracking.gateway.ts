@@ -16,6 +16,7 @@ import type { TrackingTokenPayload } from './interfaces/tracking-token-payload.i
 import { TrackingAuthService } from './tracking-auth.service';
 import { TrackingRoomService } from './tracking-room.service';
 import { TrackingService } from './tracking.service';
+import { allowedOrigins } from '../../shared/config/runtime-security';
 
 type TrackingSocket = Socket & {
   data: {
@@ -26,7 +27,8 @@ type TrackingSocket = Socket & {
 @WebSocketGateway({
   namespace: '/tracking',
   cors: {
-    origin: '*',
+    origin: allowedOrigins(),
+    credentials: true,
   },
 })
 export class TrackingGateway

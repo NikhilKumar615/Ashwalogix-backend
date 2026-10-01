@@ -10,6 +10,7 @@ import { AuthorizationService } from './authorization.service';
 import { JwtAuthGuard } from './guards/jwt-auth.guard';
 import { RolesGuard } from './guards/roles.guard';
 import { JwtStrategy } from './strategies/jwt.strategy';
+import { jwtSecret } from '../../shared/config/runtime-security';
 
 @Module({
   imports: [
@@ -18,7 +19,7 @@ import { JwtStrategy } from './strategies/jwt.strategy';
     JwtModule.registerAsync({
       inject: [ConfigService],
       useFactory: (configService: ConfigService) => ({
-        secret: configService.get<string>('JWT_SECRET') ?? 'dev-secret',
+        secret: jwtSecret(configService),
         signOptions: {
           expiresIn:
             (configService.get<string>('JWT_EXPIRES_IN') ?? '1d') as StringValue,

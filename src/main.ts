@@ -3,13 +3,18 @@ import { NestFactory } from '@nestjs/core';
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 import { AppModule } from './app.module';
 import { FilteredLogger } from './shared/filtered-logger';
+import { allowedOrigins, validateProductionSecurityConfig } from './shared/config/runtime-security';
 
 async function bootstrap() {
+  validateProductionSecurityConfig();
   const app = await NestFactory.create(AppModule, {
     logger: new FilteredLogger(),
   });
   app.setGlobalPrefix('api');
-  app.enableCors();
+  app.enableCors({
+    origin: allowedOrigins(),
+    credentials: true,
+  });
   app.useGlobalPipes(
     new ValidationPipe({
       whitelist: true,

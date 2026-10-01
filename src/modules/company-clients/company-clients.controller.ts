@@ -29,6 +29,7 @@ import { DeleteResourceDto } from '../../shared/dto/delete-resource.dto';
 import { CompanyClientsService } from './company-clients.service';
 import { CreateCompanyClientDto } from './dto/create-company-client.dto';
 import { CreateCompanyClientLocationDto } from './dto/create-company-client-location.dto';
+import { CreateCompanyClientWithLocationsDto } from './dto/create-company-client-with-locations.dto';
 import { UpdateCompanyClientDto } from './dto/update-company-client.dto';
 import { UpdateCompanyClientLocationDto } from './dto/update-company-client-location.dto';
 
@@ -90,6 +91,28 @@ export class CompanyClientsController {
     );
 
     return this.companyClientsService.createCompanyClient(organizationId, body);
+  }
+
+  @Post('with-locations')
+  @ApiOperation({ summary: 'Create a company client and its locations atomically' })
+  @ApiParam({ name: 'organizationId', type: String })
+  @ApiBody({ type: CreateCompanyClientWithLocationsDto })
+  @Roles(OrganizationRole.ORG_ADMIN, OrganizationRole.OPERATIONS)
+  async createCompanyClientWithLocations(
+    @Param('organizationId') organizationId: string,
+    @Body() body: CreateCompanyClientWithLocationsDto,
+    @CurrentUser() user: JwtPayload,
+  ) {
+    await this.authorizationService.assertOrganizationWriteAccess(
+      user,
+      organizationId,
+      [OrganizationRole.ORG_ADMIN, OrganizationRole.OPERATIONS],
+    );
+
+    return this.companyClientsService.createCompanyClientWithLocations(
+      organizationId,
+      body,
+    );
   }
 
   @Get(':companyClientId')

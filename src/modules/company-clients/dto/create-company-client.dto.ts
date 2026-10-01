@@ -3,9 +3,10 @@ import { ClientStatus } from '@prisma/client';
 import { IsBoolean, IsEmail, IsEnum, IsOptional, IsString, Matches } from 'class-validator';
 
 export class CreateCompanyClientDto {
-  @ApiProperty({ description: 'Business-facing code for this company client' })
+  @ApiPropertyOptional({ description: 'Business-facing code for this company client; generated when omitted' })
+  @IsOptional()
   @IsString()
-  companyClientCode!: string;
+  companyClientCode?: string;
 
   @ApiProperty({ description: 'Display name of the company client' })
   @IsString()

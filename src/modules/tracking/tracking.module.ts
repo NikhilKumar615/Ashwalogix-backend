@@ -23,6 +23,7 @@ import { TrackingRoomService } from './tracking-room.service';
 import { TrackingService } from './tracking.service';
 import { TrackingTestingService } from './tracking-testing.service';
 import { TrackingValidationService } from './tracking-validation.service';
+import { jwtSecret } from '../../shared/config/runtime-security';
 
 @Module({
   imports: [
@@ -33,7 +34,7 @@ import { TrackingValidationService } from './tracking-validation.service';
     JwtModule.registerAsync({
       inject: [ConfigService],
       useFactory: (configService: ConfigService) => ({
-        secret: configService.get<string>('JWT_SECRET') ?? 'dev-secret',
+        secret: jwtSecret(configService),
         signOptions: {
           expiresIn:
             (configService.get<string>('JWT_EXPIRES_IN') ?? '1d') as StringValue,

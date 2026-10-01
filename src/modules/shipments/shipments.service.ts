@@ -23,6 +23,7 @@ import type {
 } from '../../shared/kafka/interfaces/tracking-event-bus.interface';
 import { PrismaService } from '../../shared/prisma/prisma.service';
 import { MailService } from '../mail/mail.service';
+import { DriverRealtimeService } from '../driver-realtime/driver-realtime.service';
 import {
   buildBusinessPrefix,
   formatRollingAlphaCode,
@@ -95,6 +96,7 @@ export class ShipmentsService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly mailService: MailService,
+    private readonly driverRealtimeService: DriverRealtimeService,
     @Inject(TRACKING_EVENT_BUS)
     private readonly trackingEventBus: TrackingEventBus,
   ) {}
@@ -658,7 +660,16 @@ export class ShipmentsService {
       return updated;
     });
 
-    return this.enrichShipmentCoordinates(shipment);
+    const enrichedShipment = await this.enrichShipmentCoordinates(shipment);
+    this.driverRealtimeService.notifyShipmentChange(
+      shipment.currentDriverId,
+      {
+        shipmentId,
+        organizationId,
+        change: 'updated',
+      },
+    );
+    return enrichedShipment;
   }
 
   async assignDriver(shipmentId: string, input: AssignDriverDto) {
@@ -745,6 +756,18 @@ export class ShipmentsService {
     });
 
     await this.publishOrderEventSafe(result.orderEvent);
+    this.driverRealtimeService.notifyShipmentChange(input.driverId, {
+      shipmentId,
+      organizationId: input.organizationId,
+      change: 'assigned',
+    });
+    if (shipment.currentDriverId && shipment.currentDriverId !== input.driverId) {
+      this.driverRealtimeService.notifyShipmentChange(shipment.currentDriverId, {
+        shipmentId,
+        organizationId: input.organizationId,
+        change: 'removed',
+      });
+    }
     return result.assignment;
   }
 
@@ -824,6 +847,11 @@ export class ShipmentsService {
     });
 
     await this.publishOrderEventSafe(result.orderEvent);
+    this.driverRealtimeService.notifyShipmentChange(shipment.currentDriverId, {
+      shipmentId,
+      organizationId: input.organizationId,
+      change: 'status_changed',
+    });
     return result.trackingSession;
   }
 
@@ -1130,6 +1158,11 @@ export class ShipmentsService {
     });
 
     await this.publishOrderEventSafe(result.orderEvent);
+    this.driverRealtimeService.notifyShipmentChange(shipment.currentDriverId, {
+      shipmentId,
+      organizationId: input.organizationId,
+      change: 'proof_added',
+    });
     return result.proof;
   }
 
@@ -1465,6 +1498,11 @@ export class ShipmentsService {
     });
 
     await this.publishOrderEventSafe(result.orderEvent);
+    this.driverRealtimeService.notifyShipmentChange(shipment.currentDriverId, {
+      shipmentId,
+      organizationId: input.organizationId,
+      change: 'status_changed',
+    });
     return this.getShipmentById(shipmentId);
   }
 
@@ -1790,6 +1828,11 @@ export class ShipmentsService {
     });
 
     await this.publishOrderEventSafe(result.orderEvent);
+    this.driverRealtimeService.notifyShipmentChange(shipment.currentDriverId, {
+      shipmentId,
+      organizationId,
+      change: 'status_changed',
+    });
     return result.shipmentDetails;
   }
 

@@ -7,6 +7,7 @@ import { ClientStatus, Prisma } from '@prisma/client';
 import { PrismaService } from '../../shared/prisma/prisma.service';
 import { CreateCompanyClientDto } from './dto/create-company-client.dto';
 import { CreateCompanyClientLocationDto } from './dto/create-company-client-location.dto';
+import { CreateCompanyClientWithLocationsDto } from './dto/create-company-client-with-locations.dto';
 import { UpdateCompanyClientDto } from './dto/update-company-client.dto';
 import { UpdateCompanyClientLocationDto } from './dto/update-company-client-location.dto';
 
@@ -51,6 +52,49 @@ export class CompanyClientsService {
         companyClientCode,
         ...createData,
       } as Prisma.CompanyClientUncheckedCreateInput,
+    });
+
+    return this.mapCompanyClientResponse(companyClient);
+  }
+
+  async createCompanyClientWithLocations(
+    organizationId: string,
+    input: CreateCompanyClientWithLocationsDto,
+  ) {
+    const companyClientCode =
+      input.companyClientCode?.trim() ||
+      (await this.generateCompanyClientCode(organizationId));
+    const normalizedInput = this.normalizeCompanyClientInput(input);
+    const { companyClientCode: _ignoredCompanyClientCode, ...createData } = normalizedInput;
+
+    const companyClient = await this.prisma.companyClient.create({
+      data: {
+        organizationId,
+        companyClientCode,
+        ...createData,
+        locations: {
+          create: input.locations.map((location, index) => ({
+            organizationId,
+            locationType: location.locationType,
+            name: location.name,
+            addressLine1: location.addressLine1,
+            addressLine2: location.addressLine2,
+            city: location.city,
+            state: location.state,
+            postalCode: location.postalCode,
+            country: location.country ?? 'India',
+            gstin: location.gstin,
+            contactName: location.contactName,
+            contactPhone: location.contactPhone,
+            isPrimary: location.isPrimary ?? index === 0,
+          })),
+        },
+      } as Prisma.CompanyClientUncheckedCreateInput,
+      include: {
+        locations: {
+          orderBy: [{ isPrimary: 'desc' }, { createdAt: 'asc' }],
+        },
+      },
     });
 
     return this.mapCompanyClientResponse(companyClient);

@@ -43,6 +43,7 @@ export class KafkaEventBusService
   private producerReady = false;
   private producerAttempted = false;
   private disabledWarningLogged = false;
+  private readonly publishRetries: number;
 
   constructor(private readonly configService: ConfigService) {
     const serviceUri = this.resolveServiceUri();
@@ -53,6 +54,10 @@ export class KafkaEventBusService
       'ashwa-logix-backend';
     this.kafkaSsl = this.resolveKafkaSsl(serviceUri);
     this.kafkaSasl = this.resolveKafkaSasl(serviceUri);
+    this.publishRetries = Math.max(
+      1,
+      Number(this.configService.get<string>('EVENT_PUBLISH_RETRIES') ?? '3'),
+    );
 
     if (this.brokers.length > 0) {
       const config: KafkaConfig = {
@@ -114,20 +119,28 @@ export class KafkaEventBusService
       return;
     }
 
-    try {
-      await producer.send({
-        topic,
-        messages: [
-          {
-            key,
-            value: JSON.stringify(payload),
-          },
-        ],
-      });
-    } catch (error) {
-      this.logger.warn(
-        `Failed to publish Kafka message to ${topic}: ${this.toErrorMessage(error)}`,
-      );
+    for (let attempt = 1; attempt <= this.publishRetries; attempt += 1) {
+      try {
+        await producer.send({
+          topic,
+          messages: [
+            {
+              key,
+              value: JSON.stringify(payload),
+            },
+          ],
+        });
+        return;
+      } catch (error) {
+        if (attempt === this.publishRetries) {
+          this.logger.error(
+            `Failed to publish Kafka message to ${topic} after ${attempt} attempts: ${this.toErrorMessage(error)}`,
+          );
+          return;
+        }
+
+        await new Promise((resolve) => setTimeout(resolve, attempt * 250));
+      }
     }
   }
 

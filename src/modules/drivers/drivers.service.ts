@@ -281,7 +281,14 @@ export class DriversService {
           },
           orderBy: { eventTime: 'desc' },
         },
+        documents: {
+          orderBy: { uploadedAt: 'desc' },
+        },
         proofOfDeliveries: {
+          include: {
+            photoDocument: true,
+            signatureDocument: true,
+          },
           orderBy: { capturedAt: 'desc' },
         },
       },
@@ -315,12 +322,36 @@ export class DriversService {
       orderBy: { updatedAt: 'desc' },
       include: {
         companyClient: true,
+        sourceLocation: true,
+        destinationLocation: true,
+        currentDriver: true,
         currentVehicle: true,
+        stops: {
+          orderBy: { stopSequence: 'asc' },
+        },
+        items: true,
         assignments: {
           where: { driverId },
+          include: {
+            driver: true,
+            vehicle: true,
+          },
           orderBy: { assignedAt: 'desc' },
         },
+        statusEvents: {
+          include: {
+            driver: true,
+          },
+          orderBy: { eventTime: 'desc' },
+        },
+        documents: {
+          orderBy: { uploadedAt: 'desc' },
+        },
         proofOfDeliveries: {
+          include: {
+            photoDocument: true,
+            signatureDocument: true,
+          },
           orderBy: { capturedAt: 'desc' },
         },
       },

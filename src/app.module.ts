@@ -4,6 +4,7 @@ import { AuditModule } from './modules/audit/audit.module';
 import { AuthModule } from './modules/auth/auth.module';
 import { CompanyClientsModule } from './modules/company-clients/company-clients.module';
 import { DocumentsModule } from './modules/documents/documents.module';
+import { DriverRealtimeModule } from './modules/driver-realtime/driver-realtime.module';
 import { DriversModule } from './modules/drivers/drivers.module';
 import { HealthModule } from './modules/health/health.module';
 import { NotificationsModule } from './modules/notifications/notifications.module';
@@ -30,6 +31,7 @@ import { PrismaModule } from './shared/prisma/prisma.module';
     OrganizationsModule,
     CompanyClientsModule,
     DriversModule,
+    DriverRealtimeModule,
     VehiclesModule,
     ShipmentsModule,
     TrackingModule,
