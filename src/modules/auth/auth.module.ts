@@ -21,8 +21,8 @@ import { jwtSecret } from '../../shared/config/runtime-security';
       useFactory: (configService: ConfigService) => ({
         secret: jwtSecret(configService),
         signOptions: {
-          expiresIn:
-            (configService.get<string>('JWT_EXPIRES_IN') ?? '1d') as StringValue,
+          expiresIn: (configService.get<string>('JWT_EXPIRES_IN') ??
+            '1d') as StringValue,
         },
       }),
     }),

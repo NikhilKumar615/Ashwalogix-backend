@@ -1,6 +1,14 @@
 import { DocumentEntityType } from '@prisma/client';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
-import { IsEnum, IsOptional, IsString, IsUUID } from 'class-validator';
+import {
+  IsEnum,
+  IsInt,
+  IsOptional,
+  IsString,
+  IsUUID,
+  MaxLength,
+  Min,
+} from 'class-validator';
 
 export class GenerateUploadUrlDto {
   @ApiProperty()
@@ -17,10 +25,12 @@ export class GenerateUploadUrlDto {
 
   @ApiProperty()
   @IsString()
+  @MaxLength(120)
   documentType!: string;
 
   @ApiProperty()
   @IsString()
+  @MaxLength(255)
   fileName!: string;
 
   @ApiPropertyOptional()
@@ -32,4 +42,13 @@ export class GenerateUploadUrlDto {
   @IsOptional()
   @IsUUID()
   shipmentId?: string;
+
+  @ApiPropertyOptional({
+    description:
+      'Declared file size in bytes; uploads above the limit are rejected',
+  })
+  @IsOptional()
+  @IsInt()
+  @Min(0)
+  fileSize?: number;
 }

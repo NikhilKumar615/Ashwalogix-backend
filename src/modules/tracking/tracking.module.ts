@@ -17,6 +17,7 @@ import { TrackingEtaEngineConsumerService } from './tracking-eta-engine-consumer
 import { TrackingFanoutService } from './tracking-fanout.service';
 import { TrackingKalmanService } from './tracking-kalman.service';
 import { TrackingNotificationConsumerService } from './tracking-notification-consumer.service';
+import { TrackingPersistenceService } from './tracking-persistence.service';
 import { TrackingPubSubService } from './tracking-pub-sub.service';
 import { TrackingRoadEtaService } from './tracking-road-eta.service';
 import { TrackingRoomService } from './tracking-room.service';
@@ -36,8 +37,8 @@ import { jwtSecret } from '../../shared/config/runtime-security';
       useFactory: (configService: ConfigService) => ({
         secret: jwtSecret(configService),
         signOptions: {
-          expiresIn:
-            (configService.get<string>('JWT_EXPIRES_IN') ?? '1d') as StringValue,
+          expiresIn: (configService.get<string>('JWT_EXPIRES_IN') ??
+            '1d') as StringValue,
         },
       }),
     }),
@@ -57,6 +58,7 @@ import { jwtSecret } from '../../shared/config/runtime-security';
     TrackingDbSinkConsumerService,
     TrackingEtaEngineConsumerService,
     TrackingNotificationConsumerService,
+    TrackingPersistenceService,
     TrackingPubSubService,
     TrackingValidationService,
     {

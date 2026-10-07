@@ -15,7 +15,8 @@ import { Type } from 'class-transformer';
 
 export class RegisterOrganizationDocumentDto {
   @ApiProperty({
-    description: 'Use values like GST_CERTIFICATE, PAN_CARD, or CIN_CERTIFICATE',
+    description:
+      'Use values like GST_CERTIFICATE, PAN_CARD, or CIN_CERTIFICATE',
   })
   @IsString()
   documentType!: string;
@@ -80,7 +81,9 @@ export class RegisterCompanyAdminDto {
 
   @ApiProperty()
   @IsString()
-  @Matches(/^\d{10}$/, { message: 'organizationPhone must contain exactly 10 digits' })
+  @Matches(/^\d{10}$/, {
+    message: 'organizationPhone must contain exactly 10 digits',
+  })
   organizationPhone!: string;
 
   @ApiProperty()

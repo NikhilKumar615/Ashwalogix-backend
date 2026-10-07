@@ -1,4 +1,9 @@
-import { Injectable, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
+import {
+  Injectable,
+  Logger,
+  OnModuleDestroy,
+  OnModuleInit,
+} from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { PrismaPg } from '@prisma/adapter-pg';
 import { PrismaClient } from '@prisma/client';
@@ -13,11 +18,24 @@ export class PrismaService
 
   constructor(configService: ConfigService) {
     const connectionString =
-      configService.get<string>('DATABASE_URL') ?? process.env.DATABASE_URL ?? '';
+      configService.get<string>('DATABASE_URL') ??
+      process.env.DATABASE_URL ??
+      '';
+    // Verify the database server certificate by default. Opting out requires an
+    // explicit DATABASE_SSL_REJECT_UNAUTHORIZED=false and is logged loudly.
     const databaseSslRejectUnauthorized =
-      (configService.get<string>('DATABASE_SSL_REJECT_UNAUTHORIZED') ??
-        process.env.DATABASE_SSL_REJECT_UNAUTHORIZED ??
-        'false') === 'true';
+      String(
+        configService.get<string>('DATABASE_SSL_REJECT_UNAUTHORIZED') ??
+          process.env.DATABASE_SSL_REJECT_UNAUTHORIZED ??
+          'true',
+      )
+        .trim()
+        .toLowerCase() !== 'false';
+    if (!databaseSslRejectUnauthorized) {
+      new Logger('PrismaService').warn(
+        'DATABASE_SSL_REJECT_UNAUTHORIZED=false: database TLS certificates are NOT verified. Do not use this setting in production.',
+      );
+    }
     const poolMax = Number(
       configService.get<string>('DATABASE_POOL_MAX') ??
         process.env.DATABASE_POOL_MAX ??

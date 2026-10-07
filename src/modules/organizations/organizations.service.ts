@@ -1,5 +1,6 @@
 import {
   BadRequestException,
+  ForbiddenException,
   Injectable,
   Logger,
   NotFoundException,
@@ -14,9 +15,16 @@ import {
   Prisma,
   UserStatus,
 } from '@prisma/client';
-import { hash } from 'bcryptjs';
+import { compare, hash } from 'bcryptjs';
 import { randomUUID } from 'crypto';
 import { PrismaService } from '../../shared/prisma/prisma.service';
+import {
+  SAFE_USER_WITH_DRIVER_SELECT,
+  generateOneTimeToken,
+  hashOneTimeToken,
+  invalidateUserSession,
+  type SectionAccessValue,
+} from '../auth/auth-security.util';
 import {
   buildBusinessPrefix,
   buildStatePrefix,
@@ -44,6 +52,46 @@ const PORTAL_SECTION_KEYS = [
   'account',
 ];
 
+/**
+ * Who is performing a user-management action. `isOrgAdmin` must come from the
+ * caller's ORG_ADMIN role (or SUPER_ADMIN) — never from section access.
+ */
+export type OrganizationActor = {
+  userId: string;
+  isOrgAdmin: boolean;
+  sectionAccess: SectionAccessValue | null;
+};
+
+/** Public directory fields returned by the client-code lookup (no internal notes/ownership). */
+const ORGANIZATION_LOOKUP_SELECT = {
+  id: true,
+  name: true,
+  clientCode: true,
+  legalName: true,
+  companyType: true,
+  industry: true,
+  billingCycle: true,
+  creditAccount: true,
+  contactPerson: true,
+  designation: true,
+  contactEmail: true,
+  contactPhone: true,
+  email: true,
+  phone: true,
+  gstNumber: true,
+  panNumber: true,
+  addressLine1: true,
+  addressLine2: true,
+  city: true,
+  state: true,
+  postalCode: true,
+  country: true,
+  status: true,
+  locations: {
+    orderBy: [{ isPrimary: 'desc' }, { createdAt: 'asc' }],
+  },
+} satisfies Prisma.OrganizationSelect;
+
 @Injectable()
 export class OrganizationsService {
   private readonly logger = new Logger(OrganizationsService.name);
@@ -62,9 +110,7 @@ export class OrganizationsService {
       orderBy: { createdAt: 'asc' },
       include: {
         user: {
-          include: {
-            driverProfile: true,
-          },
+          select: SAFE_USER_WITH_DRIVER_SELECT,
         },
       },
     });
@@ -80,9 +126,7 @@ export class OrganizationsService {
       },
       include: {
         user: {
-          include: {
-            driverProfile: true,
-          },
+          select: SAFE_USER_WITH_DRIVER_SELECT,
         },
       },
     });
@@ -102,11 +146,7 @@ export class OrganizationsService {
         clientCode: normalizedCode,
         status: OrganizationStatus.ACTIVE,
       },
-      include: {
-        locations: {
-          orderBy: [{ isPrimary: 'desc' }, { createdAt: 'asc' }],
-        },
-      },
+      select: ORGANIZATION_LOOKUP_SELECT,
     });
 
     if (!organization) {
@@ -119,21 +159,17 @@ export class OrganizationsService {
   async createOrganizationUser(
     organizationId: string,
     input: CreateOrganizationUserDto,
-    createdByUserId: string,
+    actor: OrganizationActor,
   ) {
     const organization = await this.ensureOrganizationIsActive(organizationId);
 
-    return this.createUserWithinOrganization(
-      organization,
-      input,
-      createdByUserId,
-    );
+    return this.createUserWithinOrganization(organization, input, actor);
   }
 
   async registerDispatcher(
     organizationId: string,
     input: RegisterDispatcherDto,
-    createdByUserId: string,
+    actor: OrganizationActor,
   ) {
     const organization = await this.ensureOrganizationIsActive(organizationId);
 
@@ -147,14 +183,14 @@ export class OrganizationsService {
         role: OrganizationRole.DISPATCHER,
         sectionAccess: input.sectionAccess,
       },
-      createdByUserId,
+      actor,
     );
   }
 
   async registerWarehouseStaff(
     organizationId: string,
     input: RegisterOrganizationStaffDto,
-    createdByUserId: string,
+    actor: OrganizationActor,
   ) {
     const organization = await this.ensureOrganizationIsActive(organizationId);
 
@@ -168,14 +204,14 @@ export class OrganizationsService {
         role: OrganizationRole.WAREHOUSE,
         sectionAccess: input.sectionAccess,
       },
-      createdByUserId,
+      actor,
     );
   }
 
   async registerOperationsStaff(
     organizationId: string,
     input: RegisterOrganizationStaffDto,
-    createdByUserId: string,
+    actor: OrganizationActor,
   ) {
     const organization = await this.ensureOrganizationIsActive(organizationId);
 
@@ -189,14 +225,14 @@ export class OrganizationsService {
         role: OrganizationRole.OPERATIONS,
         sectionAccess: input.sectionAccess,
       },
-      createdByUserId,
+      actor,
     );
   }
 
   async registerCompanyDriver(
     organizationId: string,
     input: RegisterCompanyDriverDto,
-    createdByUserId: string,
+    actor: OrganizationActor,
   ) {
     const organization = await this.ensureOrganizationIsActive(organizationId);
 
@@ -214,7 +250,7 @@ export class OrganizationsService {
         homeBase: input.homeBase,
         sectionAccess: input.sectionAccess,
       },
-      createdByUserId,
+      actor,
     );
   }
 
@@ -222,6 +258,7 @@ export class OrganizationsService {
     organizationId: string,
     userId: string,
     input: UpdateOrganizationUserDto,
+    actor: OrganizationActor,
   ) {
     await this.ensureOrganizationIsActive(organizationId);
 
@@ -231,12 +268,64 @@ export class OrganizationsService {
         userId,
       },
       include: {
-        user: true,
+        user: {
+          select: { id: true, email: true, passwordHash: true },
+        },
       },
     });
 
     if (!organizationUser) {
       throw new NotFoundException('Organization user not found');
+    }
+
+    const isSelf = actor.userId === userId;
+    const changesPermissions =
+      input.sectionAccess !== undefined ||
+      input.membershipStatus !== undefined ||
+      input.userStatus !== undefined;
+
+    if (isSelf && changesPermissions) {
+      throw new ForbiddenException(
+        'You cannot change your own access, membership status or account status',
+      );
+    }
+
+    if (!isSelf && !actor.isOrgAdmin) {
+      if (organizationUser.role === OrganizationRole.ORG_ADMIN) {
+        throw new ForbiddenException(
+          'Only an organization admin can modify an organization admin',
+        );
+      }
+      if (input.password) {
+        throw new ForbiddenException(
+          "Only an organization admin can set another user's password",
+        );
+      }
+      if (input.email) {
+        throw new ForbiddenException(
+          "Only an organization admin can change another user's email",
+        );
+      }
+      if (input.sectionAccess !== undefined) {
+        this.assertCanGrantSectionAccess(actor, input.sectionAccess);
+      }
+    }
+
+    // Changing your own password through this endpoint requires the current
+    // password (prefer POST /auth/change-password).
+    if (isSelf && input.password) {
+      if (
+        !input.currentPassword ||
+        !organizationUser.user.passwordHash ||
+        !(await compare(
+          input.currentPassword,
+          organizationUser.user.passwordHash,
+        ))
+      ) {
+        throw new BadRequestException(
+          'Current password is required and must be correct. Use POST /auth/change-password.',
+        );
+      }
     }
 
     if (input.email || input.phone) {
@@ -247,9 +336,11 @@ export class OrganizationsService {
       );
     }
 
-    const passwordHash = input.password ? await hash(input.password, 10) : undefined;
+    const passwordHash = input.password
+      ? await hash(input.password, 10)
+      : undefined;
 
-    return this.prisma.$transaction(async (tx) => {
+    const result = await this.prisma.$transaction(async (tx) => {
       const updatedUser = await tx.user.update({
         where: { id: userId },
         data: {
@@ -257,11 +348,12 @@ export class OrganizationsService {
           email: input.email?.toLowerCase(),
           phone: input.phone,
           passwordHash,
+          ...(passwordHash
+            ? { resetPasswordToken: null, resetPasswordTokenExpiresAt: null }
+            : {}),
           status: input.userStatus,
         },
-        include: {
-          driverProfile: true,
-        },
+        select: SAFE_USER_WITH_DRIVER_SELECT,
       });
 
       const updatedMembership = await tx.organizationUser.update({
@@ -276,10 +368,10 @@ export class OrganizationsService {
           sectionAccess:
             input.sectionAccess === undefined
               ? undefined
-              : (this.normalizeSectionAccess(
+              : this.normalizeSectionAccess(
                   organizationUser.role,
                   input.sectionAccess,
-                ) as Prisma.InputJsonValue),
+                ),
         },
       });
 
@@ -303,6 +395,46 @@ export class OrganizationsService {
         user: updatedUser,
       };
     });
+
+    // Permission/password/status changes take effect on the next request.
+    invalidateUserSession(userId);
+    return result;
+  }
+
+  /**
+   * Non-admin managers (e.g. OPERATIONS with the "users" section) may only
+   * grant sections they hold themselves, and never fullAccess.
+   */
+  private assertCanGrantSectionAccess(
+    actor: OrganizationActor,
+    requested?: SectionAccessDto,
+  ) {
+    if (actor.isOrgAdmin || !requested) {
+      return;
+    }
+
+    if (requested.fullAccess) {
+      throw new ForbiddenException(
+        'Only an organization admin can grant full access',
+      );
+    }
+
+    const held = actor.sectionAccess;
+    const requestedSections = (requested.sections ?? []).map((section) =>
+      section.trim().toLowerCase(),
+    );
+    const allowed =
+      held?.fullAccess === true
+        ? requestedSections
+        : requestedSections.filter((section) =>
+            held?.sections.includes(section),
+          );
+
+    if (allowed.length !== requestedSections.length) {
+      throw new ForbiddenException(
+        'You can only grant portal sections that you have access to',
+      );
+    }
   }
 
   async deleteOrganizationUser(
@@ -310,34 +442,67 @@ export class OrganizationsService {
     userId: string,
     reason: string,
     deletedByUserId: string,
+    actorIsOrgAdmin = false,
   ) {
     if (userId === deletedByUserId) {
-      throw new BadRequestException('You cannot remove your own account. Transfer administration first.');
+      throw new BadRequestException(
+        'You cannot remove your own account. Transfer administration first.',
+      );
     }
     const organization = await this.ensureOrganizationIsActive(organizationId);
     if (organization.ownerUserId === userId) {
-      throw new BadRequestException('The organization owner cannot be removed. Transfer ownership first.');
+      throw new BadRequestException(
+        'The organization owner cannot be removed. Transfer ownership first.',
+      );
     }
     const membership = await this.prisma.organizationUser.findFirst({
       where: { organizationId, userId },
-      include: { user: true },
+      include: { user: { select: { id: true, fullName: true } } },
     });
     if (!membership) throw new NotFoundException('Organization user not found');
+    if (membership.role === OrganizationRole.ORG_ADMIN && !actorIsOrgAdmin) {
+      throw new ForbiddenException(
+        'Only an organization admin can remove an organization admin',
+      );
+    }
 
     await this.prisma.$transaction(async (tx) => {
       await tx.deletionAudit.create({
-        data: { organizationId, entityType: 'ORGANIZATION_USER', entityId: userId, entityLabel: membership.user.fullName, reason: reason.trim(), deletedByUserId },
+        data: {
+          organizationId,
+          entityType: 'ORGANIZATION_USER',
+          entityId: userId,
+          entityLabel: membership.user.fullName,
+          reason: reason.trim(),
+          deletedByUserId,
+        },
       });
-      await tx.organizationUser.delete({ where: { organizationId_userId: { organizationId, userId } } });
+      await tx.organizationUser.delete({
+        where: { organizationId_userId: { organizationId, userId } },
+      });
     });
+    invalidateUserSession(userId);
     return { id: userId, deleted: true };
   }
 
   private async createUserWithinOrganization(
     organization: { id: string; name: string; state: string | null },
     input: CreateOrganizationUserDto,
-    createdByUserId: string,
+    actor: OrganizationActor,
   ) {
+    const createdByUserId = actor.userId;
+
+    if (!actor.isOrgAdmin) {
+      if (input.role === OrganizationRole.ORG_ADMIN) {
+        throw new ForbiddenException(
+          'Only an organization admin can create another organization admin',
+        );
+      }
+      if (input.role !== OrganizationRole.DRIVER) {
+        this.assertCanGrantSectionAccess(actor, input.sectionAccess);
+      }
+    }
+
     const existingUser = await this.prisma.user.findFirst({
       where: {
         OR: [
@@ -354,16 +519,17 @@ export class OrganizationsService {
     }
 
     const now = new Date();
-    const temporaryPassword = input.password || this.generateTemporaryPassword();
+    const temporaryPassword =
+      input.password || this.generateTemporaryPassword();
     const passwordHash = await hash(temporaryPassword, 10);
-    const resetPasswordToken = randomUUID();
+    const resetPasswordToken = generateOneTimeToken();
     const resetHours = Number(
       this.configService.get<string>('PASSWORD_RESET_TTL_HOURS') ?? '24',
     );
     const resetPasswordTokenExpiresAt = new Date(
       Date.now() + resetHours * 60 * 60 * 1000,
     );
-    const verificationToken = randomUUID();
+    const verificationToken = generateOneTimeToken();
     const verificationHours = Number(
       this.configService.get<string>('EMAIL_VERIFICATION_TTL_HOURS') ?? '168',
     );
@@ -379,11 +545,12 @@ export class OrganizationsService {
           phone: input.phone,
           passwordHash,
           status: UserStatus.ACTIVE,
-          verificationToken,
+          // Only SHA-256 hashes of the emailed tokens are stored.
+          verificationToken: hashOneTimeToken(verificationToken),
           verificationTokenExpiresAt,
           approvedAt: now,
           approvedByUserId: createdByUserId,
-          resetPasswordToken,
+          resetPasswordToken: hashOneTimeToken(resetPasswordToken),
           resetPasswordTokenExpiresAt,
         },
       });
@@ -397,7 +564,7 @@ export class OrganizationsService {
           sectionAccess: this.normalizeSectionAccess(
             input.role,
             input.sectionAccess,
-          ) as Prisma.InputJsonValue,
+          ),
         },
       });
 
@@ -424,9 +591,9 @@ export class OrganizationsService {
 
       return tx.user.findUnique({
         where: { id: user.id },
-        include: {
+        select: {
+          ...SAFE_USER_WITH_DRIVER_SELECT,
           organizationMembers: true,
-          driverProfile: true,
         },
       });
     });
@@ -496,11 +663,35 @@ export class OrganizationsService {
     }
   }
 
+  /**
+   * Section access to store for a membership. Default deny:
+   * - ORG_ADMIN: full access (governed by role anyway).
+   * - DRIVER: never gets portal sections (stored as NULL).
+   * - Others: only what was explicitly granted; nothing if not provided.
+   */
   private normalizeSectionAccess(
     role: OrganizationRole,
     input?: SectionAccessDto,
-  ) {
-    if (role === OrganizationRole.ORG_ADMIN || !input || input.fullAccess) {
+  ): Prisma.InputJsonValue | typeof Prisma.DbNull {
+    if (role === OrganizationRole.DRIVER) {
+      return Prisma.DbNull;
+    }
+
+    if (role === OrganizationRole.ORG_ADMIN) {
+      return {
+        fullAccess: true,
+        sections: [],
+      };
+    }
+
+    if (!input) {
+      return {
+        fullAccess: false,
+        sections: [],
+      };
+    }
+
+    if (input.fullAccess) {
       return {
         fullAccess: true,
         sections: [],

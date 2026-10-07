@@ -38,6 +38,14 @@ export class UpdateOrganizationUserDto {
   })
   password?: string;
 
+  @ApiPropertyOptional({
+    description:
+      'Required when changing your own password via this endpoint (prefer POST /auth/change-password).',
+  })
+  @IsOptional()
+  @IsString()
+  currentPassword?: string;
+
   @ApiPropertyOptional({ enum: UserStatus })
   @IsOptional()
   @IsEnum(UserStatus)

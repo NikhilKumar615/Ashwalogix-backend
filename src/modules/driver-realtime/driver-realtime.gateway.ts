@@ -63,12 +63,31 @@ export class DriverRealtimeGateway
       }
 
       const payload = await this.jwtService.verifyAsync<JwtPayload>(token);
+      if (payload.typ !== undefined && payload.typ !== 'access') {
+        throw new Error('Invalid token type');
+      }
+
       const driver = await this.prisma.driver.findFirst({
         where: { userId: payload.sub },
         select: { id: true, organizationId: true },
       });
+      if (!driver) {
+        throw new Error('Driver access is not available');
+      }
 
-      if (!driver || !payload.organizationIds.includes(driver.organizationId)) {
+      // Re-check membership and organization status in the DB: the JWT may
+      // outlive a removed membership or a suspended organization.
+      const membership = await this.prisma.organizationUser.findFirst({
+        where: {
+          userId: payload.sub,
+          organizationId: driver.organizationId,
+          status: 'ACTIVE',
+          organization: { status: 'ACTIVE' },
+          user: { status: 'ACTIVE' },
+        },
+        select: { id: true },
+      });
+      if (!membership) {
         throw new Error('Driver access is not available');
       }
 

@@ -1,13 +1,14 @@
 import {
   BadRequestException,
   Body,
+  ForbiddenException,
   Controller,
   Get,
   Param,
   Post,
   UseGuards,
 } from '@nestjs/common';
-import { OrganizationRole } from '@prisma/client';
+import { DocumentEntityType, OrganizationRole } from '@prisma/client';
 import {
   ApiBearerAuth,
   ApiBody,
@@ -110,9 +111,19 @@ export class DocumentsController {
           allowAssignedDriver: true,
         },
       );
+
+      if (
+        this.isDriverOnlyInOrganization(user, body.organizationId) &&
+        body.entityType !== DocumentEntityType.SHIPMENT &&
+        body.entityType !== DocumentEntityType.POD
+      ) {
+        throw new ForbiddenException(
+          'Drivers can only attach shipment or proof-of-delivery documents',
+        );
+      }
     }
 
-    return this.documentsService.createDocument(body);
+    return this.documentsService.createDocument(body, user.sub);
   }
 
   @Get('shipment/:shipmentId')
@@ -167,7 +178,11 @@ export class DocumentsController {
       document.organizationId,
     );
 
-    if (document.shipmentId) {
+    if (!document.shipmentId) {
+      // M2: organization-level documents (KYC, driver, client, vehicle docs)
+      // are not visible to every member of the organization.
+      await this.assertOrganizationLevelDocumentAccess(user, document);
+    } else {
       await this.authorizationService.assertShipmentAccess(
         user,
         document.shipmentId,
@@ -184,5 +199,61 @@ export class DocumentsController {
     }
 
     return this.documentsService.generateAccessUrl(documentId);
+  }
+
+  private async assertOrganizationLevelDocumentAccess(
+    user: JwtPayload,
+    document: {
+      organizationId: string;
+      entityType: DocumentEntityType;
+      entityId: string;
+    },
+  ) {
+    if (document.entityType === DocumentEntityType.DRIVER) {
+      // Staff who manage drivers, or the driver the document belongs to.
+      await this.authorizationService.assertDriverAccess(
+        user,
+        document.entityId,
+        document.organizationId,
+        [
+          OrganizationRole.ORG_ADMIN,
+          OrganizationRole.OPERATIONS,
+          OrganizationRole.DISPATCHER,
+        ],
+      );
+      return;
+    }
+
+    if (document.entityType === DocumentEntityType.ORGANIZATION) {
+      // KYC / company documents.
+      await this.authorizationService.assertOrganizationAccess(
+        user,
+        document.organizationId,
+        [OrganizationRole.ORG_ADMIN, OrganizationRole.OPERATIONS],
+      );
+      return;
+    }
+
+    // CLIENT / VEHICLE / other entity documents: back-office staff only.
+    await this.authorizationService.assertOrganizationAccess(
+      user,
+      document.organizationId,
+      [
+        OrganizationRole.ORG_ADMIN,
+        OrganizationRole.OPERATIONS,
+        OrganizationRole.DISPATCHER,
+        OrganizationRole.WAREHOUSE,
+      ],
+    );
+  }
+
+  private isDriverOnlyInOrganization(user: JwtPayload, organizationId: string) {
+    const roles = user.memberships
+      .filter((membership) => membership.organizationId === organizationId)
+      .map((membership) => membership.role);
+    return (
+      roles.length > 0 &&
+      roles.every((role) => role === (OrganizationRole.DRIVER as string))
+    );
   }
 }

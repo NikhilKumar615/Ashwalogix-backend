@@ -3,6 +3,7 @@ import {
   Controller,
   Get,
   Param,
+  ParseUUIDPipe,
   Patch,
   Post,
   UseGuards,
@@ -14,8 +15,12 @@ import {
   ApiParam,
   ApiTags,
 } from '@nestjs/swagger';
+import { Throttle } from '@nestjs/throttler';
+import { AUTH_THROTTLE } from '../../shared/config/http-throttler.guard';
 import { CurrentUser } from './decorators/current-user.decorator';
 import { Roles } from './decorators/roles.decorator';
+import { ChangePasswordDto } from './dto/change-password.dto';
+import { SuspendOrganizationDto } from './dto/suspend-organization.dto';
 import { ApproveIndependentDriverDto } from './dto/approve-independent-driver.dto';
 import { ApproveOrganizationDto } from './dto/approve-organization.dto';
 import { CreateClientOrganizationDto } from './dto/create-client-organization.dto';
@@ -40,6 +45,7 @@ import type { JwtPayload } from './interfaces/jwt-payload.interface';
 export class AuthController {
   constructor(private readonly authService: AuthService) {}
 
+  @Throttle(AUTH_THROTTLE.register)
   @Post('register-company-admin')
   @ApiOperation({
     summary:
@@ -50,6 +56,7 @@ export class AuthController {
     return this.authService.registerCompanyAdmin(body);
   }
 
+  @Throttle(AUTH_THROTTLE.register)
   @Post('register-independent-driver')
   @ApiOperation({
     summary: 'Register an independent driver for verification and approval',
@@ -59,6 +66,7 @@ export class AuthController {
     return this.authService.registerIndependentDriver(body);
   }
 
+  @Throttle(AUTH_THROTTLE.emailToken)
   @Post('verify-email')
   @ApiOperation({ summary: 'Verify a newly registered user email' })
   @ApiBody({ type: VerifyEmailDto })
@@ -66,6 +74,7 @@ export class AuthController {
     return this.authService.verifyEmail(body);
   }
 
+  @Throttle(AUTH_THROTTLE.login)
   @Post('login')
   @ApiOperation({ summary: 'Login with email and password' })
   @ApiBody({ type: LoginDto })
@@ -73,6 +82,7 @@ export class AuthController {
     return this.authService.login(body);
   }
 
+  @Throttle(AUTH_THROTTLE.login)
   @Post('super-admin/request-otp')
   @ApiOperation({
     summary: 'Validate super admin credentials and send a sign-in OTP by email',
@@ -82,6 +92,7 @@ export class AuthController {
     return this.authService.requestSuperAdminOtp(body);
   }
 
+  @Throttle(AUTH_THROTTLE.otpVerify)
   @Post('super-admin/verify-otp')
   @ApiOperation({
     summary: 'Verify the emailed OTP and complete super admin sign-in',
@@ -91,6 +102,7 @@ export class AuthController {
     return this.authService.verifySuperAdminOtp(body);
   }
 
+  @Throttle(AUTH_THROTTLE.emailToken)
   @Post('forgot-password')
   @ApiOperation({ summary: 'Create a password reset token for a user account' })
   @ApiBody({ type: ForgotPasswordDto })
@@ -98,6 +110,7 @@ export class AuthController {
     return this.authService.forgotPassword(body.email);
   }
 
+  @Throttle(AUTH_THROTTLE.emailToken)
   @Post('reset-password')
   @ApiOperation({ summary: 'Reset a user password using a reset token' })
   @ApiBody({ type: ResetPasswordDto })
@@ -111,6 +124,80 @@ export class AuthController {
   @UseGuards(JwtAuthGuard)
   me(@CurrentUser() user: JwtPayload) {
     return this.authService.getCurrentUser(user.sub);
+  }
+
+  @Post('change-password')
+  @Throttle(AUTH_THROTTLE.changePassword)
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      'Change the signed-in user password (requires the current password). Returns a fresh accessToken; all other sessions are signed out.',
+  })
+  @ApiBody({ type: ChangePasswordDto })
+  @UseGuards(JwtAuthGuard)
+  changePassword(
+    @CurrentUser() user: JwtPayload,
+    @Body() body: ChangePasswordDto,
+  ) {
+    return this.authService.changePassword(
+      user.sub,
+      body.currentPassword,
+      body.newPassword,
+    );
+  }
+
+  @Get('organizations/suspended')
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary: 'List suspended client organizations (super admin)',
+  })
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles('SUPER_ADMIN')
+  getSuspendedOrganizations() {
+    return this.authService.getSuspendedOrganizations();
+  }
+
+  @Post('organizations/:organizationId/suspend')
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary:
+      'Suspend an organization: its members can no longer sign in or call org APIs (super admin)',
+  })
+  @ApiParam({ name: 'organizationId', type: String })
+  @ApiBody({ type: SuspendOrganizationDto })
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles('SUPER_ADMIN')
+  suspendOrganization(
+    @Param('organizationId', new ParseUUIDPipe()) organizationId: string,
+    @Body() body: SuspendOrganizationDto,
+    @CurrentUser() user: JwtPayload,
+  ) {
+    return this.authService.suspendOrganization(
+      organizationId,
+      user.sub,
+      body.reason,
+    );
+  }
+
+  @Post('organizations/:organizationId/reactivate')
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary: 'Reactivate a suspended organization (super admin)',
+  })
+  @ApiParam({ name: 'organizationId', type: String })
+  @ApiBody({ type: SuspendOrganizationDto, required: false })
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles('SUPER_ADMIN')
+  reactivateOrganization(
+    @Param('organizationId', new ParseUUIDPipe()) organizationId: string,
+    @Body() body: SuspendOrganizationDto,
+    @CurrentUser() user: JwtPayload,
+  ) {
+    return this.authService.reactivateOrganization(
+      organizationId,
+      user.sub,
+      body?.reason,
+    );
   }
 
   @Get('organizations/pending')
@@ -133,7 +220,9 @@ export class AuthController {
 
   @Get('organizations/approved')
   @ApiBearerAuth()
-  @ApiOperation({ summary: 'List approved client organizations for super admin' })
+  @ApiOperation({
+    summary: 'List approved client organizations for super admin',
+  })
   @UseGuards(JwtAuthGuard, RolesGuard)
   @Roles('SUPER_ADMIN')
   getApprovedOrganizations() {

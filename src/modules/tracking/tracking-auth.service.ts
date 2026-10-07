@@ -15,6 +15,12 @@ export class TrackingAuthService {
     }
 
     const payload = await this.jwtService.verifyAsync<TrackingTokenPayload>(token);
+    // Access tokens share the signing secret; only tokens minted for tracking
+    // may open a tracking socket.  Legacy tracking tokens have no typ.
+    const tokenType = (payload as { typ?: unknown }).typ;
+    if (tokenType !== undefined && tokenType !== 'tracking') {
+      throw new UnauthorizedException('Invalid tracking token');
+    }
     this.assertValidPayload(payload);
 
     return payload;

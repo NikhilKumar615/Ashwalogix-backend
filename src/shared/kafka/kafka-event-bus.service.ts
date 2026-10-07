@@ -1,20 +1,7 @@
-import {
-  Injectable,
-  Logger,
-  OnModuleDestroy,
-} from '@nestjs/common';
+import { Injectable, Logger, OnModuleDestroy } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import {
-  Consumer,
-  Kafka,
-  KafkaConfig,
-  Producer,
-  SASLOptions,
-} from 'kafkajs';
-import {
-  ORDER_EVENTS_TOPIC,
-  RIDER_LOCATION_TOPIC,
-} from './kafka.constants';
+import { Consumer, Kafka, KafkaConfig, Producer, SASLOptions } from 'kafkajs';
+import { ORDER_EVENTS_TOPIC, RIDER_LOCATION_TOPIC } from './kafka.constants';
 import type {
   OrderEventHandler,
   OrderEventMessage,
@@ -23,15 +10,17 @@ import type {
   TrackingEventBus,
 } from './interfaces/tracking-event-bus.interface';
 
+const BASE_BACKOFF_MS = 1_000;
+const MAX_BACKOFF_MS = 60_000;
+const CONSUMER_HANDLER_ATTEMPTS = 3;
+
 type SupportedSaslMechanism = Extract<
   SASLOptions['mechanism'],
   'plain' | 'scram-sha-256' | 'scram-sha-512'
 >;
 
 @Injectable()
-export class KafkaEventBusService
-  implements TrackingEventBus, OnModuleDestroy
-{
+export class KafkaEventBusService implements TrackingEventBus, OnModuleDestroy {
   private readonly logger = new Logger(KafkaEventBusService.name);
   private readonly brokers: string[];
   private readonly kafkaClientId: string;
@@ -41,7 +30,11 @@ export class KafkaEventBusService
   private producer?: Producer;
   private readonly consumers: Consumer[] = [];
   private producerReady = false;
-  private producerAttempted = false;
+  private producerConnecting?: Promise<Producer | null>;
+  private producerFailures = 0;
+  private nextProducerAttemptAt = 0;
+  private shuttingDown = false;
+  private readonly retryTimers = new Set<NodeJS.Timeout>();
   private disabledWarningLogged = false;
   private readonly publishRetries: number;
 
@@ -79,11 +72,11 @@ export class KafkaEventBusService
     }
   }
 
-  async publishRiderLocation(event: RiderLocationEvent) {
-    await this.publish(RIDER_LOCATION_TOPIC, event.shipmentId, event);
+  async publishRiderLocation(event: RiderLocationEvent): Promise<boolean> {
+    return this.publish(RIDER_LOCATION_TOPIC, event.shipmentId, event);
   }
 
-  async publishOrderEvent(event: OrderEventMessage) {
+  async publishOrderEvent(event: OrderEventMessage): Promise<void> {
     await this.publish(ORDER_EVENTS_TOPIC, event.shipmentId, event);
   }
 
@@ -91,32 +84,50 @@ export class KafkaEventBusService
     groupId: string,
     handler: RiderLocationHandler,
   ) {
-    await this.registerConsumer(RIDER_LOCATION_TOPIC, groupId, async (payload) => {
-      await handler(payload as RiderLocationEvent);
-    });
+    await this.registerConsumer(
+      RIDER_LOCATION_TOPIC,
+      groupId,
+      async (payload) => {
+        await handler(payload as RiderLocationEvent);
+      },
+    );
   }
 
   async registerOrderEventConsumer(
     groupId: string,
     handler: OrderEventHandler,
   ) {
-    await this.registerConsumer(ORDER_EVENTS_TOPIC, groupId, async (payload) => {
-      await handler(payload as OrderEventMessage);
-    });
+    await this.registerConsumer(
+      ORDER_EVENTS_TOPIC,
+      groupId,
+      async (payload) => {
+        await handler(payload as OrderEventMessage);
+      },
+    );
   }
 
   async onModuleDestroy() {
+    this.shuttingDown = true;
+    for (const timer of this.retryTimers) {
+      clearTimeout(timer);
+    }
+    this.retryTimers.clear();
+
     await Promise.allSettled([
       this.producer?.disconnect(),
       ...this.consumers.map((consumer) => consumer.disconnect()),
     ]);
   }
 
-  private async publish(topic: string, key: string, payload: unknown) {
+  private async publish(
+    topic: string,
+    key: string,
+    payload: unknown,
+  ): Promise<boolean> {
     const producer = await this.getProducer();
 
     if (!producer) {
-      return;
+      return false;
     }
 
     for (let attempt = 1; attempt <= this.publishRetries; attempt += 1) {
@@ -130,27 +141,36 @@ export class KafkaEventBusService
             },
           ],
         });
-        return;
+        return true;
       } catch (error) {
         if (attempt === this.publishRetries) {
           this.logger.error(
             `Failed to publish Kafka message to ${topic} after ${attempt} attempts: ${this.toErrorMessage(error)}`,
           );
-          return;
+          // Force a reconnect (with backoff) on a later publish.
+          this.markProducerDown();
+          return false;
         }
 
         await new Promise((resolve) => setTimeout(resolve, attempt * 250));
       }
     }
+
+    return false;
   }
 
   private async registerConsumer(
     topic: string,
     groupId: string,
     handler: (payload: unknown) => Promise<void>,
+    attempt = 0,
   ) {
     if (!this.kafka) {
       this.logDisabledWarning();
+      return;
+    }
+
+    if (this.shuttingDown) {
       return;
     }
 
@@ -162,6 +182,19 @@ export class KafkaEventBusService
     });
     this.consumers.push(consumer);
 
+    // kafkajs restarts by itself after retriable crashes; after a
+    // non-retriable crash we discard the consumer and start a fresh one.
+    consumer.on(consumer.events.CRASH, (event) => {
+      if (event.payload.restart === false && !this.shuttingDown) {
+        this.logger.error(
+          `Kafka consumer ${groupId} for topic ${topic} crashed: ${this.toErrorMessage(event.payload.error)}. Restarting with backoff.`,
+        );
+        void this.discardConsumer(consumer).then(() =>
+          this.scheduleConsumerRetry(topic, groupId, handler, 1),
+        );
+      }
+    });
+
     try {
       await consumer.connect();
       await consumer.subscribe({
@@ -170,20 +203,105 @@ export class KafkaEventBusService
       });
       await consumer.run({
         autoCommit: true,
-        eachMessage: async ({ message }) => {
+        eachMessage: async ({ partition, message }) => {
           if (!message.value) {
             return;
           }
 
-          const payload = JSON.parse(message.value.toString()) as unknown;
-          await handler(payload);
+          const rawValue = message.value.toString();
+          let payload: unknown;
+          try {
+            payload = JSON.parse(rawValue) as unknown;
+          } catch (error) {
+            this.logDeadLetter(
+              topic,
+              groupId,
+              partition,
+              message.offset,
+              rawValue,
+              error,
+              'unparseable payload',
+            );
+            return;
+          }
+
+          for (
+            let handlerAttempt = 1;
+            handlerAttempt <= CONSUMER_HANDLER_ATTEMPTS;
+            handlerAttempt += 1
+          ) {
+            try {
+              await handler(payload);
+              return;
+            } catch (error) {
+              if (handlerAttempt === CONSUMER_HANDLER_ATTEMPTS) {
+                // Never rethrow: a poison message must not block the partition.
+                this.logDeadLetter(
+                  topic,
+                  groupId,
+                  partition,
+                  message.offset,
+                  rawValue,
+                  error,
+                  `handler failed after ${handlerAttempt} attempts`,
+                );
+                return;
+              }
+
+              await new Promise((resolve) =>
+                setTimeout(resolve, handlerAttempt * 200),
+              );
+            }
+          }
         },
       });
     } catch (error) {
       this.logger.warn(
-        `Failed to start Kafka consumer ${groupId} for topic ${topic}: ${this.toErrorMessage(error)}`,
+        `Failed to start Kafka consumer ${groupId} for topic ${topic} (attempt ${attempt + 1}): ${this.toErrorMessage(error)}`,
       );
+      await this.discardConsumer(consumer);
+      this.scheduleConsumerRetry(topic, groupId, handler, attempt + 1);
     }
+  }
+
+  private scheduleConsumerRetry(
+    topic: string,
+    groupId: string,
+    handler: (payload: unknown) => Promise<void>,
+    attempt: number,
+  ) {
+    if (this.shuttingDown) {
+      return;
+    }
+
+    const timer = setTimeout(() => {
+      this.retryTimers.delete(timer);
+      void this.registerConsumer(topic, groupId, handler, attempt);
+    }, this.backoffMs(attempt));
+    timer.unref?.();
+    this.retryTimers.add(timer);
+  }
+
+  private async discardConsumer(consumer: Consumer) {
+    const index = this.consumers.indexOf(consumer);
+    if (index >= 0) {
+      this.consumers.splice(index, 1);
+    }
+    await consumer.disconnect().catch(() => undefined);
+  }
+
+  private logDeadLetter(
+    topic: string,
+    groupId: string,
+    partition: number,
+    offset: string,
+    rawValue: string,
+    error: unknown,
+    reason: string,
+  ) {
+    this.logger.error(
+      `[DLQ] Skipping Kafka message topic=${topic} group=${groupId} partition=${partition} offset=${offset} (${reason}): ${this.toErrorMessage(error)} payload=${rawValue.slice(0, 500)}`,
+    );
   }
 
   private async getProducer() {
@@ -196,23 +314,64 @@ export class KafkaEventBusService
       return this.producer;
     }
 
-    if (this.producerAttempted) {
+    if (this.producerConnecting) {
+      return this.producerConnecting;
+    }
+
+    if (Date.now() < this.nextProducerAttemptAt) {
       return null;
     }
 
-    this.producerAttempted = true;
-    this.producer = this.kafka.producer();
+    this.producerConnecting = this.connectProducer();
+    try {
+      return await this.producerConnecting;
+    } finally {
+      this.producerConnecting = undefined;
+    }
+  }
+
+  private async connectProducer(): Promise<Producer | null> {
+    if (!this.kafka) {
+      return null;
+    }
+
+    if (this.producer) {
+      await this.producer.disconnect().catch(() => undefined);
+    }
+
+    const producer = this.kafka.producer();
+    producer.on(producer.events.DISCONNECT, () => {
+      if (this.producer === producer) {
+        this.producerReady = false;
+      }
+    });
+    this.producer = producer;
 
     try {
-      await this.producer.connect();
+      await producer.connect();
       this.producerReady = true;
-      return this.producer;
+      this.producerFailures = 0;
+      this.nextProducerAttemptAt = 0;
+      return producer;
     } catch (error) {
+      this.markProducerDown();
       this.logger.warn(
-        `Failed to connect Kafka producer to ${this.brokers.join(', ')}: ${this.toErrorMessage(error)}`,
+        `Failed to connect Kafka producer to ${this.brokers.join(', ')}: ${this.toErrorMessage(error)}. Next attempt in ${Math.round((this.nextProducerAttemptAt - Date.now()) / 1000)}s.`,
       );
       return null;
     }
+  }
+
+  private markProducerDown() {
+    this.producerReady = false;
+    this.producerFailures += 1;
+    this.nextProducerAttemptAt =
+      Date.now() + this.backoffMs(this.producerFailures);
+  }
+
+  private backoffMs(attempt: number) {
+    const exponent = Math.max(0, Math.min(attempt, 10) - 1);
+    return Math.min(MAX_BACKOFF_MS, BASE_BACKOFF_MS * 2 ** exponent);
   }
 
   private resolveServiceUri() {
@@ -271,8 +430,7 @@ export class KafkaEventBusService
     }
 
     const configured =
-      this.configService.get<string>('KAFKA_SSL') ??
-      process.env.KAFKA_SSL;
+      this.configService.get<string>('KAFKA_SSL') ?? process.env.KAFKA_SSL;
 
     if (configured) {
       return ['true', '1', 'yes'].includes(configured.toLowerCase())

@@ -2,11 +2,18 @@ import { INestApplication } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
 import { JwtService } from '@nestjs/jwt';
 import { Test } from '@nestjs/testing';
-import { io as createClient, type Socket as ClientSocket } from 'socket.io-client';
+import {
+  io as createClient,
+  type Socket as ClientSocket,
+} from 'socket.io-client';
 import { PrismaService } from '../../shared/prisma/prisma.service';
 import { ShipmentsService } from '../shipments/shipments.service';
 import { TRACKING_PUB_SUB } from './tracking.constants';
-import type { TrackingPubSub, TrackingPubSubHandler, TrackingPubSubMessage } from './interfaces/tracking-pub-sub.interface';
+import type {
+  TrackingPubSub,
+  TrackingPubSubHandler,
+  TrackingPubSubMessage,
+} from './interfaces/tracking-pub-sub.interface';
 import { TrackingModule } from './tracking.module';
 import { TrackingPubSubService } from './tracking-pub-sub.service';
 
@@ -64,10 +71,19 @@ describe('TrackingGateway', () => {
                 return Promise.resolve({
                   id: shipmentId,
                   organizationId,
+                  status: 'IN_TRANSIT',
                   currentDriverId: 'driver-123',
                   currentTrackingSessionId: 'session-123',
                 });
               }),
+          },
+          trackingSession: {
+            findUnique: jest
+              .fn()
+              .mockResolvedValue({ id: 'session-123', status: 'ACTIVE' }),
+          },
+          trackingPoint: {
+            create: jest.fn().mockResolvedValue(undefined),
           },
         })
         .overrideProvider(ShipmentsService)
@@ -107,8 +123,11 @@ describe('TrackingGateway', () => {
   });
 
   it('broadcasts rider updates to customers connected to a different server instance', async () => {
-    const riderPort = (riderApp.getHttpServer().address() as { port: number }).port;
-    const customerPort = (customerApp.getHttpServer().address() as { port: number }).port;
+    const riderPort = (riderApp.getHttpServer().address() as { port: number })
+      .port;
+    const customerPort = (
+      customerApp.getHttpServer().address() as { port: number }
+    ).port;
     const riderBaseUrl = `http://127.0.0.1:${riderPort}/tracking`;
     const customerBaseUrl = `http://127.0.0.1:${customerPort}/tracking`;
 
@@ -172,7 +191,10 @@ describe('TrackingGateway', () => {
         },
       );
 
-      setTimeout(() => reject(new Error('Timed out waiting for tracking update')), 3000);
+      setTimeout(
+        () => reject(new Error('Timed out waiting for tracking update')),
+        3000,
+      );
     });
 
     expect(update.latitude).toBeCloseTo(12.9716, 4);

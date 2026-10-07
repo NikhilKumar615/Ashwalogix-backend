@@ -3,12 +3,16 @@ import { InventoryMovementType } from '@prisma/client';
 import { Type } from 'class-transformer';
 import {
   IsEnum,
+  IsIn,
   IsNumber,
   IsOptional,
   IsString,
   IsUUID,
-  Min,
+  NotEquals,
 } from 'class-validator';
+
+export const ADJUSTMENT_DIRECTIONS = ['INCREASE', 'DECREASE'] as const;
+export type AdjustmentDirection = (typeof ADJUSTMENT_DIRECTIONS)[number];
 
 export class CreateInventoryMovementDto {
   @ApiProperty()
@@ -23,11 +27,23 @@ export class CreateInventoryMovementDto {
   @IsEnum(InventoryMovementType)
   movementType!: InventoryMovementType;
 
-  @ApiProperty()
+  @ApiProperty({
+    description:
+      'Quantity moved. Must be > 0, except for ADJUSTMENT where a negative value (or adjustmentDirection=DECREASE) reduces stock.',
+  })
   @Type(() => Number)
   @IsNumber()
-  @Min(0.01)
+  @NotEquals(0)
   quantity!: number;
+
+  @ApiPropertyOptional({
+    enum: ADJUSTMENT_DIRECTIONS,
+    description:
+      'Only for ADJUSTMENT movements: DECREASE reduces stock by |quantity|. Defaults to the sign of quantity.',
+  })
+  @IsOptional()
+  @IsIn(ADJUSTMENT_DIRECTIONS)
+  adjustmentDirection?: AdjustmentDirection;
 
   @ApiPropertyOptional()
   @IsOptional()

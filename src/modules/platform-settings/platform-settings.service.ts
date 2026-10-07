@@ -1,4 +1,5 @@
 import { Injectable } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import {
   PaymentCollectionMethod,
   PlanBillingCycle,
@@ -6,6 +7,7 @@ import {
   Prisma,
 } from '@prisma/client';
 import { PrismaService } from '../../shared/prisma/prisma.service';
+import { SettingsSecretCipher } from './settings-secret-cipher';
 
 const GLOBAL_SETTINGS_ID = 'global';
 
@@ -68,9 +70,21 @@ const DEFAULT_SETTINGS = {
 
 type SettingsConfig = Record<string, unknown>;
 
+type SecretField = 'mapsApiKey' | 'messagingApiKey' | 'externalApiKey';
+
 @Injectable()
 export class PlatformSettingsService {
-  constructor(private readonly prisma: PrismaService) {}
+  private readonly secretCipher: SettingsSecretCipher;
+
+  constructor(
+    private readonly prisma: PrismaService,
+    configService?: ConfigService,
+  ) {
+    this.secretCipher = new SettingsSecretCipher(
+      configService?.get<string>('SETTINGS_ENCRYPTION_KEY') ??
+        process.env.SETTINGS_ENCRYPTION_KEY,
+    );
+  }
 
   async getSettings() {
     await this.ensureSeedPlans();
@@ -87,14 +101,30 @@ export class PlatformSettingsService {
       revision,
       plans,
     ] = await Promise.all([
-      this.prisma.platformIdentitySetting.findUnique({ where: { id: GLOBAL_SETTINGS_ID } }),
-      this.prisma.tenantGovernanceSetting.findUnique({ where: { id: GLOBAL_SETTINGS_ID } }),
-      this.prisma.billingSetting.findUnique({ where: { id: GLOBAL_SETTINGS_ID } }),
-      this.prisma.notificationSetting.findUnique({ where: { id: GLOBAL_SETTINGS_ID } }),
-      this.prisma.securitySetting.findUnique({ where: { id: GLOBAL_SETTINGS_ID } }),
-      this.prisma.integrationSetting.findUnique({ where: { id: GLOBAL_SETTINGS_ID } }),
-      this.prisma.brandingSetting.findUnique({ where: { id: GLOBAL_SETTINGS_ID } }),
-      this.prisma.systemSetting.findUnique({ where: { id: GLOBAL_SETTINGS_ID } }),
+      this.prisma.platformIdentitySetting.findUnique({
+        where: { id: GLOBAL_SETTINGS_ID },
+      }),
+      this.prisma.tenantGovernanceSetting.findUnique({
+        where: { id: GLOBAL_SETTINGS_ID },
+      }),
+      this.prisma.billingSetting.findUnique({
+        where: { id: GLOBAL_SETTINGS_ID },
+      }),
+      this.prisma.notificationSetting.findUnique({
+        where: { id: GLOBAL_SETTINGS_ID },
+      }),
+      this.prisma.securitySetting.findUnique({
+        where: { id: GLOBAL_SETTINGS_ID },
+      }),
+      this.prisma.integrationSetting.findUnique({
+        where: { id: GLOBAL_SETTINGS_ID },
+      }),
+      this.prisma.brandingSetting.findUnique({
+        where: { id: GLOBAL_SETTINGS_ID },
+      }),
+      this.prisma.systemSetting.findUnique({
+        where: { id: GLOBAL_SETTINGS_ID },
+      }),
       this.prisma.platformSettingsRevision.findUnique({
         where: { id: GLOBAL_SETTINGS_ID },
         include: {
@@ -119,38 +149,61 @@ export class PlatformSettingsService {
         regionalNote: identity?.regionalNote ?? DEFAULT_SETTINGS.regionalNote,
         autoApproval: governance?.autoApproval ?? DEFAULT_SETTINGS.autoApproval,
         requireDocumentVerification:
-          governance?.requireDocumentVerification ?? DEFAULT_SETTINGS.requireDocumentVerification,
-        tenantLimitPolicy: governance?.tenantLimitPolicy ?? DEFAULT_SETTINGS.tenantLimitPolicy,
-        approvalWorkflow: governance?.approvalWorkflow ?? DEFAULT_SETTINGS.approvalWorkflow,
+          governance?.requireDocumentVerification ??
+          DEFAULT_SETTINGS.requireDocumentVerification,
+        tenantLimitPolicy:
+          governance?.tenantLimitPolicy ?? DEFAULT_SETTINGS.tenantLimitPolicy,
+        approvalWorkflow:
+          governance?.approvalWorkflow ?? DEFAULT_SETTINGS.approvalWorkflow,
         tenantOperationalLimit:
-          governance?.tenantOperationalLimit ?? DEFAULT_SETTINGS.tenantOperationalLimit,
-        tenantReviewNote: governance?.tenantReviewNote ?? DEFAULT_SETTINGS.tenantReviewNote,
-        plans: plans.length > 0 ? plans.map((plan) => this.mapPlanToConfig(plan)) : this.getDefaultPlanConfigs(),
+          governance?.tenantOperationalLimit ??
+          DEFAULT_SETTINGS.tenantOperationalLimit,
+        tenantReviewNote:
+          governance?.tenantReviewNote ?? DEFAULT_SETTINGS.tenantReviewNote,
+        plans:
+          plans.length > 0
+            ? plans.map((plan) => this.mapPlanToConfig(plan))
+            : this.getDefaultPlanConfigs(),
         defaultInvoicePrefix:
-          billing?.defaultInvoicePrefix ?? DEFAULT_SETTINGS.defaultInvoicePrefix,
-        billingGraceDays: String(billing?.billingGraceDays ?? DEFAULT_SETTINGS.billingGraceDays),
+          billing?.defaultInvoicePrefix ??
+          DEFAULT_SETTINGS.defaultInvoicePrefix,
+        billingGraceDays: String(
+          billing?.billingGraceDays ?? DEFAULT_SETTINGS.billingGraceDays,
+        ),
         taxMode: billing?.taxMode ?? DEFAULT_SETTINGS.taxMode,
         defaultPlanId: billing?.defaultPlanId ?? DEFAULT_SETTINGS.defaultPlanId,
         defaultPaymentCollectionMethod:
-          billing?.defaultPaymentCollectionMethod ?? DEFAULT_SETTINGS.defaultPaymentCollectionMethod,
+          billing?.defaultPaymentCollectionMethod ??
+          DEFAULT_SETTINGS.defaultPaymentCollectionMethod,
         allowManualActivationWithoutPayment:
-          billing?.allowManualActivationWithoutPayment ?? DEFAULT_SETTINGS.allowManualActivationWithoutPayment,
+          billing?.allowManualActivationWithoutPayment ??
+          DEFAULT_SETTINGS.allowManualActivationWithoutPayment,
         emailShipmentAlerts:
-          notifications?.emailShipmentAlerts ?? DEFAULT_SETTINGS.emailShipmentAlerts,
-        emailDelayAlerts: notifications?.emailDelayAlerts ?? DEFAULT_SETTINGS.emailDelayAlerts,
+          notifications?.emailShipmentAlerts ??
+          DEFAULT_SETTINGS.emailShipmentAlerts,
+        emailDelayAlerts:
+          notifications?.emailDelayAlerts ?? DEFAULT_SETTINGS.emailDelayAlerts,
         emailDeliveryAlerts:
-          notifications?.emailDeliveryAlerts ?? DEFAULT_SETTINGS.emailDeliveryAlerts,
-        smsShipmentAlerts: notifications?.smsShipmentAlerts ?? DEFAULT_SETTINGS.smsShipmentAlerts,
+          notifications?.emailDeliveryAlerts ??
+          DEFAULT_SETTINGS.emailDeliveryAlerts,
+        smsShipmentAlerts:
+          notifications?.smsShipmentAlerts ??
+          DEFAULT_SETTINGS.smsShipmentAlerts,
         whatsappDelayAlerts:
-          notifications?.whatsappDelayAlerts ?? DEFAULT_SETTINGS.whatsappDelayAlerts,
+          notifications?.whatsappDelayAlerts ??
+          DEFAULT_SETTINGS.whatsappDelayAlerts,
         whatsappDeliveryAlerts:
-          notifications?.whatsappDeliveryAlerts ?? DEFAULT_SETTINGS.whatsappDeliveryAlerts,
+          notifications?.whatsappDeliveryAlerts ??
+          DEFAULT_SETTINGS.whatsappDeliveryAlerts,
         notificationTemplateName:
-          notifications?.notificationTemplateName ?? DEFAULT_SETTINGS.notificationTemplateName,
+          notifications?.notificationTemplateName ??
+          DEFAULT_SETTINGS.notificationTemplateName,
         notificationTemplateBody:
-          notifications?.notificationTemplateBody ?? DEFAULT_SETTINGS.notificationTemplateBody,
+          notifications?.notificationTemplateBody ??
+          DEFAULT_SETTINGS.notificationTemplateBody,
         sessionTimeoutMinutes: String(
-          security?.sessionTimeoutMinutes ?? DEFAULT_SETTINGS.sessionTimeoutMinutes,
+          security?.sessionTimeoutMinutes ??
+            DEFAULT_SETTINGS.sessionTimeoutMinutes,
         ),
         maxLoginAttempts: String(
           security?.maxLoginAttempts ?? DEFAULT_SETTINGS.maxLoginAttempts,
@@ -158,28 +211,36 @@ export class PlatformSettingsService {
         passwordMinLength: String(
           security?.passwordMinLength ?? DEFAULT_SETTINGS.passwordMinLength,
         ),
-        requireUppercase: security?.requireUppercase ?? DEFAULT_SETTINGS.requireUppercase,
-        requireNumbers: security?.requireNumbers ?? DEFAULT_SETTINGS.requireNumbers,
+        requireUppercase:
+          security?.requireUppercase ?? DEFAULT_SETTINGS.requireUppercase,
+        requireNumbers:
+          security?.requireNumbers ?? DEFAULT_SETTINGS.requireNumbers,
         requireSpecialChars:
           security?.requireSpecialChars ?? DEFAULT_SETTINGS.requireSpecialChars,
-        allowRememberMe: security?.allowRememberMe ?? DEFAULT_SETTINGS.allowRememberMe,
-        mapsProvider: integrations?.mapsProvider ?? DEFAULT_SETTINGS.mapsProvider,
-        mapsApiKey: integrations?.mapsApiKey ?? DEFAULT_SETTINGS.mapsApiKey,
+        allowRememberMe:
+          security?.allowRememberMe ?? DEFAULT_SETTINGS.allowRememberMe,
+        mapsProvider:
+          integrations?.mapsProvider ?? DEFAULT_SETTINGS.mapsProvider,
+        // S16: secrets are never returned; only a mask such as '••••abcd'.
+        mapsApiKey: this.secretCipher.mask(integrations?.mapsApiKey),
         messagingProvider:
           integrations?.messagingProvider ?? DEFAULT_SETTINGS.messagingProvider,
-        messagingApiKey: integrations?.messagingApiKey ?? DEFAULT_SETTINGS.messagingApiKey,
+        messagingApiKey: this.secretCipher.mask(integrations?.messagingApiKey),
         externalApiEnabled:
-          integrations?.externalApiEnabled ?? DEFAULT_SETTINGS.externalApiEnabled,
+          integrations?.externalApiEnabled ??
+          DEFAULT_SETTINGS.externalApiEnabled,
         externalApiBaseUrl:
-          integrations?.externalApiBaseUrl ?? DEFAULT_SETTINGS.externalApiBaseUrl,
-        externalApiKey: integrations?.externalApiKey ?? DEFAULT_SETTINGS.externalApiKey,
+          integrations?.externalApiBaseUrl ??
+          DEFAULT_SETTINGS.externalApiBaseUrl,
+        externalApiKey: this.secretCipher.mask(integrations?.externalApiKey),
         logoFile: branding?.logoFile ?? DEFAULT_SETTINGS.logoFile,
         brandPrimaryColor:
           branding?.brandPrimaryColor ?? DEFAULT_SETTINGS.brandPrimaryColor,
         brandSecondaryColor:
           branding?.brandSecondaryColor ?? DEFAULT_SETTINGS.brandSecondaryColor,
         brandTagline: branding?.brandTagline ?? DEFAULT_SETTINGS.brandTagline,
-        tenantIdPattern: system?.tenantIdPattern ?? DEFAULT_SETTINGS.tenantIdPattern,
+        tenantIdPattern:
+          system?.tenantIdPattern ?? DEFAULT_SETTINGS.tenantIdPattern,
         shipmentIdPattern:
           system?.shipmentIdPattern ?? DEFAULT_SETTINGS.shipmentIdPattern,
         dataRetentionDays: String(
@@ -189,11 +250,13 @@ export class PlatformSettingsService {
           system?.auditRetentionDays ?? DEFAULT_SETTINGS.auditRetentionDays,
         ),
         enableDriverMarketplace:
-          system?.enableDriverMarketplace ?? DEFAULT_SETTINGS.enableDriverMarketplace,
+          system?.enableDriverMarketplace ??
+          DEFAULT_SETTINGS.enableDriverMarketplace,
         enableSmartTracking:
           system?.enableSmartTracking ?? DEFAULT_SETTINGS.enableSmartTracking,
         enableExperimentalBilling:
-          system?.enableExperimentalBilling ?? DEFAULT_SETTINGS.enableExperimentalBilling,
+          system?.enableExperimentalBilling ??
+          DEFAULT_SETTINGS.enableExperimentalBilling,
       },
       updatedAt: revision?.updatedAt ?? null,
       updatedByUser: revision?.updatedByUser ?? null,
@@ -226,6 +289,28 @@ export class PlatformSettingsService {
 
   async updateSettings(config: SettingsConfig, updatedByUserId: string) {
     await this.prisma.$transaction(async (tx) => {
+      const existingIntegrations = await tx.integrationSetting.findUnique({
+        where: { id: GLOBAL_SETTINGS_ID },
+        select: {
+          mapsApiKey: true,
+          messagingApiKey: true,
+          externalApiKey: true,
+        },
+      });
+      const secrets = {
+        mapsApiKey: this.resolveSecretForSave(
+          config.mapsApiKey,
+          existingIntegrations?.mapsApiKey,
+        ),
+        messagingApiKey: this.resolveSecretForSave(
+          config.messagingApiKey,
+          existingIntegrations?.messagingApiKey,
+        ),
+        externalApiKey: this.resolveSecretForSave(
+          config.externalApiKey,
+          existingIntegrations?.externalApiKey,
+        ),
+      } satisfies Record<SecretField, string | null>;
       const syncedPlans = await this.syncPlans(
         tx,
         Array.isArray(config.plans) ? config.plans : [],
@@ -246,38 +331,95 @@ export class PlatformSettingsService {
       await tx.platformIdentitySetting.upsert({
         where: { id: GLOBAL_SETTINGS_ID },
         update: {
-          platformName: this.stringValue(config.platformName, DEFAULT_SETTINGS.platformName),
-          supportEmail: this.optionalStringValue(config.supportEmail, DEFAULT_SETTINGS.supportEmail),
-          supportPhone: this.optionalStringValue(config.supportPhone, DEFAULT_SETTINGS.supportPhone),
-          timezone: this.stringValue(config.timezone, DEFAULT_SETTINGS.timezone),
-          currency: this.stringValue(config.currency, DEFAULT_SETTINGS.currency),
-          language: this.stringValue(config.language, DEFAULT_SETTINGS.language),
-          dateFormat: this.stringValue(config.dateFormat, DEFAULT_SETTINGS.dateFormat),
-          regionalNote: this.optionalStringValue(config.regionalNote, DEFAULT_SETTINGS.regionalNote),
+          platformName: this.stringValue(
+            config.platformName,
+            DEFAULT_SETTINGS.platformName,
+          ),
+          supportEmail: this.optionalStringValue(
+            config.supportEmail,
+            DEFAULT_SETTINGS.supportEmail,
+          ),
+          supportPhone: this.optionalStringValue(
+            config.supportPhone,
+            DEFAULT_SETTINGS.supportPhone,
+          ),
+          timezone: this.stringValue(
+            config.timezone,
+            DEFAULT_SETTINGS.timezone,
+          ),
+          currency: this.stringValue(
+            config.currency,
+            DEFAULT_SETTINGS.currency,
+          ),
+          language: this.stringValue(
+            config.language,
+            DEFAULT_SETTINGS.language,
+          ),
+          dateFormat: this.stringValue(
+            config.dateFormat,
+            DEFAULT_SETTINGS.dateFormat,
+          ),
+          regionalNote: this.optionalStringValue(
+            config.regionalNote,
+            DEFAULT_SETTINGS.regionalNote,
+          ),
         },
         create: {
           id: GLOBAL_SETTINGS_ID,
-          platformName: this.stringValue(config.platformName, DEFAULT_SETTINGS.platformName),
-          supportEmail: this.optionalStringValue(config.supportEmail, DEFAULT_SETTINGS.supportEmail),
-          supportPhone: this.optionalStringValue(config.supportPhone, DEFAULT_SETTINGS.supportPhone),
-          timezone: this.stringValue(config.timezone, DEFAULT_SETTINGS.timezone),
-          currency: this.stringValue(config.currency, DEFAULT_SETTINGS.currency),
-          language: this.stringValue(config.language, DEFAULT_SETTINGS.language),
-          dateFormat: this.stringValue(config.dateFormat, DEFAULT_SETTINGS.dateFormat),
-          regionalNote: this.optionalStringValue(config.regionalNote, DEFAULT_SETTINGS.regionalNote),
+          platformName: this.stringValue(
+            config.platformName,
+            DEFAULT_SETTINGS.platformName,
+          ),
+          supportEmail: this.optionalStringValue(
+            config.supportEmail,
+            DEFAULT_SETTINGS.supportEmail,
+          ),
+          supportPhone: this.optionalStringValue(
+            config.supportPhone,
+            DEFAULT_SETTINGS.supportPhone,
+          ),
+          timezone: this.stringValue(
+            config.timezone,
+            DEFAULT_SETTINGS.timezone,
+          ),
+          currency: this.stringValue(
+            config.currency,
+            DEFAULT_SETTINGS.currency,
+          ),
+          language: this.stringValue(
+            config.language,
+            DEFAULT_SETTINGS.language,
+          ),
+          dateFormat: this.stringValue(
+            config.dateFormat,
+            DEFAULT_SETTINGS.dateFormat,
+          ),
+          regionalNote: this.optionalStringValue(
+            config.regionalNote,
+            DEFAULT_SETTINGS.regionalNote,
+          ),
         },
       });
 
       await tx.tenantGovernanceSetting.upsert({
         where: { id: GLOBAL_SETTINGS_ID },
         update: {
-          autoApproval: this.booleanValue(config.autoApproval, DEFAULT_SETTINGS.autoApproval),
+          autoApproval: this.booleanValue(
+            config.autoApproval,
+            DEFAULT_SETTINGS.autoApproval,
+          ),
           requireDocumentVerification: this.booleanValue(
             config.requireDocumentVerification,
             DEFAULT_SETTINGS.requireDocumentVerification,
           ),
-          tenantLimitPolicy: this.stringValue(config.tenantLimitPolicy, DEFAULT_SETTINGS.tenantLimitPolicy),
-          approvalWorkflow: this.stringValue(config.approvalWorkflow, DEFAULT_SETTINGS.approvalWorkflow),
+          tenantLimitPolicy: this.stringValue(
+            config.tenantLimitPolicy,
+            DEFAULT_SETTINGS.tenantLimitPolicy,
+          ),
+          approvalWorkflow: this.stringValue(
+            config.approvalWorkflow,
+            DEFAULT_SETTINGS.approvalWorkflow,
+          ),
           tenantOperationalLimit: this.optionalStringValue(
             config.tenantOperationalLimit,
             DEFAULT_SETTINGS.tenantOperationalLimit,
@@ -289,13 +431,22 @@ export class PlatformSettingsService {
         },
         create: {
           id: GLOBAL_SETTINGS_ID,
-          autoApproval: this.booleanValue(config.autoApproval, DEFAULT_SETTINGS.autoApproval),
+          autoApproval: this.booleanValue(
+            config.autoApproval,
+            DEFAULT_SETTINGS.autoApproval,
+          ),
           requireDocumentVerification: this.booleanValue(
             config.requireDocumentVerification,
             DEFAULT_SETTINGS.requireDocumentVerification,
           ),
-          tenantLimitPolicy: this.stringValue(config.tenantLimitPolicy, DEFAULT_SETTINGS.tenantLimitPolicy),
-          approvalWorkflow: this.stringValue(config.approvalWorkflow, DEFAULT_SETTINGS.approvalWorkflow),
+          tenantLimitPolicy: this.stringValue(
+            config.tenantLimitPolicy,
+            DEFAULT_SETTINGS.tenantLimitPolicy,
+          ),
+          approvalWorkflow: this.stringValue(
+            config.approvalWorkflow,
+            DEFAULT_SETTINGS.approvalWorkflow,
+          ),
           tenantOperationalLimit: this.optionalStringValue(
             config.tenantOperationalLimit,
             DEFAULT_SETTINGS.tenantOperationalLimit,
@@ -495,18 +646,12 @@ export class PlatformSettingsService {
             config.mapsProvider,
             DEFAULT_SETTINGS.mapsProvider,
           ),
-          mapsApiKey: this.optionalStringValue(
-            config.mapsApiKey,
-            DEFAULT_SETTINGS.mapsApiKey,
-          ),
+          mapsApiKey: secrets.mapsApiKey,
           messagingProvider: this.stringValue(
             config.messagingProvider,
             DEFAULT_SETTINGS.messagingProvider,
           ),
-          messagingApiKey: this.optionalStringValue(
-            config.messagingApiKey,
-            DEFAULT_SETTINGS.messagingApiKey,
-          ),
+          messagingApiKey: secrets.messagingApiKey,
           externalApiEnabled: this.booleanValue(
             config.externalApiEnabled,
             DEFAULT_SETTINGS.externalApiEnabled,
@@ -515,10 +660,7 @@ export class PlatformSettingsService {
             config.externalApiBaseUrl,
             DEFAULT_SETTINGS.externalApiBaseUrl,
           ),
-          externalApiKey: this.optionalStringValue(
-            config.externalApiKey,
-            DEFAULT_SETTINGS.externalApiKey,
-          ),
+          externalApiKey: secrets.externalApiKey,
         },
         create: {
           id: GLOBAL_SETTINGS_ID,
@@ -526,18 +668,12 @@ export class PlatformSettingsService {
             config.mapsProvider,
             DEFAULT_SETTINGS.mapsProvider,
           ),
-          mapsApiKey: this.optionalStringValue(
-            config.mapsApiKey,
-            DEFAULT_SETTINGS.mapsApiKey,
-          ),
+          mapsApiKey: secrets.mapsApiKey,
           messagingProvider: this.stringValue(
             config.messagingProvider,
             DEFAULT_SETTINGS.messagingProvider,
           ),
-          messagingApiKey: this.optionalStringValue(
-            config.messagingApiKey,
-            DEFAULT_SETTINGS.messagingApiKey,
-          ),
+          messagingApiKey: secrets.messagingApiKey,
           externalApiEnabled: this.booleanValue(
             config.externalApiEnabled,
             DEFAULT_SETTINGS.externalApiEnabled,
@@ -546,10 +682,7 @@ export class PlatformSettingsService {
             config.externalApiBaseUrl,
             DEFAULT_SETTINGS.externalApiBaseUrl,
           ),
-          externalApiKey: this.optionalStringValue(
-            config.externalApiKey,
-            DEFAULT_SETTINGS.externalApiKey,
-          ),
+          externalApiKey: secrets.externalApiKey,
         },
       });
 
@@ -729,12 +862,17 @@ export class PlatformSettingsService {
         ? existingPlans.find((candidate) => candidate.id === incomingId)
         : existingPlans.find((candidate) => candidate.code === code);
 
-      const payload: Prisma.SubscriptionPlanUncheckedCreateInput = {
+      const has = (key: string) =>
+        Object.prototype.hasOwnProperty.call(plan, key);
+      const createPayload: Prisma.SubscriptionPlanUncheckedCreateInput = {
         code: existingPlan?.code ?? code,
         name: this.stringValue(plan.name, `Plan ${index + 1}`),
         description: this.optionalStringValue(plan.description, null),
         priceAmount: this.decimalValue(plan.price, '0'),
-        currency: this.stringValue(plan.currency, DEFAULT_SETTINGS.currency).toUpperCase(),
+        currency: this.stringValue(
+          plan.currency,
+          DEFAULT_SETTINGS.currency,
+        ).toUpperCase(),
         billingCycle: this.planBillingCycleValue(plan.billingCycle),
         tenantCap: this.integerValueOrNull(plan.tenantCap),
         shipmentCapPerDay: this.integerValueOrNull(plan.shipmentCapPerDay),
@@ -743,19 +881,39 @@ export class PlatformSettingsService {
         status: this.booleanValue(plan.enabled, true)
           ? PlanStatus.ACTIVE
           : PlanStatus.INACTIVE,
-        metadata:
-          plan.metadata && typeof plan.metadata === 'object'
-            ? (plan.metadata as Prisma.InputJsonValue)
-            : Prisma.JsonNull,
+        metadata: this.planMetadataValue(plan.metadata),
+      };
+
+      // F15: for existing plans only touch the fields the client actually
+      // sent, so fields the settings UI doesn't edit (shipmentCapPerDay,
+      // graceDays, metadata, ...) are never nulled by a save.
+      const updatePayload: Prisma.SubscriptionPlanUncheckedUpdateInput = {
+        sortOrder: index,
+        ...(has('name') ? { name: createPayload.name } : {}),
+        ...(has('description')
+          ? { description: createPayload.description }
+          : {}),
+        ...(has('price') ? { priceAmount: createPayload.priceAmount } : {}),
+        ...(has('currency') ? { currency: createPayload.currency } : {}),
+        ...(has('billingCycle')
+          ? { billingCycle: createPayload.billingCycle }
+          : {}),
+        ...(has('tenantCap') ? { tenantCap: createPayload.tenantCap } : {}),
+        ...(has('shipmentCapPerDay')
+          ? { shipmentCapPerDay: createPayload.shipmentCapPerDay }
+          : {}),
+        ...(has('graceDays') ? { graceDays: createPayload.graceDays } : {}),
+        ...(has('enabled') ? { status: createPayload.status } : {}),
+        ...(has('metadata') ? { metadata: createPayload.metadata } : {}),
       };
 
       const syncedPlan = existingPlan
         ? await tx.subscriptionPlan.update({
             where: { id: existingPlan.id },
-            data: payload,
+            data: updatePayload,
           })
         : await tx.subscriptionPlan.create({
-            data: payload,
+            data: createPayload,
           });
 
       syncedPlanIds.push(syncedPlan.id);
@@ -800,6 +958,9 @@ export class PlatformSettingsService {
     priceAmount: Prisma.Decimal;
     billingCycle: PlanBillingCycle;
     tenantCap: number | null;
+    shipmentCapPerDay: number | null;
+    graceDays: number | null;
+    metadata: Prisma.JsonValue | null;
     status: PlanStatus;
     currency: string;
     isDefault: boolean;
@@ -815,7 +976,46 @@ export class PlatformSettingsService {
       description: plan.description ?? '',
       currency: plan.currency,
       isDefault: plan.isDefault,
+      // Round-tripped so a settings save keeps them (F15).
+      shipmentCapPerDay: plan.shipmentCapPerDay,
+      graceDays: plan.graceDays,
+      metadata: plan.metadata ?? null,
     };
+  }
+
+  private planMetadataValue(
+    value: unknown,
+  ): Prisma.InputJsonValue | typeof Prisma.JsonNull {
+    return value && typeof value === 'object'
+      ? (value as Prisma.InputJsonValue)
+      : Prisma.JsonNull;
+  }
+
+  /**
+   * S16: a masked ('••••abcd') or empty value means "keep the stored secret";
+   * anything else is a new secret and is encrypted (when a key is configured).
+   */
+  private resolveSecretForSave(
+    incoming: unknown,
+    existing: string | null | undefined,
+  ): string | null {
+    const typed = typeof incoming === 'string' ? incoming.trim() : '';
+
+    if (!typed || SettingsSecretCipher.isMasked(typed)) {
+      if (!existing) {
+        return existing ?? null;
+      }
+      // Opportunistically encrypt legacy plaintext values.
+      if (
+        this.secretCipher.enabled &&
+        !SettingsSecretCipher.isEncrypted(existing)
+      ) {
+        return this.secretCipher.encrypt(existing);
+      }
+      return existing;
+    }
+
+    return this.secretCipher.encrypt(typed);
   }
 
   private getDefaultPlanConfigs() {
@@ -868,7 +1068,11 @@ export class PlatformSettingsService {
   }
 
   private integerValueOrNull(value: unknown) {
-    const parsed = parseInt(String(value ?? '').replace(/[^\d]/g, ''), 10);
+    const text =
+      typeof value === 'number' || typeof value === 'string'
+        ? String(value)
+        : '';
+    const parsed = parseInt(text.replace(/[^\d]/g, ''), 10);
     return Number.isFinite(parsed) ? parsed : null;
   }
 

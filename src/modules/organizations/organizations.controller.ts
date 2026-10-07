@@ -17,6 +17,7 @@ import {
   ApiParam,
   ApiTags,
 } from '@nestjs/swagger';
+import { Throttle } from '@nestjs/throttler';
 import { AuthorizationService } from '../auth/authorization.service';
 import { CurrentUser } from '../auth/decorators/current-user.decorator';
 import { Roles } from '../auth/decorators/roles.decorator';
@@ -30,7 +31,10 @@ import { RegisterCompanyDriverDto } from './dto/register-company-driver.dto';
 import { RegisterDispatcherDto } from './dto/register-dispatcher.dto';
 import { RegisterOrganizationStaffDto } from './dto/register-organization-staff.dto';
 import { UpdateOrganizationUserDto } from './dto/update-organization-user.dto';
-import { OrganizationsService } from './organizations.service';
+import {
+  OrganizationsService,
+  type OrganizationActor,
+} from './organizations.service';
 
 @ApiTags('Organizations')
 @ApiBearerAuth()
@@ -79,8 +83,11 @@ export class OrganizationsController {
     return this.organizationsService.getUserById(organizationId, userId);
   }
 
+  @Throttle({ default: { limit: 30, ttl: 60_000 } })
   @Get('lookup/client-code/:clientCode')
-  @ApiOperation({ summary: 'Lookup an active organization by platform client code' })
+  @ApiOperation({
+    summary: 'Lookup an active organization by platform client code',
+  })
   @ApiParam({ name: 'clientCode', type: String })
   @Roles(
     OrganizationRole.ORG_ADMIN,
@@ -92,7 +99,15 @@ export class OrganizationsController {
     @Param('clientCode') clientCode: string,
     @CurrentUser() user: JwtPayload,
   ) {
-    if (!user.organizationIds?.length) {
+    const hasActiveOrganization =
+      user.platformRole === 'SUPER_ADMIN' ||
+      user.memberships?.some(
+        (membership) => membership.organizationStatus === 'ACTIVE',
+      );
+    if (!user.organizationIds?.length && user.platformRole !== 'SUPER_ADMIN') {
+      throw new NotFoundException('Organization not found');
+    }
+    if (!hasActiveOrganization) {
       throw new NotFoundException('Organization not found');
     }
 
@@ -121,7 +136,7 @@ export class OrganizationsController {
     return this.organizationsService.createOrganizationUser(
       organizationId,
       body,
-      user.sub,
+      this.actor(user, organizationId),
     );
   }
 
@@ -144,12 +159,14 @@ export class OrganizationsController {
     return this.organizationsService.registerDispatcher(
       organizationId,
       body,
-      user.sub,
+      this.actor(user, organizationId),
     );
   }
 
   @Post(':organizationId/warehouse-staff')
-  @ApiOperation({ summary: 'Register warehouse staff under an approved company' })
+  @ApiOperation({
+    summary: 'Register warehouse staff under an approved company',
+  })
   @ApiParam({ name: 'organizationId', type: String })
   @ApiBody({ type: RegisterOrganizationStaffDto })
   @Roles(OrganizationRole.ORG_ADMIN)
@@ -167,12 +184,14 @@ export class OrganizationsController {
     return this.organizationsService.registerWarehouseStaff(
       organizationId,
       body,
-      user.sub,
+      this.actor(user, organizationId),
     );
   }
 
   @Post(':organizationId/operations-staff')
-  @ApiOperation({ summary: 'Register operations staff under an approved company' })
+  @ApiOperation({
+    summary: 'Register operations staff under an approved company',
+  })
   @ApiParam({ name: 'organizationId', type: String })
   @ApiBody({ type: RegisterOrganizationStaffDto })
   @Roles(OrganizationRole.ORG_ADMIN)
@@ -190,12 +209,14 @@ export class OrganizationsController {
     return this.organizationsService.registerOperationsStaff(
       organizationId,
       body,
-      user.sub,
+      this.actor(user, organizationId),
     );
   }
 
   @Post(':organizationId/drivers')
-  @ApiOperation({ summary: 'Register a company driver under an approved company' })
+  @ApiOperation({
+    summary: 'Register a company driver under an approved company',
+  })
   @ApiParam({ name: 'organizationId', type: String })
   @ApiBody({ type: RegisterCompanyDriverDto })
   @Roles(OrganizationRole.ORG_ADMIN)
@@ -213,7 +234,7 @@ export class OrganizationsController {
     return this.organizationsService.registerCompanyDriver(
       organizationId,
       body,
-      user.sub,
+      this.actor(user, organizationId),
     );
   }
 
@@ -239,6 +260,7 @@ export class OrganizationsController {
       organizationId,
       userId,
       body,
+      this.actor(user, organizationId),
     );
   }
 
@@ -252,7 +274,32 @@ export class OrganizationsController {
     @Body() body: DeleteResourceDto,
     @CurrentUser() user: JwtPayload,
   ) {
-    await this.authorizationService.assertOrganizationWriteAccess(user, organizationId, [OrganizationRole.ORG_ADMIN]);
-    return this.organizationsService.deleteOrganizationUser(organizationId, userId, body.reason, user.sub);
+    await this.authorizationService.assertOrganizationWriteAccess(
+      user,
+      organizationId,
+      [OrganizationRole.ORG_ADMIN],
+    );
+    return this.organizationsService.deleteOrganizationUser(
+      organizationId,
+      userId,
+      body.reason,
+      user.sub,
+      this.authorizationService.isOrganizationAdmin(user, organizationId),
+    );
+  }
+
+  /** Role-derived actor context; section access never makes someone an org admin. */
+  private actor(user: JwtPayload, organizationId: string): OrganizationActor {
+    return {
+      userId: user.sub,
+      isOrgAdmin: this.authorizationService.isOrganizationAdmin(
+        user,
+        organizationId,
+      ),
+      sectionAccess: this.authorizationService.getSectionAccess(
+        user,
+        organizationId,
+      ),
+    };
   }
 }

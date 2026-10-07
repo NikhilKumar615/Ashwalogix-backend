@@ -1,6 +1,12 @@
-import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
+import {
+  BadRequestException,
+  ForbiddenException,
+  Injectable,
+  NotFoundException,
+} from '@nestjs/common';
 import {
   DriverStatus,
+  OrganizationRole,
   ShipmentAssignmentStatus,
   ShipmentStatus,
 } from '@prisma/client';
@@ -13,44 +19,50 @@ import {
   formatRollingAlphaCodeWithState,
   parseRollingAlphaCodeSequence,
 } from '../../shared/codes/entity-code.util';
+import {
+  SAFE_USER_SELECT,
+  invalidateUserSession,
+} from '../auth/auth-security.util';
 import { UpdateDriverDto } from './dto/update-driver.dto';
+import {
+  BoundedTtlCache,
+  GEOCODE_FETCH_TIMEOUT_MS,
+} from '../shipments/geocoding.util';
 
 type Coordinate = {
   latitude: number;
   longitude: number;
 };
 
-const geocodeCache = new Map<string, Coordinate | null>();
+// Bounded LRU with TTL: hits cached for a day, misses for 5 minutes.
+const geocodeCache = new BoundedTtlCache<Coordinate | null>();
+const GEOCODE_ERROR_TTL_MS = 60 * 1000;
 
 @Injectable()
 export class DriversService {
   constructor(private readonly prisma: PrismaService) {}
 
   async listDrivers(organizationId: string, status?: DriverStatus) {
-    await this.normalizeDriverCodes(organizationId);
-
     return this.prisma.driver.findMany({
       where: {
         organizationId,
         ...(status ? { status } : {}),
       },
       include: {
-        user: true,
+        user: { select: SAFE_USER_SELECT },
       },
       orderBy: { createdAt: 'desc' },
     });
   }
 
   async getDriverById(driverId: string, organizationId: string) {
-    await this.normalizeDriverCodes(organizationId);
-
     const driver = await this.prisma.driver.findFirst({
       where: {
         id: driverId,
         organizationId,
       },
       include: {
-        user: true,
+        user: { select: SAFE_USER_SELECT },
         assignments: {
           include: {
             shipment: true,
@@ -75,6 +87,10 @@ export class DriversService {
     input: UpdateDriverDto,
   ) {
     const driver = await this.ensureDriverExists(driverId, organizationId);
+
+    if (driver.userId && (input.email || input.phone || input.fullName)) {
+      await this.assertLinkedUserIsOnlyADriver(driver.userId);
+    }
 
     if (input.email || input.phone) {
       await this.ensureDriverIdentityIsAvailable(
@@ -102,7 +118,7 @@ export class DriversService {
           notes: input.notes,
         },
         include: {
-          user: true,
+          user: { select: SAFE_USER_SELECT },
         },
       });
 
@@ -132,6 +148,8 @@ export class DriversService {
       throw new BadRequestException('This driver does not have a linked user account');
     }
 
+    await this.assertLinkedUserIsOnlyADriver(driver.userId);
+
     const temporaryPassword = nextPassword || this.generateTemporaryPassword();
     const passwordHash = await hash(temporaryPassword, 10);
 
@@ -143,6 +161,7 @@ export class DriversService {
         resetPasswordTokenExpiresAt: null,
       },
     });
+    invalidateUserSession(driver.userId);
 
     return {
       driverId,
@@ -385,6 +404,34 @@ export class DriversService {
 
   private generateTemporaryPassword() {
     return `Lg${randomUUID().replace(/-/g, '').slice(0, 10)}`;
+  }
+
+  /**
+   * Driver management (OPERATIONS/drivers section) must not become a path to
+   * take over a non-driver account (e.g. an ORG_ADMIN who also has a driver
+   * profile) by resetting its password or changing its email.
+   */
+  private async assertLinkedUserIsOnlyADriver(userId: string) {
+    const user = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: {
+        platformRole: true,
+        organizationMembers: { select: { organizationId: true, role: true } },
+      },
+    });
+
+    const privileged =
+      !!user?.platformRole ||
+      user?.organizationMembers.some(
+        (membership) => membership.role !== OrganizationRole.DRIVER,
+      );
+
+    if (privileged) {
+      throw new ForbiddenException(
+        'This driver is linked to a staff/admin account. Manage that account from Users instead.',
+      );
+    }
+
   }
 
   private async ensureDriverIdentityIsAvailable(
@@ -643,8 +690,9 @@ export class DriversService {
       return null;
     }
 
-    if (geocodeCache.has(normalizedAddress)) {
-      return geocodeCache.get(normalizedAddress) ?? null;
+    const cached = geocodeCache.lookup(normalizedAddress);
+    if (cached) {
+      return cached.value;
     }
 
     try {
@@ -653,10 +701,10 @@ export class DriversService {
         ? await this.geocodeWithGoogle(normalizedAddress, googleApiKey)
         : await this.geocodeWithNominatim(normalizedAddress);
 
-      geocodeCache.set(normalizedAddress, coordinate);
+      geocodeCache.setResult(normalizedAddress, coordinate);
       return coordinate;
     } catch {
-      geocodeCache.set(normalizedAddress, null);
+      geocodeCache.set(normalizedAddress, null, GEOCODE_ERROR_TTL_MS);
       return null;
     }
   }
@@ -674,6 +722,7 @@ export class DriversService {
       headers: {
         Accept: 'application/json',
       },
+      signal: AbortSignal.timeout(GEOCODE_FETCH_TIMEOUT_MS),
     });
 
     if (!response.ok) {
@@ -709,6 +758,7 @@ export class DriversService {
         Accept: 'application/json',
         'User-Agent': 'AshwaLogix/1.0 shipment-coordinate-resolver',
       },
+      signal: AbortSignal.timeout(GEOCODE_FETCH_TIMEOUT_MS),
     });
 
     if (!response.ok) {

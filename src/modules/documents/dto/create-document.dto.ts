@@ -54,12 +54,17 @@ export class CreateDocumentDto {
   @Min(0)
   fileSize?: number;
 
-  @ApiPropertyOptional({ enum: DocumentStatus })
+  @ApiPropertyOptional({
+    enum: DocumentStatus,
+    description: 'Ignored: new documents are always created as UPLOADED',
+  })
   @IsOptional()
   @IsEnum(DocumentStatus)
   status?: DocumentStatus;
 
-  @ApiPropertyOptional()
+  @ApiPropertyOptional({
+    description: 'Ignored: uploadedBy is always the authenticated user',
+  })
   @IsOptional()
   @IsUUID()
   uploadedBy?: string;

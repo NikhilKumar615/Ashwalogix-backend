@@ -214,7 +214,7 @@ export class MailService {
   }) {
     if (!this.resend || !this.fromEmail) {
       this.logger.warn(
-        `Mail delivery skipped because MAIL_ENABLED, MAIL_FROM_EMAIL, or RESEND_API_KEY is not configured. Intended recipient: ${input.to}`,
+        `Mail delivery skipped because MAIL_ENABLED, MAIL_FROM_EMAIL, or RESEND_API_KEY is not configured. Intended recipient: ${this.maskEmail(input.to)}`,
       );
       return;
     }
@@ -285,6 +285,11 @@ export class MailService {
         ? `<p><a href="${input.ctaUrl}" style="display:inline-block;padding:12px 18px;background:#2563eb;color:#ffffff;text-decoration:none;border-radius:8px;">${this.escape(input.ctaLabel)}</a></p><p style="word-break:break-all;color:#475569;">${input.ctaUrl}</p>`
         : '';
     return `<div style="font-family: Arial, sans-serif; line-height: 1.6; color: #0f172a; max-width: 640px; margin: 0 auto;"><h2>${this.escape(input.title)}</h2><p>${input.intro}</p><p>${input.body}</p>${cta}${input.footer ? `<p style="color:#475569;">${input.footer}</p>` : ''}</div>`;
+  }
+
+  private maskEmail(email: string) {
+    const [local = '', domain = ''] = email.split('@');
+    return `${local.slice(0, 2)}***@${domain}`;
   }
 
   private escape(value: string) {

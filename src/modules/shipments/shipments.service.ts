@@ -1,6 +1,13 @@
-import { BadRequestException, Inject, Injectable } from '@nestjs/common';
+import {
+  BadRequestException,
+  ConflictException,
+  Inject,
+  Injectable,
+  Logger,
+} from '@nestjs/common';
 import {
   DocumentEntityType,
+  DocumentStatus,
   EventSource,
   MembershipStatus,
   ProofType,
@@ -14,6 +21,8 @@ import {
   StopStatus,
   TrackingSessionStatus,
   UserStatus,
+  DriverStatus,
+  VehicleStatus,
 } from '@prisma/client';
 import { randomUUID } from 'crypto';
 import { TRACKING_EVENT_BUS } from '../../shared/kafka/kafka.constants';
@@ -27,10 +36,16 @@ import { DriverRealtimeService } from '../driver-realtime/driver-realtime.servic
 import {
   buildBusinessPrefix,
   formatRollingAlphaCode,
+  isUniqueConstraintViolation,
   parseRollingAlphaCodeSequence,
+  withUniqueCodeRetry,
 } from '../../shared/codes/entity-code.util';
 import { AssignDriverDto } from './dto/assign-driver.dto';
-import { CreateShipmentDto } from './dto/create-shipment.dto';
+import {
+  CreateShipmentDto,
+  CreateShipmentItemDto,
+  CreateShipmentStopDto,
+} from './dto/create-shipment.dto';
 import { CreateProofOfDeliveryDto } from './dto/create-proof-of-delivery.dto';
 import { CreateTrackingPointDto } from './dto/create-tracking-point.dto';
 import { FailShipmentDto } from './dto/fail-shipment.dto';
@@ -39,11 +54,15 @@ import { ShipmentStatusActionDto } from './dto/shipment-status-action.dto';
 import { StartTrackingSessionDto } from './dto/start-tracking-session.dto';
 import { UpdateShipmentDto } from './dto/update-shipment.dto';
 import { ValidateShipmentLocationDto } from './dto/validate-shipment-location.dto';
+import { BoundedTtlCache, GEOCODE_FETCH_TIMEOUT_MS } from './geocoding.util';
 
 type ListShipmentsParams = {
   organizationId?: string;
   organizationIds?: string[];
   status?: ShipmentStatus;
+  take?: number;
+  skip?: number;
+  cursor?: string;
 };
 
 type Coordinate = {
@@ -71,11 +90,62 @@ type SnappedRouteCacheEntry = {
   response: SnappedRouteResponse;
 };
 
+type RouteSide = 'PICKUP' | 'DELIVERY';
+
+type ExistingStop = {
+  id: string;
+  stopSequence: number;
+  stopType: StopType;
+  locationName: string;
+  addressLine1: string | null;
+  addressLine2: string | null;
+  city: string | null;
+  state: string | null;
+  postalCode: string | null;
+  country: string | null;
+  plannedArrivalAt: Date | null;
+  plannedDepartureAt: Date | null;
+};
+
+type ExistingItem = {
+  id: string;
+  description: string;
+  quantity: Prisma.Decimal;
+  unit: string;
+  weight: Prisma.Decimal | null;
+  volume: Prisma.Decimal | null;
+  declaredValue: Prisma.Decimal | null;
+};
+
+type StopChangePlan = {
+  locationChanged: boolean;
+  pickupChanged: boolean;
+  deliveryChanged: boolean;
+};
+
+type ItemChangePlan = 'unchanged' | 'details' | 'replace';
+
+type TransitionOptions = {
+  shipmentId: string;
+  organizationId: string;
+  nextStatus: ShipmentStatus;
+  eventType: string;
+  allowedFromStatuses: ShipmentStatus[];
+  notes?: string | null;
+  actorUserId?: string | null;
+  source?: EventSource;
+  /** Extra columns written atomically with the guarded status change. */
+  extraData?: Prisma.ShipmentUncheckedUpdateManyInput;
+  afterUpdate?: (tx: Prisma.TransactionClient) => Promise<void>;
+  metadata?: Prisma.InputJsonValue;
+};
+
 const OSRM_MATCH_BASE_URL = 'https://router.project-osrm.org/match/v1/driving';
 const OSRM_ROUTE_BASE_URL = 'https://router.project-osrm.org/route/v1/driving';
 const GOOGLE_DIRECTIONS_BASE_URL =
   'https://maps.googleapis.com/maps/api/directions/json';
-const GOOGLE_ROADS_SNAP_BASE_URL = 'https://roads.googleapis.com/v1/snapToRoads';
+const GOOGLE_ROADS_SNAP_BASE_URL =
+  'https://roads.googleapis.com/v1/snapToRoads';
 const ROUTE_CACHE_TTL_MS = 5 * 60 * 1000;
 const ROUTE_BATCH_SIZE = 20;
 const ROUTE_CONCURRENCY = 2;
@@ -86,13 +156,245 @@ const MIN_SNAP_POINT_DISTANCE_METRES = 35;
 const MAX_SNAP_POINTS = 220;
 const MAX_ROUTE_POINT_ACCURACY_METRES = 50;
 const MAX_ROUTE_CACHE_ENTRIES = 80;
+const MAX_SNAPPED_ROUTE_SOURCE_POINTS = 5000;
 
-const geocodeCache = new Map<string, Coordinate | null>();
-const reverseGeocodeCache = new Map<string, string | null>();
+const DEFAULT_LIST_TAKE = 500;
+const MAX_LIST_TAKE = 1000;
+const DEFAULT_TRACKING_HISTORY_LIMIT = 2000;
+const MAX_TRACKING_HISTORY_LIMIT = 10000;
+const ORDER_EVENT_PUBLISH_TIMEOUT_MS = 5_000;
+// Exceptions (timeouts, network errors) are cached briefly so a flapping
+// provider is not hammered, without blocking a retry for long.
+const GEOCODE_ERROR_TTL_MS = 60 * 1000;
+
+const TERMINAL_SHIPMENT_STATUSES: ShipmentStatus[] = [
+  ShipmentStatus.DELIVERED,
+  ShipmentStatus.COMPLETED,
+  ShipmentStatus.FAILED,
+  ShipmentStatus.CANCELLED,
+];
+
+// Route (client, locations, stops, items, mode/type) may only change before
+// the driver is on the way.
+const ROUTE_EDITABLE_STATUSES: ShipmentStatus[] = [
+  ShipmentStatus.DRAFT,
+  ShipmentStatus.PLANNED,
+  ShipmentStatus.ASSIGNED,
+];
+
+const ASSIGNABLE_STATUSES: ShipmentStatus[] = [
+  ShipmentStatus.DRAFT,
+  ShipmentStatus.PLANNED,
+  ShipmentStatus.ASSIGNED,
+  ShipmentStatus.EN_ROUTE_PICKUP,
+];
+
+const CANCELLABLE_STATUSES: ShipmentStatus[] = [
+  ShipmentStatus.DRAFT,
+  ShipmentStatus.PLANNED,
+  ShipmentStatus.ASSIGNED,
+  ShipmentStatus.EN_ROUTE_PICKUP,
+  ShipmentStatus.AT_PICKUP,
+];
+
+const FAILABLE_STATUSES: ShipmentStatus[] = [
+  ShipmentStatus.ASSIGNED,
+  ShipmentStatus.EN_ROUTE_PICKUP,
+  ShipmentStatus.AT_PICKUP,
+  ShipmentStatus.PICKED_UP,
+  ShipmentStatus.IN_TRANSIT,
+  ShipmentStatus.AT_DELIVERY,
+];
+
+const PROOF_ALLOWED_STATUSES: Record<ProofType, ShipmentStatus[]> = {
+  [ProofType.PICKUP]: [ShipmentStatus.AT_PICKUP],
+  [ProofType.DELIVERY]: [ShipmentStatus.AT_DELIVERY, ShipmentStatus.DELIVERED],
+};
+
+// Admin "manual status" endpoint: explicit, forward-only transitions. POD and
+// driver preconditions are still enforced in manuallyUpdateShipmentStatus.
+const MANUAL_STATUS_TRANSITIONS: Record<ShipmentStatus, ShipmentStatus[]> = {
+  [ShipmentStatus.DRAFT]: [
+    ShipmentStatus.PLANNED,
+    ShipmentStatus.ASSIGNED,
+    ShipmentStatus.CANCELLED,
+  ],
+  [ShipmentStatus.PLANNED]: [ShipmentStatus.ASSIGNED, ShipmentStatus.CANCELLED],
+  [ShipmentStatus.ASSIGNED]: [
+    ShipmentStatus.EN_ROUTE_PICKUP,
+    ShipmentStatus.AT_PICKUP,
+    ShipmentStatus.CANCELLED,
+    ShipmentStatus.FAILED,
+  ],
+  [ShipmentStatus.EN_ROUTE_PICKUP]: [
+    ShipmentStatus.AT_PICKUP,
+    ShipmentStatus.CANCELLED,
+    ShipmentStatus.FAILED,
+  ],
+  [ShipmentStatus.AT_PICKUP]: [
+    ShipmentStatus.PICKED_UP,
+    ShipmentStatus.CANCELLED,
+    ShipmentStatus.FAILED,
+  ],
+  [ShipmentStatus.PICKED_UP]: [
+    ShipmentStatus.IN_TRANSIT,
+    ShipmentStatus.AT_DELIVERY,
+    ShipmentStatus.FAILED,
+  ],
+  [ShipmentStatus.IN_TRANSIT]: [
+    ShipmentStatus.AT_DELIVERY,
+    ShipmentStatus.FAILED,
+  ],
+  [ShipmentStatus.AT_DELIVERY]: [
+    ShipmentStatus.DELIVERED,
+    ShipmentStatus.FAILED,
+  ],
+  [ShipmentStatus.DELIVERED]: [ShipmentStatus.COMPLETED],
+  [ShipmentStatus.COMPLETED]: [],
+  [ShipmentStatus.FAILED]: [],
+  [ShipmentStatus.CANCELLED]: [],
+};
+
+const DRIVER_REQUIRED_STATUSES: ShipmentStatus[] = [
+  ShipmentStatus.ASSIGNED,
+  ShipmentStatus.EN_ROUTE_PICKUP,
+  ShipmentStatus.AT_PICKUP,
+  ShipmentStatus.PICKED_UP,
+  ShipmentStatus.IN_TRANSIT,
+  ShipmentStatus.AT_DELIVERY,
+  ShipmentStatus.DELIVERED,
+];
+
+// adminFormData keys that describe the route. They are frozen once the
+// shipment is past ASSIGNED.
+const ROUTE_FORM_KEYS = [
+  'originName',
+  'originAddress',
+  'originCity',
+  'originState',
+  'originPincode',
+  'originCountry',
+  'originLatitude',
+  'originLongitude',
+  'pickupLatitude',
+  'pickupLongitude',
+  'pickupLocationVerifiedAt',
+  'destinationName',
+  'deliveryAddress',
+  'destinationCity',
+  'destinationState',
+  'destinationPincode',
+  'destinationCountry',
+  'destinationLatitude',
+  'destinationLongitude',
+  'receiverLatitude',
+  'receiverLongitude',
+  'deliveryLocationVerifiedAt',
+];
+
+const ROUTE_ADDRESS_FORM_KEYS: Record<RouteSide, string[]> = {
+  PICKUP: [
+    'originName',
+    'originAddress',
+    'originCity',
+    'originState',
+    'originPincode',
+  ],
+  DELIVERY: [
+    'destinationName',
+    'deliveryAddress',
+    'destinationCity',
+    'destinationState',
+    'destinationPincode',
+  ],
+};
+
+const ROUTE_COORDINATE_FORM_KEYS: Record<
+  RouteSide,
+  { latitude: string; longitude: string; verifiedAt: string }
+> = {
+  PICKUP: {
+    latitude: 'originLatitude',
+    longitude: 'originLongitude',
+    verifiedAt: 'pickupLocationVerifiedAt',
+  },
+  DELIVERY: {
+    latitude: 'destinationLatitude',
+    longitude: 'destinationLongitude',
+    verifiedAt: 'deliveryLocationVerifiedAt',
+  },
+};
+
+const SHIPMENT_DETAIL_INCLUDE = {
+  companyClient: true,
+  sourceLocation: true,
+  destinationLocation: true,
+  currentDriver: true,
+  currentVehicle: true,
+  items: {
+    orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+  },
+  stops: {
+    orderBy: { stopSequence: 'asc' },
+  },
+  assignments: {
+    include: {
+      driver: true,
+      vehicle: true,
+    },
+    orderBy: { assignedAt: 'desc' },
+  },
+  statusEvents: {
+    include: {
+      driver: true,
+    },
+    orderBy: { eventTime: 'desc' },
+  },
+  trackingSessions: {
+    orderBy: { startedAt: 'desc' },
+  },
+  documents: {
+    orderBy: { uploadedAt: 'desc' },
+  },
+  proofOfDeliveries: {
+    include: {
+      photoDocument: true,
+      signatureDocument: true,
+    },
+    orderBy: { capturedAt: 'desc' },
+  },
+} satisfies Prisma.ShipmentInclude;
+
+const geocodeCache = new BoundedTtlCache<Coordinate | null>();
+
+/** String form of a primitive form/DB value; objects and nullish become ''. */
+function textOf(value: unknown): string {
+  if (value === null || value === undefined) {
+    return '';
+  }
+  if (
+    typeof value === 'string' ||
+    typeof value === 'number' ||
+    typeof value === 'boolean' ||
+    typeof value === 'bigint'
+  ) {
+    return String(value);
+  }
+  if (value instanceof Date) {
+    return value.toISOString();
+  }
+  if (value instanceof Prisma.Decimal) {
+    return value.toString();
+  }
+  return '';
+}
+const reverseGeocodeCache = new BoundedTtlCache<string | null>();
 const snappedRouteCache = new Map<string, SnappedRouteCacheEntry>();
 
 @Injectable()
 export class ShipmentsService {
+  private readonly logger = new Logger(ShipmentsService.name);
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly mailService: MailService,
@@ -102,16 +404,6 @@ export class ShipmentsService {
   ) {}
 
   async listShipments(params: ListShipmentsParams) {
-    if (params.organizationId) {
-      await this.normalizeShipmentCodes(params.organizationId);
-    } else if (params.organizationIds?.length) {
-      await Promise.all(
-        params.organizationIds.map((organizationId) =>
-          this.normalizeShipmentCodes(organizationId),
-        ),
-      );
-    }
-
     const where: Prisma.ShipmentWhereInput = {};
 
     if (params.organizationId) {
@@ -126,9 +418,25 @@ export class ShipmentsService {
       where.status = params.status;
     }
 
+    const take = this.clampInteger(
+      params.take,
+      DEFAULT_LIST_TAKE,
+      1,
+      MAX_LIST_TAKE,
+    );
+    const skip = this.clampInteger(
+      params.skip,
+      params.cursor ? 1 : 0,
+      0,
+      Number.MAX_SAFE_INTEGER,
+    );
+
     const shipments = await this.prisma.shipment.findMany({
       where,
-      orderBy: { createdAt: 'desc' },
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      take,
+      skip,
+      ...(params.cursor ? { cursor: { id: params.cursor } } : {}),
       include: {
         companyClient: true,
         currentDriver: true,
@@ -136,118 +444,54 @@ export class ShipmentsService {
       },
     });
 
-    return Promise.all(
-      shipments.map((shipment) => this.enrichShipmentCoordinates(shipment)),
+    // List rows only use coordinates that are already stored (adminFormData,
+    // address snapshots); geocoding is reserved for the detail endpoint.
+    return shipments.map((shipment) =>
+      this.toStoredCoordinateResponse(shipment),
     );
   }
 
   async getShipmentById(id: string) {
-    const shipmentForNormalization = await this.prisma.shipment.findUnique({
-      where: { id },
-      select: { organizationId: true },
-    });
-
-    if (shipmentForNormalization?.organizationId) {
-      await this.normalizeShipmentCodes(shipmentForNormalization.organizationId);
-    }
-
     const shipment = await this.prisma.shipment.findUnique({
       where: { id },
-      include: {
-        companyClient: true,
-        sourceLocation: true,
-        destinationLocation: true,
-        currentDriver: true,
-        currentVehicle: true,
-        items: true,
-        stops: {
-          orderBy: { stopSequence: 'asc' },
-        },
-        assignments: {
-          include: {
-            driver: true,
-            vehicle: true,
-          },
-          orderBy: { assignedAt: 'desc' },
-        },
-        statusEvents: {
-          include: {
-            driver: true,
-          },
-          orderBy: { eventTime: 'desc' },
-        },
-        trackingSessions: {
-          orderBy: { startedAt: 'desc' },
-        },
-        documents: {
-          orderBy: { uploadedAt: 'desc' },
-        },
-        proofOfDeliveries: {
-          include: {
-            photoDocument: true,
-            signatureDocument: true,
-          },
-          orderBy: { capturedAt: 'desc' },
-        },
-      },
+      include: SHIPMENT_DETAIL_INCLUDE,
     });
 
     return shipment ? this.enrichShipmentCoordinates(shipment) : null;
   }
 
-  async getShipmentByCode(shipmentCode: string) {
+  /**
+   * Looks a shipment up by code, restricted to the caller's organizations.
+   * `organizationIds === null` means unrestricted (platform super admin).
+   */
+  async getShipmentByCode(
+    shipmentCode: string,
+    organizationIds: string[] | null,
+  ) {
     const normalizedCode = shipmentCode.trim().toUpperCase();
+
+    if (
+      !normalizedCode ||
+      (organizationIds !== null && !organizationIds.length)
+    ) {
+      return null;
+    }
 
     const shipment = await this.prisma.shipment.findFirst({
       where: {
         shipmentCode: normalizedCode,
+        ...(organizationIds !== null
+          ? { organizationId: { in: organizationIds } }
+          : {}),
       },
-      include: {
-        companyClient: true,
-        sourceLocation: true,
-        destinationLocation: true,
-        currentDriver: true,
-        currentVehicle: true,
-        assignments: {
-          include: {
-            driver: true,
-            vehicle: true,
-          },
-          orderBy: { assignedAt: 'desc' },
-        },
-        items: true,
-        stops: {
-          orderBy: { stopSequence: 'asc' },
-        },
-        statusEvents: {
-          include: {
-            driver: true,
-          },
-          orderBy: { eventTime: 'desc' },
-        },
-        trackingSessions: {
-          orderBy: { startedAt: 'desc' },
-        },
-        documents: {
-          orderBy: { uploadedAt: 'desc' },
-        },
-        proofOfDeliveries: {
-          include: {
-            photoDocument: true,
-            signatureDocument: true,
-          },
-          orderBy: { capturedAt: 'desc' },
-        },
-      },
+      include: SHIPMENT_DETAIL_INCLUDE,
     });
 
     if (!shipment) {
       return null;
     }
 
-    const enrichedShipment = await this.enrichShipmentCoordinates(shipment);
-    await this.sendShipmentUpdateEmail(shipment, 'Shipment created', 'A new shipment has been created and is ready for planning.');
-    return enrichedShipment;
+    return this.enrichShipmentCoordinates(shipment);
   }
 
   async getShipmentTimeline(id: string) {
@@ -262,15 +506,20 @@ export class ShipmentsService {
     });
   }
 
-  async createShipment(input: CreateShipmentDto) {
+  async createShipment(input: CreateShipmentDto, actorUserId?: string | null) {
     this.validateCreateShipmentInput(input);
+    this.validatePlannedDates(input.plannedPickupAt, input.plannedDeliveryAt);
+    this.assertUniqueStopSequences(input.stops);
+    await this.assertCompanyClientBelongsToOrganization(
+      input.organizationId,
+      input.companyClientId,
+    );
+    await this.assertShipmentLocationsBelongToOrganization(input);
     await this.normalizeRequiredRouteCoordinates(input);
+    const snapshots = await this.buildAddressSnapshots(input);
 
     const status = ShipmentStatus.DRAFT;
     const requestedShipmentCode = input.shipmentCode?.trim().toUpperCase();
-    const shipmentCode =
-      requestedShipmentCode || (await this.generateShipmentCode(input.organizationId));
-    const resolvedCompanyClientId = input.companyClientId;
 
     if (requestedShipmentCode) {
       const existingShipment = await this.prisma.shipment.findUnique({
@@ -290,141 +539,192 @@ export class ShipmentsService {
       }
     }
 
-    const shipment = await this.prisma.shipment.create({
-      data: {
-        organizationId: input.organizationId,
-        companyClientId: resolvedCompanyClientId,
-        shipmentMode: input.shipmentMode,
-        shipmentCode,
-        shipmentType: input.shipmentType,
-        priority: input.priority ?? ShipmentPriority.MEDIUM,
-        status,
-        sourceLocationId: input.sourceLocationId,
-        destinationLocationId: input.destinationLocationId,
-        plannedPickupAt: input.plannedPickupAt
-          ? new Date(input.plannedPickupAt)
-          : null,
-        plannedDeliveryAt: input.plannedDeliveryAt
-          ? new Date(input.plannedDeliveryAt)
-          : null,
-        invoiceNumber: input.invoiceNumber,
-        invoiceDate: input.invoiceDate ? new Date(input.invoiceDate) : null,
-        invoiceAmount:
-          input.invoiceAmount !== undefined
-            ? new Prisma.Decimal(input.invoiceAmount)
+    const createWithCode = (shipmentCode: string) =>
+      this.prisma.shipment.create({
+        data: {
+          organizationId: input.organizationId,
+          companyClientId: input.companyClientId,
+          shipmentMode: input.shipmentMode,
+          shipmentCode,
+          shipmentType: input.shipmentType,
+          priority: input.priority ?? ShipmentPriority.MEDIUM,
+          status,
+          sourceLocationId: input.sourceLocationId,
+          destinationLocationId: input.destinationLocationId,
+          sourceAddressSnapshot: snapshots.source ?? undefined,
+          destinationAddressSnapshot: snapshots.destination ?? undefined,
+          plannedPickupAt: input.plannedPickupAt
+            ? new Date(input.plannedPickupAt)
+            : null,
+          plannedDeliveryAt: input.plannedDeliveryAt
+            ? new Date(input.plannedDeliveryAt)
+            : null,
+          invoiceNumber: input.invoiceNumber,
+          invoiceDate: input.invoiceDate ? new Date(input.invoiceDate) : null,
+          invoiceAmount:
+            input.invoiceAmount !== undefined
+              ? new Prisma.Decimal(input.invoiceAmount)
+              : undefined,
+          internalSenderName: input.internalSenderName,
+          internalSenderPhone: input.internalSenderPhone,
+          internalSenderDepartment: input.internalSenderDepartment,
+          internalReceiverName: input.internalReceiverName,
+          internalReceiverPhone: input.internalReceiverPhone,
+          internalReceiverDepartment: input.internalReceiverDepartment,
+          notes: input.notes,
+          adminFormData:
+            input.adminFormData !== undefined
+              ? (input.adminFormData as Prisma.InputJsonValue)
+              : undefined,
+          items: input.items?.length
+            ? {
+                create: input.items.map((item) =>
+                  this.toItemCreateData(input.organizationId, item),
+                ),
+              }
             : undefined,
-        internalSenderName: input.internalSenderName,
-        internalSenderPhone: input.internalSenderPhone,
-        internalSenderDepartment: input.internalSenderDepartment,
-        internalReceiverName: input.internalReceiverName,
-        internalReceiverPhone: input.internalReceiverPhone,
-        internalReceiverDepartment: input.internalReceiverDepartment,
-        notes: input.notes,
-        adminFormData:
-          input.adminFormData !== undefined
-            ? (input.adminFormData as Prisma.InputJsonValue)
+          stops: input.stops?.length
+            ? {
+                create: input.stops.map((stop) =>
+                  this.toStopCreateData(input.organizationId, stop),
+                ),
+              }
             : undefined,
-        items: input.items?.length
-          ? {
-              create: input.items.map((item) => ({
-                organizationId: input.organizationId,
-                description: item.description,
-                quantity: new Prisma.Decimal(item.quantity),
-                unit: item.unit,
-                weight:
-                  item.weight !== undefined
-                    ? new Prisma.Decimal(item.weight)
-                    : undefined,
-                volume:
-                  item.volume !== undefined
-                    ? new Prisma.Decimal(item.volume)
-                    : undefined,
-                declaredValue:
-                  item.declaredValue !== undefined
-                    ? new Prisma.Decimal(item.declaredValue)
-                    : undefined,
-              })),
-            }
-          : undefined,
-        stops: input.stops?.length
-          ? {
-              create: input.stops.map((stop) => ({
-                organizationId: input.organizationId,
-                stopSequence: stop.stopSequence,
-                stopType: stop.stopType,
-                locationName: stop.locationName,
-                addressLine1: stop.addressLine1,
-                addressLine2: stop.addressLine2,
-                city: stop.city,
-                state: stop.state,
-                postalCode: stop.postalCode,
-                country: stop.country ?? 'India',
-                plannedArrivalAt: stop.plannedArrivalAt
-                  ? new Date(stop.plannedArrivalAt)
-                  : undefined,
-                plannedDepartureAt: stop.plannedDepartureAt
-                  ? new Date(stop.plannedDepartureAt)
-                  : undefined,
-                status: StopStatus.PENDING,
-              })),
-            }
-          : undefined,
-        statusEvents: {
-          create: {
-            organizationId: input.organizationId,
-            eventType: 'shipment_created',
-            toStatus: status,
-            source: input.eventSource ?? EventSource.API,
-            notes: 'Shipment created via API',
-            metadata: {
-              shipmentMode: input.shipmentMode,
-              shipmentType: input.shipmentType,
-              priority: input.priority ?? ShipmentPriority.MEDIUM,
+          statusEvents: {
+            create: {
+              organizationId: input.organizationId,
+              actorUserId: actorUserId ?? undefined,
+              eventType: 'shipment_created',
+              toStatus: status,
+              source: input.eventSource ?? EventSource.API,
+              notes: 'Shipment created via API',
+              metadata: {
+                shipmentMode: input.shipmentMode,
+                shipmentType: input.shipmentType,
+                priority: input.priority ?? ShipmentPriority.MEDIUM,
+              },
             },
           },
         },
-      },
-      include: {
-        companyClient: true,
-        items: true,
-        stops: {
-          orderBy: { stopSequence: 'asc' },
+        include: {
+          companyClient: true,
+          items: {
+            orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+          },
+          stops: {
+            orderBy: { stopSequence: 'asc' },
+          },
+          statusEvents: {
+            orderBy: { eventTime: 'desc' },
+          },
         },
-        statusEvents: {
-          orderBy: { eventTime: 'desc' },
-        },
-      },
-    });
+      });
+
+    let shipment: Awaited<ReturnType<typeof createWithCode>>;
+    try {
+      shipment = requestedShipmentCode
+        ? await createWithCode(requestedShipmentCode)
+        : await withUniqueCodeRetry(
+            async () =>
+              createWithCode(
+                await this.generateShipmentCode(input.organizationId),
+              ),
+            {
+              // Only retry when the collision is on the generated code, not
+              // on a duplicate invoice number.
+              shouldRetry: async () =>
+                !(await this.isInvoiceNumberTaken(
+                  input.organizationId,
+                  input.invoiceNumber,
+                )),
+            },
+          );
+    } catch (error) {
+      return this.rethrowUniqueViolation(
+        error,
+        input.organizationId,
+        input.invoiceNumber,
+      );
+    }
 
     const enrichedShipment = await this.enrichShipmentCoordinates(shipment);
-    await this.sendShipmentUpdateEmail(shipment, 'Shipment updated', 'Shipment details have been updated.');
+    void this.sendShipmentUpdateEmail(
+      shipment,
+      'Shipment created',
+      'A new shipment has been created and is ready for planning.',
+    );
     return enrichedShipment;
   }
 
-  async updateShipment(shipmentId: string, input: UpdateShipmentDto) {
-    const existingShipment = await this.ensureShipmentExists(shipmentId);
+  async updateShipment(
+    shipmentId: string,
+    input: UpdateShipmentDto,
+    actorUserId?: string | null,
+  ) {
+    const existingShipment = await this.prisma.shipment.findUnique({
+      where: { id: shipmentId },
+      include: {
+        stops: { orderBy: { stopSequence: 'asc' } },
+        items: { orderBy: [{ createdAt: 'asc' }, { id: 'asc' }] },
+      },
+    });
+
+    if (!existingShipment) {
+      throw new BadRequestException(`Shipment ${shipmentId} does not exist`);
+    }
+
+    if (
+      input.organizationId &&
+      input.organizationId !== existingShipment.organizationId
+    ) {
+      throw new BadRequestException(
+        'organizationId does not match the shipment organization',
+      );
+    }
+
+    // Status changes only go through the guarded status actions.
+    if (
+      input.initialStatus !== undefined &&
+      input.initialStatus !== existingShipment.status
+    ) {
+      throw new BadRequestException(
+        'Shipment status cannot be changed through an update. Use the shipment status actions instead.',
+      );
+    }
 
     const organizationId = existingShipment.organizationId;
+    const routeLocked = !ROUTE_EDITABLE_STATUSES.includes(
+      existingShipment.status,
+    );
+    const existingFormData = this.asRecord(existingShipment.adminFormData);
+    const requestedShipmentCode = input.shipmentCode?.trim().toUpperCase();
+
     const normalizedInput: CreateShipmentDto = {
       organizationId,
       shipmentMode: input.shipmentMode ?? existingShipment.shipmentMode,
       shipmentType: input.shipmentType ?? existingShipment.shipmentType,
       priority: input.priority ?? existingShipment.priority ?? undefined,
-      shipmentCode: input.shipmentCode ?? existingShipment.shipmentCode,
+      // Codes are stable: only an explicit, different code changes it (a
+      // re-submitted code that differs only by case is ignored).
+      shipmentCode:
+        requestedShipmentCode &&
+        requestedShipmentCode !== existingShipment.shipmentCode.toUpperCase()
+          ? requestedShipmentCode
+          : existingShipment.shipmentCode,
       companyClientId:
         input.shipmentMode === ShipmentMode.INTERNAL
           ? undefined
           : input.companyClientId !== undefined
-          ? input.companyClientId
-          : existingShipment.companyClientId ?? undefined,
+            ? input.companyClientId
+            : (existingShipment.companyClientId ?? undefined),
       sourceLocationId:
         input.sourceLocationId !== undefined
           ? input.sourceLocationId
-          : existingShipment.sourceLocationId ?? undefined,
+          : (existingShipment.sourceLocationId ?? undefined),
       destinationLocationId:
         input.destinationLocationId !== undefined
           ? input.destinationLocationId
-          : existingShipment.destinationLocationId ?? undefined,
+          : (existingShipment.destinationLocationId ?? undefined),
       plannedPickupAt:
         input.plannedPickupAt !== undefined
           ? input.plannedPickupAt
@@ -436,7 +736,7 @@ export class ShipmentsService {
       invoiceNumber:
         input.invoiceNumber !== undefined
           ? input.invoiceNumber
-          : existingShipment.invoiceNumber ?? undefined,
+          : (existingShipment.invoiceNumber ?? undefined),
       invoiceDate:
         input.invoiceDate !== undefined
           ? input.invoiceDate
@@ -451,229 +751,367 @@ export class ShipmentsService {
       internalSenderName:
         input.internalSenderName !== undefined
           ? input.internalSenderName
-          : existingShipment.internalSenderName ?? undefined,
+          : (existingShipment.internalSenderName ?? undefined),
       internalSenderPhone:
         input.internalSenderPhone !== undefined
           ? input.internalSenderPhone
-          : existingShipment.internalSenderPhone ?? undefined,
+          : (existingShipment.internalSenderPhone ?? undefined),
       internalSenderDepartment:
         input.internalSenderDepartment !== undefined
           ? input.internalSenderDepartment
-          : existingShipment.internalSenderDepartment ?? undefined,
+          : (existingShipment.internalSenderDepartment ?? undefined),
       internalReceiverName:
         input.internalReceiverName !== undefined
           ? input.internalReceiverName
-          : existingShipment.internalReceiverName ?? undefined,
+          : (existingShipment.internalReceiverName ?? undefined),
       internalReceiverPhone:
         input.internalReceiverPhone !== undefined
           ? input.internalReceiverPhone
-          : existingShipment.internalReceiverPhone ?? undefined,
+          : (existingShipment.internalReceiverPhone ?? undefined),
       internalReceiverDepartment:
         input.internalReceiverDepartment !== undefined
           ? input.internalReceiverDepartment
-          : existingShipment.internalReceiverDepartment ?? undefined,
+          : (existingShipment.internalReceiverDepartment ?? undefined),
       notes:
-        input.notes !== undefined ? input.notes : existingShipment.notes ?? undefined,
+        input.notes !== undefined
+          ? input.notes
+          : (existingShipment.notes ?? undefined),
       adminFormData:
         input.adminFormData !== undefined
           ? input.adminFormData
-          : ((existingShipment.adminFormData as Record<string, unknown> | null) ?? undefined),
+          : Object.keys(existingFormData).length ||
+              existingShipment.adminFormData
+            ? existingFormData
+            : undefined,
       items: input.items,
       stops: input.stops,
-      initialStatus:
-        input.initialStatus !== undefined
-          ? input.initialStatus
-          : existingShipment.status,
       eventSource: input.eventSource ?? EventSource.API,
     };
 
     this.validateCreateShipmentInput(normalizedInput);
-    await this.normalizeRequiredRouteCoordinates(normalizedInput);
+    if (
+      input.plannedPickupAt !== undefined ||
+      input.plannedDeliveryAt !== undefined
+    ) {
+      this.validatePlannedDates(
+        normalizedInput.plannedPickupAt,
+        normalizedInput.plannedDeliveryAt,
+      );
+    }
+    this.assertUniqueStopSequences(input.stops);
 
-    const shipment = await this.prisma.$transaction(async (tx) => {
-      if (input.items) {
-        await tx.shipmentItem.deleteMany({
-          where: {
-            shipmentId,
-          },
-        });
+    const stopPlan =
+      input.stops !== undefined
+        ? this.planStopChanges(existingShipment.stops, input.stops)
+        : null;
+    const itemPlan =
+      input.items !== undefined
+        ? this.planItemChanges(existingShipment.items, input.items)
+        : null;
+
+    const companyClientChanged =
+      (normalizedInput.companyClientId ?? null) !==
+      (existingShipment.companyClientId ?? null);
+    const sourceLocationChanged =
+      (normalizedInput.sourceLocationId ?? null) !==
+      (existingShipment.sourceLocationId ?? null);
+    const destinationLocationChanged =
+      (normalizedInput.destinationLocationId ?? null) !==
+      (existingShipment.destinationLocationId ?? null);
+
+    if (routeLocked) {
+      const lockedChanges: string[] = [];
+      if (normalizedInput.shipmentMode !== existingShipment.shipmentMode) {
+        lockedChanges.push('shipmentMode');
+      }
+      if (normalizedInput.shipmentType !== existingShipment.shipmentType) {
+        lockedChanges.push('shipmentType');
+      }
+      if (companyClientChanged) lockedChanges.push('companyClientId');
+      if (sourceLocationChanged) lockedChanges.push('sourceLocationId');
+      if (destinationLocationChanged)
+        lockedChanges.push('destinationLocationId');
+      if (stopPlan?.locationChanged) lockedChanges.push('stops');
+      if (itemPlan === 'replace') lockedChanges.push('items');
+
+      if (lockedChanges.length) {
+        throw new ConflictException(
+          `${lockedChanges.join(', ')} cannot be changed once the shipment is ${existingShipment.status}.`,
+        );
       }
 
-      if (input.stops) {
-        await tx.shipmentStop.deleteMany({
-          where: {
-            shipmentId,
-          },
-        });
+      // Route keys inside adminFormData (addresses, pins) are frozen too.
+      if (input.adminFormData !== undefined) {
+        normalizedInput.adminFormData = this.preserveRouteFormKeys(
+          existingFormData,
+          input.adminFormData,
+        );
       }
+    }
 
-      const updated = await tx.shipment.update({
-        where: { id: shipmentId },
-        data: {
-          companyClientId: normalizedInput.companyClientId ?? null,
-          shipmentMode: normalizedInput.shipmentMode,
-          shipmentCode: normalizedInput.shipmentCode,
-          shipmentType: normalizedInput.shipmentType,
-          priority: normalizedInput.priority ?? ShipmentPriority.MEDIUM,
-          sourceLocationId: normalizedInput.sourceLocationId ?? null,
-          destinationLocationId: normalizedInput.destinationLocationId ?? null,
-          plannedPickupAt: normalizedInput.plannedPickupAt
-            ? new Date(normalizedInput.plannedPickupAt)
-            : null,
-          plannedDeliveryAt: normalizedInput.plannedDeliveryAt
-            ? new Date(normalizedInput.plannedDeliveryAt)
-            : null,
-          invoiceNumber: normalizedInput.invoiceNumber ?? null,
-          invoiceDate: normalizedInput.invoiceDate
-            ? new Date(normalizedInput.invoiceDate)
-            : null,
-          invoiceAmount:
-            normalizedInput.invoiceAmount !== undefined
-              ? new Prisma.Decimal(normalizedInput.invoiceAmount)
-              : null,
-          internalSenderName: normalizedInput.internalSenderName ?? null,
-          internalSenderPhone: normalizedInput.internalSenderPhone ?? null,
-          internalSenderDepartment:
-            normalizedInput.internalSenderDepartment ?? null,
-          internalReceiverName: normalizedInput.internalReceiverName ?? null,
-          internalReceiverPhone: normalizedInput.internalReceiverPhone ?? null,
-          internalReceiverDepartment:
-            normalizedInput.internalReceiverDepartment ?? null,
-          notes: normalizedInput.notes ?? null,
-          adminFormData:
-            normalizedInput.adminFormData !== undefined
-              ? (normalizedInput.adminFormData as Prisma.InputJsonValue)
-              : Prisma.DbNull,
-          items: normalizedInput.items?.length
-            ? {
-                create: normalizedInput.items.map((item) => ({
-                  organizationId,
-                  description: item.description,
-                  quantity: new Prisma.Decimal(item.quantity),
-                  unit: item.unit,
-                  weight:
-                    item.weight !== undefined
-                      ? new Prisma.Decimal(item.weight)
-                      : undefined,
-                  volume:
-                    item.volume !== undefined
-                      ? new Prisma.Decimal(item.volume)
-                      : undefined,
-                  declaredValue:
-                    item.declaredValue !== undefined
-                      ? new Prisma.Decimal(item.declaredValue)
-                      : undefined,
-                })),
-              }
-            : input.items
-              ? undefined
-              : undefined,
-          stops: normalizedInput.stops?.length
-            ? {
-                create: normalizedInput.stops.map((stop) => ({
-                  organizationId,
-                  stopSequence: stop.stopSequence,
-                  stopType: stop.stopType,
-                  locationName: stop.locationName,
-                  addressLine1: stop.addressLine1,
-                  addressLine2: stop.addressLine2,
-                  city: stop.city,
-                  state: stop.state,
-                  postalCode: stop.postalCode,
-                  country: stop.country ?? 'India',
-                  plannedArrivalAt: stop.plannedArrivalAt
-                    ? new Date(stop.plannedArrivalAt)
-                    : undefined,
-                  plannedDepartureAt: stop.plannedDepartureAt
-                    ? new Date(stop.plannedDepartureAt)
-                    : undefined,
-                  status: StopStatus.PENDING,
-                })),
-              }
-            : input.stops
-              ? undefined
-              : undefined,
-          status:
-            input.initialStatus !== undefined
-              ? input.initialStatus
-              : existingShipment.status,
-        },
-        include: {
-          companyClient: true,
-          sourceLocation: true,
-          destinationLocation: true,
-          currentDriver: true,
-          currentVehicle: true,
-          items: true,
-          stops: {
-            orderBy: { stopSequence: 'asc' },
-          },
-          assignments: {
-            include: {
-              driver: true,
-              vehicle: true,
-            },
-            orderBy: { assignedAt: 'desc' },
-          },
-          statusEvents: {
-            include: {
-              driver: true,
-            },
-            orderBy: { eventTime: 'desc' },
-          },
-          trackingSessions: {
-            orderBy: { startedAt: 'desc' },
-          },
-          documents: {
-            orderBy: { uploadedAt: 'desc' },
-          },
-          proofOfDeliveries: {
-            include: {
-              photoDocument: true,
-              signatureDocument: true,
-            },
-            orderBy: { capturedAt: 'desc' },
+    if (companyClientChanged) {
+      await this.assertCompanyClientBelongsToOrganization(
+        organizationId,
+        normalizedInput.companyClientId,
+      );
+    }
+    await this.assertShipmentLocationsBelongToOrganization(normalizedInput);
+
+    if (
+      normalizedInput.shipmentCode !== existingShipment.shipmentCode &&
+      normalizedInput.shipmentCode
+    ) {
+      const codeOwner = await this.prisma.shipment.findUnique({
+        where: {
+          organizationId_shipmentCode: {
+            organizationId,
+            shipmentCode: normalizedInput.shipmentCode,
           },
         },
+        select: { id: true },
       });
+      if (codeOwner && codeOwner.id !== shipmentId) {
+        throw new ConflictException(
+          `Shipment code ${normalizedInput.shipmentCode} already exists`,
+        );
+      }
+    }
 
-      await tx.shipmentStatusEvent.create({
-        data: {
-          organizationId,
-          shipmentId,
-          eventType: 'shipment_updated',
-          fromStatus: existingShipment.status,
-          toStatus:
-            input.initialStatus !== undefined
-              ? input.initialStatus
-              : existingShipment.status,
-          source: normalizedInput.eventSource ?? EventSource.API,
-          notes: 'Shipment updated via API',
-          metadata: {
+    // Route coordinates: only re-geocode the side whose address changed, keep
+    // user-pinned/verified coordinates otherwise. Runs before (never inside)
+    // the transaction.
+    let snapshotUpdate: {
+      source: Prisma.InputJsonValue | null;
+      destination: Prisma.InputJsonValue | null;
+    } | null = null;
+
+    if (!routeLocked) {
+      const routeInput: CreateShipmentDto = {
+        ...normalizedInput,
+        stops:
+          input.stops ??
+          existingShipment.stops.map((stop) => this.toStopDto(stop)),
+      };
+      const pickupChanged =
+        Boolean(stopPlan?.pickupChanged) ||
+        sourceLocationChanged ||
+        this.routeFormAddressChanged(
+          existingFormData,
+          input.adminFormData,
+          'PICKUP',
+        );
+      const deliveryChanged =
+        Boolean(stopPlan?.deliveryChanged) ||
+        destinationLocationChanged ||
+        this.routeFormAddressChanged(
+          existingFormData,
+          input.adminFormData,
+          'DELIVERY',
+        );
+
+      await this.resolveRouteCoordinatesForUpdate(
+        routeInput,
+        existingFormData,
+        {
+          PICKUP: pickupChanged,
+          DELIVERY: deliveryChanged,
+        },
+      );
+      normalizedInput.adminFormData = routeInput.adminFormData;
+
+      if (pickupChanged || deliveryChanged) {
+        snapshotUpdate = await this.buildAddressSnapshots(routeInput);
+      }
+    }
+
+    let shipment;
+    try {
+      shipment = await this.prisma.$transaction(async (tx) => {
+        const guard = await tx.shipment.updateMany({
+          where: { id: shipmentId, status: existingShipment.status },
+          data: {
+            companyClientId: normalizedInput.companyClientId ?? null,
             shipmentMode: normalizedInput.shipmentMode,
+            shipmentCode: normalizedInput.shipmentCode,
             shipmentType: normalizedInput.shipmentType,
             priority: normalizedInput.priority ?? ShipmentPriority.MEDIUM,
+            sourceLocationId: normalizedInput.sourceLocationId ?? null,
+            destinationLocationId:
+              normalizedInput.destinationLocationId ?? null,
+            ...(snapshotUpdate
+              ? {
+                  sourceAddressSnapshot: snapshotUpdate.source ?? Prisma.DbNull,
+                  destinationAddressSnapshot:
+                    snapshotUpdate.destination ?? Prisma.DbNull,
+                }
+              : {}),
+            plannedPickupAt: normalizedInput.plannedPickupAt
+              ? new Date(normalizedInput.plannedPickupAt)
+              : null,
+            plannedDeliveryAt: normalizedInput.plannedDeliveryAt
+              ? new Date(normalizedInput.plannedDeliveryAt)
+              : null,
+            invoiceNumber: normalizedInput.invoiceNumber ?? null,
+            invoiceDate: normalizedInput.invoiceDate
+              ? new Date(normalizedInput.invoiceDate)
+              : null,
+            invoiceAmount:
+              normalizedInput.invoiceAmount !== undefined
+                ? new Prisma.Decimal(normalizedInput.invoiceAmount)
+                : null,
+            internalSenderName: normalizedInput.internalSenderName ?? null,
+            internalSenderPhone: normalizedInput.internalSenderPhone ?? null,
+            internalSenderDepartment:
+              normalizedInput.internalSenderDepartment ?? null,
+            internalReceiverName: normalizedInput.internalReceiverName ?? null,
+            internalReceiverPhone:
+              normalizedInput.internalReceiverPhone ?? null,
+            internalReceiverDepartment:
+              normalizedInput.internalReceiverDepartment ?? null,
+            notes: normalizedInput.notes ?? null,
+            adminFormData:
+              normalizedInput.adminFormData !== undefined
+                ? (normalizedInput.adminFormData as Prisma.InputJsonValue)
+                : Prisma.DbNull,
           },
-        },
-      });
+        });
 
-      return updated;
-    });
+        if (guard.count === 0) {
+          throw new ConflictException(
+            'The shipment status changed while saving. Reload the shipment and try again.',
+          );
+        }
+
+        if (input.items !== undefined && itemPlan && itemPlan !== 'unchanged') {
+          await this.applyItemChanges(
+            tx,
+            shipmentId,
+            organizationId,
+            existingShipment.items,
+            input.items,
+            itemPlan,
+          );
+        }
+
+        if (input.stops !== undefined) {
+          await this.applyStopChanges(
+            tx,
+            shipmentId,
+            organizationId,
+            existingShipment.stops,
+            input.stops,
+          );
+        }
+
+        await tx.shipmentStatusEvent.create({
+          data: {
+            organizationId,
+            shipmentId,
+            actorUserId: actorUserId ?? undefined,
+            eventType: 'shipment_updated',
+            fromStatus: existingShipment.status,
+            toStatus: existingShipment.status,
+            source: normalizedInput.eventSource ?? EventSource.API,
+            notes: 'Shipment updated via API',
+            metadata: {
+              shipmentMode: normalizedInput.shipmentMode,
+              shipmentType: normalizedInput.shipmentType,
+              priority: normalizedInput.priority ?? ShipmentPriority.MEDIUM,
+              itemsChanged: Boolean(itemPlan && itemPlan !== 'unchanged'),
+              stopsChanged: Boolean(stopPlan?.locationChanged),
+            },
+          },
+        });
+
+        return tx.shipment.findUniqueOrThrow({
+          where: { id: shipmentId },
+          include: SHIPMENT_DETAIL_INCLUDE,
+        });
+      });
+    } catch (error) {
+      return this.rethrowUniqueViolation(
+        error,
+        organizationId,
+        normalizedInput.invoiceNumber,
+        shipmentId,
+      );
+    }
 
     const enrichedShipment = await this.enrichShipmentCoordinates(shipment);
-    this.driverRealtimeService.notifyShipmentChange(
-      shipment.currentDriverId,
-      {
-        shipmentId,
-        organizationId,
-        change: 'updated',
-      },
-    );
+    this.driverRealtimeService.notifyShipmentChange(shipment.currentDriverId, {
+      shipmentId,
+      organizationId,
+      change: 'updated',
+    });
     return enrichedShipment;
   }
 
-  async assignDriver(shipmentId: string, input: AssignDriverDto) {
+  async assignDriver(
+    shipmentId: string,
+    input: AssignDriverDto,
+    actorUserId?: string | null,
+  ) {
     const shipment = await this.ensureShipmentExists(shipmentId);
+
+    if (shipment.organizationId !== input.organizationId) {
+      throw new BadRequestException(
+        'organizationId does not match the shipment organization',
+      );
+    }
+
+    const requestedVehicleId = input.vehicleId ?? null;
+    const activeAssignment = await this.prisma.shipmentAssignment.findFirst({
+      where: {
+        shipmentId,
+        assignmentStatus: ShipmentAssignmentStatus.ACTIVE,
+      },
+      include: {
+        driver: true,
+        vehicle: true,
+      },
+      orderBy: { assignedAt: 'desc' },
+    });
+
+    // Re-submitting the current driver/vehicle (e.g. the portal edit form) is
+    // a no-op in any status.
+    if (
+      activeAssignment &&
+      activeAssignment.driverId === input.driverId &&
+      (activeAssignment.vehicleId ?? null) === requestedVehicleId &&
+      shipment.currentDriverId === input.driverId &&
+      (shipment.currentVehicleId ?? null) === requestedVehicleId
+    ) {
+      return activeAssignment;
+    }
+
+    if (!ASSIGNABLE_STATUSES.includes(shipment.status)) {
+      throw new ConflictException(
+        `A driver cannot be assigned while the shipment is ${shipment.status}.`,
+      );
+    }
+
+    const driver = await this.ensureDriverExists(
+      input.driverId,
+      shipment.organizationId,
+    );
+    if (driver.status !== DriverStatus.ACTIVE) {
+      throw new BadRequestException(
+        `Driver ${driver.fullName} is ${driver.status} and cannot be assigned.`,
+      );
+    }
+
+    if (requestedVehicleId) {
+      const vehicle = await this.ensureVehicleExists(
+        requestedVehicleId,
+        shipment.organizationId,
+      );
+      if (vehicle.status !== VehicleStatus.ACTIVE) {
+        throw new BadRequestException(
+          `Vehicle ${vehicle.vehicleNumber} is ${vehicle.status} and cannot be assigned.`,
+        );
+      }
+    }
+
     const shipmentWithRoute = await this.getShipmentById(shipmentId);
 
     if (
@@ -685,13 +1123,86 @@ export class ShipmentsService {
       );
     }
 
-    await this.ensureDriverExists(input.driverId, input.organizationId);
-
-    if (input.vehicleId) {
-      await this.ensureVehicleExists(input.vehicleId, input.organizationId);
+    const busyDriverShipment = await this.prisma.shipment.findFirst({
+      where: {
+        id: { not: shipmentId },
+        status: { notIn: TERMINAL_SHIPMENT_STATUSES },
+        OR: [
+          { currentDriverId: input.driverId },
+          {
+            assignments: {
+              some: {
+                driverId: input.driverId,
+                assignmentStatus: ShipmentAssignmentStatus.ACTIVE,
+              },
+            },
+          },
+        ],
+      },
+      select: { shipmentCode: true },
+    });
+    if (busyDriverShipment) {
+      throw new ConflictException(
+        `Driver ${driver.fullName} is already assigned to active shipment ${busyDriverShipment.shipmentCode}.`,
+      );
     }
 
+    if (requestedVehicleId) {
+      const busyVehicleShipment = await this.prisma.shipment.findFirst({
+        where: {
+          id: { not: shipmentId },
+          status: { notIn: TERMINAL_SHIPMENT_STATUSES },
+          OR: [
+            { currentVehicleId: requestedVehicleId },
+            {
+              assignments: {
+                some: {
+                  vehicleId: requestedVehicleId,
+                  assignmentStatus: ShipmentAssignmentStatus.ACTIVE,
+                },
+              },
+            },
+          ],
+        },
+        select: { shipmentCode: true },
+      });
+      if (busyVehicleShipment) {
+        throw new ConflictException(
+          `The vehicle is already assigned to active shipment ${busyVehicleShipment.shipmentCode}.`,
+        );
+      }
+    }
+
+    const isDriverChange = Boolean(
+      shipment.currentDriverId && shipment.currentDriverId !== input.driverId,
+    );
+    const nextStatus =
+      shipment.status === ShipmentStatus.PLANNED ||
+      (isDriverChange && shipment.status === ShipmentStatus.EN_ROUTE_PICKUP)
+        ? ShipmentStatus.ASSIGNED
+        : shipment.status;
+
     const result = await this.prisma.$transaction(async (tx) => {
+      const guard = await tx.shipment.updateMany({
+        where: {
+          id: shipmentId,
+          organizationId: shipment.organizationId,
+          status: shipment.status,
+          currentDriverId: shipment.currentDriverId,
+        },
+        data: {
+          currentDriverId: input.driverId,
+          currentVehicleId: requestedVehicleId,
+          status: nextStatus,
+        },
+      });
+
+      if (guard.count === 0) {
+        throw new ConflictException(
+          'The shipment changed while assigning the driver. Reload and try again.',
+        );
+      }
+
       await tx.shipmentAssignment.updateMany({
         where: {
           shipmentId,
@@ -703,12 +1214,21 @@ export class ShipmentsService {
         },
       });
 
+      // The previous driver's live session must not keep feeding this shipment.
+      if (isDriverChange) {
+        await this.closeTrackingSession(
+          tx,
+          shipmentId,
+          TrackingSessionStatus.CANCELLED,
+        );
+      }
+
       const assignment = await tx.shipmentAssignment.create({
         data: {
-          organizationId: input.organizationId,
+          organizationId: shipment.organizationId,
           shipmentId,
           driverId: input.driverId,
-          vehicleId: input.vehicleId,
+          vehicleId: requestedVehicleId,
           notes: input.notes,
         },
         include: {
@@ -717,31 +1237,20 @@ export class ShipmentsService {
         },
       });
 
-      const nextStatus =
-        shipment.status === ShipmentStatus.PLANNED
-          ? ShipmentStatus.ASSIGNED
-          : shipment.status;
-
-      await tx.shipment.update({
-        where: { id: shipmentId },
-        data: {
-          currentDriverId: input.driverId,
-          currentVehicleId: input.vehicleId,
-          status: nextStatus,
-        },
-      });
-
       const event = {
-        organizationId: input.organizationId,
+        organizationId: shipment.organizationId,
         shipmentId,
         driverId: input.driverId,
+        actorUserId: actorUserId ?? undefined,
         eventType: 'driver_assigned',
         fromStatus: shipment.status,
         toStatus: nextStatus,
         source: EventSource.API,
         notes: input.notes ?? 'Driver assigned to shipment',
         metadata: {
-          vehicleId: input.vehicleId,
+          vehicleId: requestedVehicleId,
+          previousDriverId: shipment.currentDriverId,
+          previousVehicleId: shipment.currentVehicleId,
         },
       };
 
@@ -755,18 +1264,21 @@ export class ShipmentsService {
       };
     });
 
-    await this.publishOrderEventSafe(result.orderEvent);
+    this.publishOrderEventSafe(result.orderEvent);
     this.driverRealtimeService.notifyShipmentChange(input.driverId, {
       shipmentId,
-      organizationId: input.organizationId,
+      organizationId: shipment.organizationId,
       change: 'assigned',
     });
-    if (shipment.currentDriverId && shipment.currentDriverId !== input.driverId) {
-      this.driverRealtimeService.notifyShipmentChange(shipment.currentDriverId, {
-        shipmentId,
-        organizationId: input.organizationId,
-        change: 'removed',
-      });
+    if (isDriverChange) {
+      this.driverRealtimeService.notifyShipmentChange(
+        shipment.currentDriverId,
+        {
+          shipmentId,
+          organizationId: shipment.organizationId,
+          change: 'removed',
+        },
+      );
     }
     return result.assignment;
   }
@@ -774,6 +1286,7 @@ export class ShipmentsService {
   async startTrackingSession(
     shipmentId: string,
     input: StartTrackingSessionDto,
+    actorUserId?: string | null,
   ) {
     const shipment = await this.ensureShipmentExists(shipmentId);
 
@@ -789,64 +1302,115 @@ export class ShipmentsService {
       );
     }
 
-    const activeSession = shipment.currentTrackingSessionId
-      ? await this.prisma.trackingSession.findUnique({
-          where: { id: shipment.currentTrackingSessionId },
-        })
-      : null;
-
-    if (activeSession && activeSession.status === TrackingSessionStatus.ACTIVE) {
-      return activeSession;
+    if (TERMINAL_SHIPMENT_STATUSES.includes(shipment.status)) {
+      throw new ConflictException(
+        `Tracking cannot start while the shipment is ${shipment.status}.`,
+      );
     }
 
-    const result = await this.prisma.$transaction(async (tx) => {
-      const trackingSession = await tx.trackingSession.create({
-        data: {
+    const existingActiveSession = await this.findActiveSessionForDriver(
+      shipment.currentTrackingSessionId,
+      shipmentId,
+      input.driverId,
+    );
+    if (existingActiveSession) {
+      return existingActiveSession;
+    }
+
+    const nextStatus =
+      shipment.status === ShipmentStatus.ASSIGNED
+        ? ShipmentStatus.EN_ROUTE_PICKUP
+        : shipment.status;
+
+    let result: {
+      trackingSession: Awaited<
+        ReturnType<PrismaService['trackingSession']['create']>
+      >;
+      orderEvent: OrderEventMessage;
+    };
+    try {
+      result = await this.prisma.$transaction(async (tx) => {
+        // Any stale ACTIVE session for this shipment is closed first.
+        await tx.trackingSession.updateMany({
+          where: { shipmentId, status: TrackingSessionStatus.ACTIVE },
+          data: {
+            status: TrackingSessionStatus.COMPLETED,
+            endedAt: new Date(),
+          },
+        });
+
+        const trackingSession = await tx.trackingSession.create({
+          data: {
+            organizationId: input.organizationId,
+            shipmentId,
+            driverId: input.driverId,
+            status: TrackingSessionStatus.ACTIVE,
+          },
+        });
+
+        const guard = await tx.shipment.updateMany({
+          where: {
+            id: shipmentId,
+            status: shipment.status,
+            currentDriverId: input.driverId,
+            currentTrackingSessionId: shipment.currentTrackingSessionId,
+          },
+          data: {
+            currentTrackingSessionId: trackingSession.id,
+            status: nextStatus,
+          },
+        });
+
+        if (guard.count === 0) {
+          throw new ConflictException(
+            'The shipment changed while starting tracking. Reload and try again.',
+          );
+        }
+
+        const event = {
           organizationId: input.organizationId,
           shipmentId,
           driverId: input.driverId,
-          status: TrackingSessionStatus.ACTIVE,
-        },
+          actorUserId: actorUserId ?? undefined,
+          eventType: 'tracking_started',
+          fromStatus: shipment.status,
+          toStatus: nextStatus,
+          source: EventSource.API,
+          notes: 'Tracking session started',
+          metadata: {
+            trackingSessionId: trackingSession.id,
+          },
+        };
+
+        await tx.shipmentStatusEvent.create({
+          data: event,
+        });
+
+        return {
+          trackingSession,
+          orderEvent: this.toOrderEventMessage(event),
+        };
       });
+    } catch (error) {
+      // A concurrent start from the same driver won the race: return its session.
+      if (error instanceof ConflictException) {
+        const latest = await this.prisma.shipment.findUnique({
+          where: { id: shipmentId },
+          select: { currentTrackingSessionId: true },
+        });
+        const concurrentSession = await this.findActiveSessionForDriver(
+          latest?.currentTrackingSessionId ?? null,
+          shipmentId,
+          input.driverId,
+        );
+        if (concurrentSession) {
+          return concurrentSession;
+        }
+      }
+      throw error;
+    }
 
-      const nextStatus =
-        shipment.status === ShipmentStatus.ASSIGNED
-          ? ShipmentStatus.EN_ROUTE_PICKUP
-          : shipment.status;
-
-      await tx.shipment.update({
-        where: { id: shipmentId },
-        data: {
-          currentTrackingSessionId: trackingSession.id,
-          status: nextStatus,
-        },
-      });
-
-      const event = {
-        organizationId: input.organizationId,
-        shipmentId,
-        driverId: input.driverId,
-        eventType: 'tracking_started',
-        fromStatus: shipment.status,
-        toStatus: nextStatus,
-        source: EventSource.API,
-        notes: 'Tracking session started',
-        metadata: {
-          trackingSessionId: trackingSession.id,
-        },
-      };
-
-      await tx.shipmentStatusEvent.create({
-        data: event,
-      });
-
-      return {
-        trackingSession,
-        orderEvent: this.toOrderEventMessage(event),
-      };
-    });
-
-    await this.publishOrderEventSafe(result.orderEvent);
+    this.publishOrderEventSafe(result.orderEvent);
     this.driverRealtimeService.notifyShipmentChange(shipment.currentDriverId, {
       shipmentId,
       organizationId: input.organizationId,
@@ -864,6 +1428,15 @@ export class ShipmentsService {
       );
     }
 
+    if (
+      !shipment.currentDriverId ||
+      shipment.currentDriverId !== input.driverId
+    ) {
+      throw new BadRequestException(
+        'The provided driver is not the current driver for this shipment',
+      );
+    }
+
     const trackingSessionId =
       input.trackingSessionId ?? shipment.currentTrackingSessionId;
 
@@ -877,13 +1450,24 @@ export class ShipmentsService {
       where: { id: trackingSessionId },
     });
 
-    if (!trackingSession || trackingSession.status !== TrackingSessionStatus.ACTIVE) {
+    if (
+      !trackingSession ||
+      trackingSession.shipmentId !== shipmentId ||
+      trackingSession.organizationId !== shipment.organizationId ||
+      trackingSession.driverId !== input.driverId
+    ) {
+      throw new BadRequestException(
+        'Tracking session does not belong to this shipment and driver',
+      );
+    }
+
+    if (trackingSession.status !== TrackingSessionStatus.ACTIVE) {
       throw new BadRequestException('Tracking session is not active');
     }
 
     return this.prisma.trackingPoint.create({
       data: {
-        organizationId: input.organizationId,
+        organizationId: shipment.organizationId,
         trackingSessionId,
         shipmentId,
         driverId: input.driverId,
@@ -914,35 +1498,44 @@ export class ShipmentsService {
     });
   }
 
-  async getTrackingHistory(shipmentId: string, limit?: number) {
+  async getTrackingHistory(shipmentId: string, limit?: number | string | null) {
     await this.ensureShipmentExists(shipmentId);
 
-    const safeLimit =
-      limit !== undefined && limit !== null && Number.isFinite(Number(limit))
-        ? Math.max(Number(limit), 1)
-        : null;
+    const safeLimit = this.clampInteger(
+      limit,
+      DEFAULT_TRACKING_HISTORY_LIMIT,
+      1,
+      MAX_TRACKING_HISTORY_LIMIT,
+    );
 
+    // Latest N points, newest first (unchanged ordering).
     return this.prisma.trackingPoint.findMany({
       where: { shipmentId },
       orderBy: { recordedAt: 'desc' },
-      ...(safeLimit ? { take: safeLimit } : {}),
+      take: safeLimit,
     });
   }
 
-  async getSnappedTrackingRoute(shipmentId: string): Promise<SnappedRouteResponse> {
+  async getSnappedTrackingRoute(
+    shipmentId: string,
+  ): Promise<SnappedRouteResponse> {
     await this.ensureShipmentExists(shipmentId);
 
-    const trackingPoints = await this.prisma.trackingPoint.findMany({
-      where: { shipmentId },
-      orderBy: { recordedAt: 'asc' },
-      select: {
-        id: true,
-        latitude: true,
-        longitude: true,
-        accuracy: true,
-        recordedAt: true,
-      },
-    });
+    // Bounded read: the latest N points, then back to chronological order.
+    const trackingPoints = (
+      await this.prisma.trackingPoint.findMany({
+        where: { shipmentId },
+        orderBy: { recordedAt: 'desc' },
+        take: MAX_SNAPPED_ROUTE_SOURCE_POINTS,
+        select: {
+          id: true,
+          latitude: true,
+          longitude: true,
+          accuracy: true,
+          recordedAt: true,
+        },
+      })
+    ).reverse();
     const routePoints = this.filterRoutePoints(
       trackingPoints.map((point) => this.toTrackingRoutePoint(point)),
     );
@@ -975,7 +1568,9 @@ export class ShipmentsService {
       return fallbackResponse;
     }
 
-    const hasGoogleDirections = Boolean(process.env.GOOGLE_MAPS_API_KEY?.trim());
+    const hasGoogleDirections = Boolean(
+      process.env.GOOGLE_MAPS_API_KEY?.trim(),
+    );
 
     try {
       const points = hasGoogleDirections
@@ -991,7 +1586,9 @@ export class ShipmentsService {
       this.setSnappedRouteCache(cacheKey, response);
       return response;
     } catch (primaryError) {
-      const providerErrors = [this.toProviderErrorMessage('primary', primaryError)];
+      const providerErrors = [
+        this.toProviderErrorMessage('primary', primaryError),
+      ];
       if (!hasGoogleDirections) {
         fallbackResponse.providerErrors = providerErrors;
         this.setSnappedRouteCache(cacheKey, fallbackResponse);
@@ -1044,8 +1641,9 @@ export class ShipmentsService {
     }
 
     const cacheKey = `${coordinate.latitude.toFixed(6)},${coordinate.longitude.toFixed(6)}`;
-    if (reverseGeocodeCache.has(cacheKey)) {
-      return reverseGeocodeCache.get(cacheKey) ?? null;
+    const cached = reverseGeocodeCache.lookup(cacheKey);
+    if (cached) {
+      return cached.value;
     }
 
     try {
@@ -1054,10 +1652,10 @@ export class ShipmentsService {
         ? await this.reverseGeocodeWithGoogle(coordinate, googleApiKey)
         : await this.reverseGeocodeWithNominatim(coordinate);
 
-      reverseGeocodeCache.set(cacheKey, label);
+      reverseGeocodeCache.setResult(cacheKey, label);
       return label;
     } catch {
-      reverseGeocodeCache.set(cacheKey, null);
+      reverseGeocodeCache.set(cacheKey, null, GEOCODE_ERROR_TTL_MS);
       return null;
     }
   }
@@ -1103,6 +1701,7 @@ export class ShipmentsService {
   async createProofOfDelivery(
     shipmentId: string,
     input: CreateProofOfDeliveryDto,
+    actorUserId?: string | null,
   ) {
     const shipment = await this.ensureShipmentExists(shipmentId);
 
@@ -1112,24 +1711,158 @@ export class ShipmentsService {
       );
     }
 
-    const result = await this.prisma.$transaction(async (tx) => {
-      const proof = await tx.proofOfDelivery.create({
-        data: {
-          organizationId: input.organizationId,
-          shipmentId,
-          proofType: input.proofType,
-          photoDocumentId: input.photoDocumentId,
-          signatureDocumentId: input.signatureDocumentId,
-          receiverName: input.receiverName,
-          receiverPhone: input.receiverPhone,
-          remarks: input.remarks,
-          capturedBy: input.capturedBy,
-        },
-      });
+    const photoDocumentIds = [
+      ...new Set(
+        [input.photoDocumentId, ...(input.photoDocumentIds ?? [])].filter(
+          (id): id is string => Boolean(id),
+        ),
+      ),
+    ];
+    const signatureDocumentId = input.signatureDocumentId ?? null;
 
-      const event = {
-        organizationId: input.organizationId,
+    if (!photoDocumentIds.length && !signatureDocumentId) {
+      throw new BadRequestException(
+        'A photo or signature document is required to record proof.',
+      );
+    }
+
+    // Idempotency: photos/signatures already attached to a proof of this type
+    // are not linked again (driver-app retries after a partial failure).
+    const existingProofs = await this.prisma.proofOfDelivery.findMany({
+      where: {
         shipmentId,
+        proofType: input.proofType,
+        OR: [
+          ...(photoDocumentIds.length
+            ? [{ photoDocumentId: { in: photoDocumentIds } }]
+            : []),
+          ...(signatureDocumentId ? [{ signatureDocumentId }] : []),
+        ],
+      },
+      orderBy: { capturedAt: 'asc' },
+    });
+    const linkedPhotoIds = new Set(
+      existingProofs
+        .map((proof) => proof.photoDocumentId)
+        .filter((id): id is string => Boolean(id)),
+    );
+    const signatureAlreadyLinked = Boolean(
+      signatureDocumentId &&
+      existingProofs.some(
+        (proof) => proof.signatureDocumentId === signatureDocumentId,
+      ),
+    );
+    const newPhotoIds = photoDocumentIds.filter(
+      (id) => !linkedPhotoIds.has(id),
+    );
+
+    if (
+      !newPhotoIds.length &&
+      (!signatureDocumentId || signatureAlreadyLinked)
+    ) {
+      const existingProof =
+        existingProofs.find(
+          (proof) => proof.photoDocumentId === photoDocumentIds[0],
+        ) ??
+        existingProofs.find(
+          (proof) => proof.signatureDocumentId === signatureDocumentId,
+        ) ??
+        existingProofs[0];
+      if (existingProof) {
+        return existingProof;
+      }
+    }
+
+    // Status and document ownership are enforced for anything new that is linked.
+    const allowedStatuses = PROOF_ALLOWED_STATUSES[input.proofType];
+    if (!allowedStatuses.includes(shipment.status)) {
+      throw new ConflictException(
+        input.proofType === ProofType.PICKUP
+          ? `Pickup proof can only be recorded while the shipment is AT_PICKUP (current status: ${shipment.status}).`
+          : `Delivery proof can only be recorded while the shipment is AT_DELIVERY or DELIVERED (current status: ${shipment.status}).`,
+      );
+    }
+
+    const allDocumentIds = [
+      ...new Set([
+        ...photoDocumentIds,
+        ...(signatureDocumentId ? [signatureDocumentId] : []),
+      ]),
+    ];
+    const matchingDocuments = await this.prisma.document.count({
+      where: {
+        id: { in: allDocumentIds },
+        organizationId: shipment.organizationId,
+        status: { not: DocumentStatus.DELETED },
+        OR: [{ shipmentId }, { entityId: shipmentId }],
+      },
+    });
+    if (matchingDocuments !== allDocumentIds.length) {
+      throw new BadRequestException(
+        'One or more proof documents do not belong to this shipment.',
+      );
+    }
+
+    const capturedBy = input.capturedBy ?? actorUserId ?? undefined;
+    const rows: Array<{
+      photoDocumentId: string | null;
+      signatureDocumentId: string | null;
+      remarks: string | undefined;
+    }> = newPhotoIds.length
+      ? newPhotoIds.map((photoDocumentId, index) => ({
+          photoDocumentId,
+          signatureDocumentId:
+            index === 0 && signatureDocumentId && !signatureAlreadyLinked
+              ? signatureDocumentId
+              : null,
+          remarks:
+            index === 0
+              ? input.remarks
+              : `Additional ${input.proofType === ProofType.PICKUP ? 'pickup' : 'delivery'} photo ${index + 1} of ${newPhotoIds.length}.`,
+        }))
+      : [
+          {
+            photoDocumentId: null,
+            signatureDocumentId,
+            remarks: input.remarks,
+          },
+        ];
+
+    const result = await this.prisma.$transaction(async (tx) => {
+      const current = await tx.shipment.findFirst({
+        where: { id: shipmentId, status: { in: allowedStatuses } },
+        select: { id: true },
+      });
+      if (!current) {
+        throw new ConflictException(
+          'The shipment status changed while recording proof. Reload and try again.',
+        );
+      }
+
+      const proofs = [];
+      for (const row of rows) {
+        proofs.push(
+          await tx.proofOfDelivery.create({
+            data: {
+              organizationId: shipment.organizationId,
+              shipmentId,
+              proofType: input.proofType,
+              photoDocumentId: row.photoDocumentId,
+              signatureDocumentId: row.signatureDocumentId,
+              receiverName: input.receiverName,
+              receiverPhone: input.receiverPhone,
+              remarks: row.remarks,
+              capturedBy,
+            },
+          }),
+        );
+      }
+
+      const primaryProof = proofs[0];
+      const event = {
+        organizationId: shipment.organizationId,
+        shipmentId,
+        actorUserId: actorUserId ?? undefined,
         eventType:
           input.proofType === ProofType.PICKUP
             ? 'pickup_proof_uploaded'
@@ -1143,7 +1876,10 @@ export class ShipmentsService {
             : 'Delivery proof recorded',
         metadata: {
           proofType: input.proofType,
-          proofId: proof.id,
+          proofId: primaryProof.id,
+          proofIds: proofs.map((proof) => proof.id),
+          photoDocumentIds,
+          signatureDocumentId,
         },
       };
 
@@ -1152,25 +1888,33 @@ export class ShipmentsService {
       });
 
       return {
-        proof,
+        proof: primaryProof,
         orderEvent: this.toOrderEventMessage(event),
       };
     });
 
-    await this.publishOrderEventSafe(result.orderEvent);
+    this.publishOrderEventSafe(result.orderEvent);
     this.driverRealtimeService.notifyShipmentChange(shipment.currentDriverId, {
       shipmentId,
-      organizationId: input.organizationId,
+      organizationId: shipment.organizationId,
       change: 'proof_added',
     });
     return result.proof;
   }
 
-  async planShipment(shipmentId: string, input: ShipmentStatusActionDto) {
-    return this.confirmShipment(shipmentId, input);
+  async planShipment(
+    shipmentId: string,
+    input: ShipmentStatusActionDto,
+    actorUserId?: string | null,
+  ) {
+    return this.confirmShipment(shipmentId, input, actorUserId);
   }
 
-  async confirmShipment(shipmentId: string, input: ShipmentStatusActionDto) {
+  async confirmShipment(
+    shipmentId: string,
+    input: ShipmentStatusActionDto,
+    actorUserId?: string | null,
+  ) {
     const activeAssignment = await this.prisma.shipmentAssignment.findFirst({
       where: {
         shipmentId,
@@ -1180,208 +1924,223 @@ export class ShipmentsService {
       select: { id: true },
     });
 
-    return this.transitionShipmentStatus(
+    return this.transitionShipmentStatus({
       shipmentId,
-      input.organizationId,
-      activeAssignment ? ShipmentStatus.ASSIGNED : ShipmentStatus.PLANNED,
-      ['shipment_confirmed'],
-      [ShipmentStatus.DRAFT],
-      input.notes ?? 'Shipment confirmed',
-    );
-  }
-
-  async markAtPickup(shipmentId: string, input: ShipmentStatusActionDto) {
-    return this.transitionShipmentStatus(
-      shipmentId,
-      input.organizationId,
-      ShipmentStatus.AT_PICKUP,
-      ['arrived_pickup'],
-      [ShipmentStatus.ASSIGNED, ShipmentStatus.EN_ROUTE_PICKUP],
-      input.notes ?? 'Shipment arrived at pickup',
-      async (tx) => {
-        await tx.shipmentStop.updateMany({
-          where: {
-            shipmentId,
-            stopType: 'PICKUP',
-          },
-          data: {
-            status: StopStatus.ARRIVED,
-            actualArrivalAt: new Date(),
-          },
-        });
-      },
-    );
-  }
-
-  async confirmPickup(shipmentId: string, input: ShipmentStatusActionDto) {
-    return this.transitionShipmentStatus(
-      shipmentId,
-      input.organizationId,
-      ShipmentStatus.PICKED_UP,
-      ['pickup_completed'],
-      [ShipmentStatus.AT_PICKUP],
-      input.notes ?? 'Shipment pickup confirmed',
-      async (tx) => {
-        await tx.shipment.update({
-          where: { id: shipmentId },
-          data: {
-            actualPickupAt: new Date(),
-          },
-        });
-        await tx.shipmentStop.updateMany({
-          where: {
-            shipmentId,
-            stopType: 'PICKUP',
-          },
-          data: {
-            status: StopStatus.COMPLETED,
-            actualDepartureAt: new Date(),
-          },
-        });
-      },
-    );
-  }
-
-  async markInTransit(shipmentId: string, input: ShipmentStatusActionDto) {
-    return this.transitionShipmentStatus(
-      shipmentId,
-      input.organizationId,
-      ShipmentStatus.IN_TRANSIT,
-      ['shipment_in_transit'],
-      [ShipmentStatus.PICKED_UP, ShipmentStatus.AT_PICKUP],
-      input.notes ?? 'Shipment marked in transit',
-    );
-  }
-
-  async markAtDelivery(shipmentId: string, input: ShipmentStatusActionDto) {
-    return this.transitionShipmentStatus(
-      shipmentId,
-      input.organizationId,
-      ShipmentStatus.AT_DELIVERY,
-      ['arrived_delivery'],
-      [ShipmentStatus.IN_TRANSIT, ShipmentStatus.PICKED_UP],
-      input.notes ?? 'Shipment arrived at delivery',
-      async (tx) => {
-        await tx.shipmentStop.updateMany({
-          where: {
-            shipmentId,
-            stopType: 'DELIVERY',
-          },
-          data: {
-            status: StopStatus.ARRIVED,
-            actualArrivalAt: new Date(),
-          },
-        });
-      },
-    );
-  }
-
-  async completeDelivery(shipmentId: string, input: ShipmentStatusActionDto) {
-    const deliveryProofCount = await this.prisma.proofOfDelivery.count({
-      where: {
-        shipmentId,
-        organizationId: input.organizationId,
-        proofType: ProofType.DELIVERY,
-      },
+      organizationId: input.organizationId,
+      nextStatus: activeAssignment
+        ? ShipmentStatus.ASSIGNED
+        : ShipmentStatus.PLANNED,
+      eventType: 'shipment_confirmed',
+      allowedFromStatuses: [ShipmentStatus.DRAFT],
+      notes: input.notes ?? 'Shipment confirmed',
+      actorUserId,
     });
-
-    if (deliveryProofCount === 0) {
-      throw new BadRequestException(
-        'At least one delivery proof is required before completing delivery',
-      );
-    }
-
-    return this.transitionShipmentStatus(
-      shipmentId,
-      input.organizationId,
-      ShipmentStatus.DELIVERED,
-      ['delivery_completed'],
-      [ShipmentStatus.AT_DELIVERY],
-      input.notes ?? 'Shipment delivery completed',
-      async (tx) => {
-        await tx.shipment.update({
-          where: { id: shipmentId },
-          data: {
-            actualDeliveryAt: new Date(),
-          },
-        });
-        await tx.shipmentStop.updateMany({
-          where: {
-            shipmentId,
-            stopType: 'DELIVERY',
-          },
-          data: {
-            status: StopStatus.COMPLETED,
-            actualDepartureAt: new Date(),
-          },
-        });
-        await this.closeTrackingSession(tx, shipmentId);
-      },
-    );
   }
 
-  async completeShipment(shipmentId: string, input: ShipmentStatusActionDto) {
-    return this.transitionShipmentStatus(
+  async markAtPickup(
+    shipmentId: string,
+    input: ShipmentStatusActionDto,
+    actorUserId?: string | null,
+  ) {
+    return this.transitionShipmentStatus({
       shipmentId,
-      input.organizationId,
-      ShipmentStatus.COMPLETED,
-      ['shipment_completed'],
-      [ShipmentStatus.DELIVERED],
-      input.notes ?? 'Shipment completed',
-    );
-  }
-
-  async failShipment(shipmentId: string, input: FailShipmentDto) {
-    return this.transitionShipmentStatus(
-      shipmentId,
-      input.organizationId,
-      ShipmentStatus.FAILED,
-      ['shipment_failed'],
-      [
+      organizationId: input.organizationId,
+      nextStatus: ShipmentStatus.AT_PICKUP,
+      eventType: 'arrived_pickup',
+      allowedFromStatuses: [
         ShipmentStatus.ASSIGNED,
         ShipmentStatus.EN_ROUTE_PICKUP,
-        ShipmentStatus.AT_PICKUP,
-        ShipmentStatus.PICKED_UP,
-        ShipmentStatus.IN_TRANSIT,
-        ShipmentStatus.AT_DELIVERY,
       ],
-      input.notes ?? input.reason,
-      async (tx) => {
-        await this.closeTrackingSession(tx, shipmentId);
+      notes: input.notes ?? 'Shipment arrived at pickup',
+      actorUserId,
+      afterUpdate: async (tx) => {
+        await this.markStops(tx, shipmentId, StopType.PICKUP, 'arrived');
       },
-      {
-        reason: input.reason,
-      },
-    );
+    });
   }
 
-  async cancelShipment(shipmentId: string, input: ShipmentStatusActionDto) {
-    return this.transitionShipmentStatus(
+  async confirmPickup(
+    shipmentId: string,
+    input: ShipmentStatusActionDto,
+    actorUserId?: string | null,
+  ) {
+    await this.assertProofExists(
       shipmentId,
       input.organizationId,
-      ShipmentStatus.CANCELLED,
-      ['shipment_cancelled'],
-      [ShipmentStatus.DRAFT, ShipmentStatus.PLANNED, ShipmentStatus.ASSIGNED],
-      input.notes ?? 'Shipment cancelled',
-      async (tx) => {
-        await tx.shipmentAssignment.updateMany({
-          where: {
-            shipmentId,
-            assignmentStatus: ShipmentAssignmentStatus.ACTIVE,
-          },
-          data: {
-            assignmentStatus: ShipmentAssignmentStatus.CANCELLED,
-            unassignedAt: new Date(),
-          },
-        });
-        await this.closeTrackingSession(tx, shipmentId);
-      },
+      ProofType.PICKUP,
     );
+
+    return this.transitionShipmentStatus({
+      shipmentId,
+      organizationId: input.organizationId,
+      nextStatus: ShipmentStatus.PICKED_UP,
+      eventType: 'pickup_completed',
+      allowedFromStatuses: [ShipmentStatus.AT_PICKUP],
+      notes: input.notes ?? 'Shipment pickup confirmed',
+      actorUserId,
+      extraData: { actualPickupAt: new Date() },
+      afterUpdate: async (tx) => {
+        await this.markStops(tx, shipmentId, StopType.PICKUP, 'completed');
+      },
+    });
+  }
+
+  async markInTransit(
+    shipmentId: string,
+    input: ShipmentStatusActionDto,
+    actorUserId?: string | null,
+  ) {
+    // AT_PICKUP must go through confirm-pickup (which requires pickup proof).
+    return this.transitionShipmentStatus({
+      shipmentId,
+      organizationId: input.organizationId,
+      nextStatus: ShipmentStatus.IN_TRANSIT,
+      eventType: 'shipment_in_transit',
+      allowedFromStatuses: [ShipmentStatus.PICKED_UP],
+      notes: input.notes ?? 'Shipment marked in transit',
+      actorUserId,
+    });
+  }
+
+  async markAtDelivery(
+    shipmentId: string,
+    input: ShipmentStatusActionDto,
+    actorUserId?: string | null,
+  ) {
+    return this.transitionShipmentStatus({
+      shipmentId,
+      organizationId: input.organizationId,
+      nextStatus: ShipmentStatus.AT_DELIVERY,
+      eventType: 'arrived_delivery',
+      allowedFromStatuses: [
+        ShipmentStatus.IN_TRANSIT,
+        ShipmentStatus.PICKED_UP,
+      ],
+      notes: input.notes ?? 'Shipment arrived at delivery',
+      actorUserId,
+      afterUpdate: async (tx) => {
+        await this.markStops(tx, shipmentId, StopType.DELIVERY, 'arrived');
+      },
+    });
+  }
+
+  async completeDelivery(
+    shipmentId: string,
+    input: ShipmentStatusActionDto,
+    actorUserId?: string | null,
+  ) {
+    await this.assertProofExists(
+      shipmentId,
+      input.organizationId,
+      ProofType.DELIVERY,
+    );
+
+    return this.transitionShipmentStatus({
+      shipmentId,
+      organizationId: input.organizationId,
+      nextStatus: ShipmentStatus.DELIVERED,
+      eventType: 'delivery_completed',
+      allowedFromStatuses: [ShipmentStatus.AT_DELIVERY],
+      notes: input.notes ?? 'Shipment delivery completed',
+      actorUserId,
+      extraData: { actualDeliveryAt: new Date() },
+      afterUpdate: async (tx) => {
+        await this.markStops(tx, shipmentId, StopType.DELIVERY, 'completed');
+        await this.closeTrackingSession(tx, shipmentId);
+        await this.closeActiveAssignments(
+          tx,
+          shipmentId,
+          ShipmentAssignmentStatus.CLOSED,
+        );
+      },
+    });
+  }
+
+  async completeShipment(
+    shipmentId: string,
+    input: ShipmentStatusActionDto,
+    actorUserId?: string | null,
+  ) {
+    return this.transitionShipmentStatus({
+      shipmentId,
+      organizationId: input.organizationId,
+      nextStatus: ShipmentStatus.COMPLETED,
+      eventType: 'shipment_completed',
+      allowedFromStatuses: [ShipmentStatus.DELIVERED],
+      notes: input.notes ?? 'Shipment completed',
+      actorUserId,
+      afterUpdate: async (tx) => {
+        await this.closeTrackingSession(tx, shipmentId);
+        await this.closeActiveAssignments(
+          tx,
+          shipmentId,
+          ShipmentAssignmentStatus.CLOSED,
+        );
+      },
+    });
+  }
+
+  async failShipment(
+    shipmentId: string,
+    input: FailShipmentDto,
+    actorUserId?: string | null,
+  ) {
+    return this.transitionShipmentStatus({
+      shipmentId,
+      organizationId: input.organizationId,
+      nextStatus: ShipmentStatus.FAILED,
+      eventType: 'shipment_failed',
+      allowedFromStatuses: FAILABLE_STATUSES,
+      notes: input.notes ?? input.reason,
+      actorUserId,
+      afterUpdate: async (tx) => {
+        await this.closeTrackingSession(tx, shipmentId);
+        await this.closeActiveAssignments(
+          tx,
+          shipmentId,
+          ShipmentAssignmentStatus.CLOSED,
+        );
+      },
+      metadata: {
+        reason: input.reason,
+      },
+    });
+  }
+
+  async cancelShipment(
+    shipmentId: string,
+    input: ShipmentStatusActionDto,
+    actorUserId?: string | null,
+  ) {
+    return this.transitionShipmentStatus({
+      shipmentId,
+      organizationId: input.organizationId,
+      nextStatus: ShipmentStatus.CANCELLED,
+      eventType: 'shipment_cancelled',
+      allowedFromStatuses: CANCELLABLE_STATUSES,
+      notes: input.notes ?? 'Shipment cancelled',
+      actorUserId,
+      // Release the driver and vehicle for other work.
+      extraData: { currentDriverId: null, currentVehicleId: null },
+      afterUpdate: async (tx) => {
+        await this.closeActiveAssignments(
+          tx,
+          shipmentId,
+          ShipmentAssignmentStatus.CANCELLED,
+        );
+        await this.closeTrackingSession(
+          tx,
+          shipmentId,
+          TrackingSessionStatus.CANCELLED,
+        );
+      },
+    });
   }
 
   async manuallyUpdateShipmentStatus(
     shipmentId: string,
     input: ManualShipmentStatusDto,
+    actorUserId?: string | null,
   ) {
     const shipment = await this.ensureShipmentExists(shipmentId);
 
@@ -1399,114 +2158,121 @@ export class ShipmentsService {
       return this.getShipmentById(shipmentId);
     }
 
-    const result = await this.prisma.$transaction(async (tx) => {
-      const now = new Date();
-      const shipmentUpdate: Prisma.ShipmentUpdateInput = {
-        status: input.status,
-      };
-      const pickupStartedStatuses = new Set<ShipmentStatus>([
-        ShipmentStatus.PICKED_UP,
-        ShipmentStatus.IN_TRANSIT,
-      ]);
-      const deliveryCompletedStatuses = new Set<ShipmentStatus>([
-        ShipmentStatus.DELIVERED,
-        ShipmentStatus.COMPLETED,
-      ]);
-      const terminalStatuses = new Set<ShipmentStatus>([
-        ShipmentStatus.DELIVERED,
-        ShipmentStatus.COMPLETED,
-        ShipmentStatus.FAILED,
-        ShipmentStatus.CANCELLED,
-      ]);
-      const pickupStopStatuses = new Set<ShipmentStatus>([
-        ShipmentStatus.AT_PICKUP,
-        ShipmentStatus.PICKED_UP,
-      ]);
-      const deliveryStopStatuses = new Set<ShipmentStatus>([
-        ShipmentStatus.AT_DELIVERY,
-        ShipmentStatus.DELIVERED,
-        ShipmentStatus.COMPLETED,
-      ]);
+    const target = input.status;
+    if (!MANUAL_STATUS_TRANSITIONS[shipment.status].includes(target)) {
+      const allowed = MANUAL_STATUS_TRANSITIONS[shipment.status];
+      throw new ConflictException(
+        allowed.length
+          ? `Shipment cannot move from ${shipment.status} to ${target}. Allowed: ${allowed.join(', ')}.`
+          : `Shipment is ${shipment.status} and its status can no longer be changed.`,
+      );
+    }
 
-      if (pickupStartedStatuses.has(input.status) && !shipment.actualPickupAt) {
-        shipmentUpdate.actualPickupAt = now;
-      }
+    if (
+      DRIVER_REQUIRED_STATUSES.includes(target) &&
+      !shipment.currentDriverId
+    ) {
+      throw new BadRequestException(
+        `Assign a driver before moving the shipment to ${target}.`,
+      );
+    }
 
-      if (deliveryCompletedStatuses.has(input.status) && !shipment.actualDeliveryAt) {
-        shipmentUpdate.actualDeliveryAt = now;
-      }
-
-      if (terminalStatuses.has(input.status)) {
-        await this.closeTrackingSession(tx, shipmentId);
-      }
-
-      await tx.shipment.update({
-        where: { id: shipmentId },
-        data: shipmentUpdate,
-      });
-
-      if (pickupStopStatuses.has(input.status)) {
-        await tx.shipmentStop.updateMany({
-          where: { shipmentId, stopType: StopType.PICKUP },
-          data: {
-            status:
-              input.status === ShipmentStatus.PICKED_UP
-                ? StopStatus.COMPLETED
-                : StopStatus.ARRIVED,
-            actualArrivalAt: now,
-            actualDepartureAt:
-              input.status === ShipmentStatus.PICKED_UP ? now : undefined,
-          },
-        });
-      }
-
-      if (deliveryStopStatuses.has(input.status)) {
-        await tx.shipmentStop.updateMany({
-          where: { shipmentId, stopType: StopType.DELIVERY },
-          data: {
-            status:
-              input.status === ShipmentStatus.AT_DELIVERY
-                ? StopStatus.ARRIVED
-                : StopStatus.COMPLETED,
-            actualArrivalAt: now,
-            actualDepartureAt:
-              input.status === ShipmentStatus.AT_DELIVERY ? undefined : now,
-          },
-        });
-      }
-
-      const event = {
-        organizationId: input.organizationId,
+    if (target === ShipmentStatus.PICKED_UP) {
+      await this.assertProofExists(
         shipmentId,
-        eventType: 'shipment_status_manual_update',
-        fromStatus: shipment.status,
-        toStatus: input.status,
-        source: EventSource.ADMIN,
-        notes: input.notes || `Status manually changed to ${input.status}`,
-        metadata: {
-          manual: true,
-        },
-      };
+        input.organizationId,
+        ProofType.PICKUP,
+      );
+    }
 
-      await tx.shipmentStatusEvent.create({
-        data: event,
-      });
+    if (target === ShipmentStatus.DELIVERED) {
+      await this.assertProofExists(
+        shipmentId,
+        input.organizationId,
+        ProofType.DELIVERY,
+      );
+    }
 
-      return {
-        orderEvent: this.toOrderEventMessage(event),
-      };
-    });
+    const now = new Date();
 
-    await this.publishOrderEventSafe(result.orderEvent);
-    this.driverRealtimeService.notifyShipmentChange(shipment.currentDriverId, {
+    await this.transitionShipmentStatus({
       shipmentId,
       organizationId: input.organizationId,
-      change: 'status_changed',
+      nextStatus: target,
+      eventType: 'shipment_status_manual_update',
+      // Guard on the exact status validated above.
+      allowedFromStatuses: [shipment.status],
+      notes: input.notes || `Status manually changed to ${target}`,
+      actorUserId,
+      source: EventSource.ADMIN,
+      metadata: { manual: true },
+      extraData:
+        target === ShipmentStatus.CANCELLED
+          ? { currentDriverId: null, currentVehicleId: null }
+          : undefined,
+      afterUpdate: async (tx) => {
+        if (
+          target === ShipmentStatus.PICKED_UP ||
+          target === ShipmentStatus.IN_TRANSIT ||
+          target === ShipmentStatus.AT_DELIVERY
+        ) {
+          await tx.shipment.updateMany({
+            where: { id: shipmentId, actualPickupAt: null },
+            data: { actualPickupAt: now },
+          });
+        }
+
+        if (target === ShipmentStatus.DELIVERED) {
+          await tx.shipment.updateMany({
+            where: { id: shipmentId, actualDeliveryAt: null },
+            data: { actualDeliveryAt: now },
+          });
+        }
+
+        if (target === ShipmentStatus.AT_PICKUP) {
+          await this.markStops(tx, shipmentId, StopType.PICKUP, 'arrived');
+        }
+        if (target === ShipmentStatus.PICKED_UP) {
+          await this.markStops(tx, shipmentId, StopType.PICKUP, 'completed');
+        }
+        if (target === ShipmentStatus.AT_DELIVERY) {
+          await this.markStops(tx, shipmentId, StopType.DELIVERY, 'arrived');
+        }
+        if (target === ShipmentStatus.DELIVERED) {
+          await this.markStops(tx, shipmentId, StopType.DELIVERY, 'completed');
+        }
+
+        if (target === ShipmentStatus.CANCELLED) {
+          await this.closeActiveAssignments(
+            tx,
+            shipmentId,
+            ShipmentAssignmentStatus.CANCELLED,
+          );
+          await this.closeTrackingSession(
+            tx,
+            shipmentId,
+            TrackingSessionStatus.CANCELLED,
+          );
+        } else if (TERMINAL_SHIPMENT_STATUSES.includes(target)) {
+          await this.closeTrackingSession(tx, shipmentId);
+          await this.closeActiveAssignments(
+            tx,
+            shipmentId,
+            ShipmentAssignmentStatus.CLOSED,
+          );
+        }
+      },
     });
+
     return this.getShipmentById(shipmentId);
   }
 
-  async deleteShipment(shipmentId: string, organizationId: string) {
+  async deleteShipment(
+    shipmentId: string,
+    organizationId: string,
+    reason?: string | null,
+    deletedByUserId?: string | null,
+  ) {
     const shipment = await this.ensureShipmentExists(shipmentId);
 
     if (shipment.organizationId !== organizationId) {
@@ -1515,13 +2281,13 @@ export class ShipmentsService {
       );
     }
 
-    const deletableStatuses = new Set<ShipmentStatus>([
+    const deletableStatuses: ShipmentStatus[] = [
       ShipmentStatus.DRAFT,
       ShipmentStatus.PLANNED,
       ShipmentStatus.CANCELLED,
-    ]);
+    ];
 
-    if (!deletableStatuses.has(shipment.status)) {
+    if (!deletableStatuses.includes(shipment.status)) {
       throw new BadRequestException(
         'Only draft, planned, or cancelled shipments can be deleted',
       );
@@ -1547,6 +2313,17 @@ export class ShipmentsService {
     }
 
     await this.prisma.$transaction(async (tx) => {
+      await tx.deletionAudit.create({
+        data: {
+          organizationId,
+          entityType: 'SHIPMENT',
+          entityId: shipment.id,
+          entityLabel: shipment.shipmentCode,
+          reason: reason?.trim() || 'Shipment deleted',
+          deletedByUserId: deletedByUserId ?? undefined,
+        },
+      });
+
       await tx.document.deleteMany({
         where: {
           OR: [
@@ -1559,9 +2336,15 @@ export class ShipmentsService {
         },
       });
 
-      await tx.shipment.delete({
-        where: { id: shipmentId },
+      const deleted = await tx.shipment.deleteMany({
+        where: { id: shipmentId, status: { in: deletableStatuses } },
       });
+
+      if (deleted.count === 0) {
+        throw new ConflictException(
+          'The shipment status changed and it can no longer be deleted.',
+        );
+      }
     });
 
     return {
@@ -1611,6 +2394,52 @@ export class ShipmentsService {
       );
     } catch {
       // A notification failure must not roll back a successfully saved shipment.
+    }
+  }
+
+  // Pickup can come from another client (client-to-client shipments), so the
+  // source/destination may be any client location, but never one that belongs
+  // to a different organization.
+  private async assertShipmentLocationsBelongToOrganization(
+    input: CreateShipmentDto,
+  ) {
+    const locationIds = [
+      input.sourceLocationId,
+      input.destinationLocationId,
+    ].filter((id): id is string => Boolean(id));
+    if (!locationIds.length) return;
+
+    const matches = await this.prisma.companyClientLocation.count({
+      where: {
+        id: { in: locationIds },
+        organizationId: input.organizationId,
+      },
+    });
+
+    if (matches !== new Set(locationIds).size) {
+      throw new BadRequestException(
+        'Pickup or delivery location does not belong to this organization',
+      );
+    }
+  }
+
+  private async assertCompanyClientBelongsToOrganization(
+    organizationId: string,
+    companyClientId?: string | null,
+  ) {
+    if (!companyClientId) {
+      return;
+    }
+
+    const client = await this.prisma.companyClient.findFirst({
+      where: { id: companyClientId, organizationId },
+      select: { id: true },
+    });
+
+    if (!client) {
+      throw new BadRequestException(
+        'The selected client does not belong to this organization',
+      );
     }
   }
 
@@ -1668,6 +2497,41 @@ export class ShipmentsService {
     }
   }
 
+  private validatePlannedDates(
+    plannedPickupAt?: string | null,
+    plannedDeliveryAt?: string | null,
+  ) {
+    if (!plannedPickupAt || !plannedDeliveryAt) {
+      return;
+    }
+
+    const pickup = new Date(plannedPickupAt).getTime();
+    const delivery = new Date(plannedDeliveryAt).getTime();
+
+    if (
+      Number.isFinite(pickup) &&
+      Number.isFinite(delivery) &&
+      delivery < pickup
+    ) {
+      throw new BadRequestException(
+        'plannedDeliveryAt must be the same as or later than plannedPickupAt',
+      );
+    }
+  }
+
+  private assertUniqueStopSequences(stops?: CreateShipmentStopDto[]) {
+    if (!stops?.length) {
+      return;
+    }
+
+    const sequences = stops.map((stop) => stop.stopSequence);
+    if (new Set(sequences).size !== sequences.length) {
+      throw new BadRequestException(
+        'Each stop must have a unique stopSequence',
+      );
+    }
+  }
+
   private async generateShipmentCode(organizationId: string) {
     const organization = await this.prisma.organization.findUnique({
       where: { id: organizationId },
@@ -1680,7 +2544,7 @@ export class ShipmentsService {
 
     const prefix = buildBusinessPrefix(organization.name);
     const existingCodes = await this.prisma.shipment.findMany({
-      where: { organizationId },
+      where: { organizationId, shipmentCode: { startsWith: `${prefix}-SHP-` } },
       select: { shipmentCode: true },
     });
     const nextSequence =
@@ -1696,72 +2560,68 @@ export class ShipmentsService {
     return formatRollingAlphaCode(prefix, 'SHP', nextSequence);
   }
 
-  private async normalizeShipmentCodes(organizationId: string) {
-    const organization = await this.prisma.organization.findUnique({
-      where: { id: organizationId },
-      select: { name: true },
+  private async isInvoiceNumberTaken(
+    organizationId: string,
+    invoiceNumber?: string | null,
+    excludeShipmentId?: string,
+  ) {
+    if (!invoiceNumber) {
+      return false;
+    }
+
+    const match = await this.prisma.shipment.findFirst({
+      where: {
+        organizationId,
+        invoiceNumber,
+        ...(excludeShipmentId ? { id: { not: excludeShipmentId } } : {}),
+      },
+      select: { id: true },
     });
 
-    if (!organization) {
-      throw new BadRequestException('Organization not found');
-    }
-
-    const prefix = buildBusinessPrefix(organization.name);
-    const shipments = await this.prisma.shipment.findMany({
-      where: { organizationId },
-      orderBy: { createdAt: 'asc' },
-      select: { id: true, shipmentCode: true },
-    });
-    const usedSequences = new Set<number>();
-
-    for (const shipment of shipments) {
-      const parsedSequence = parseRollingAlphaCodeSequence(
-        shipment.shipmentCode,
-        prefix,
-        'SHP',
-      );
-
-      if (parsedSequence !== null) {
-        usedSequences.add(parsedSequence);
-      }
-    }
-
-    for (const shipment of shipments) {
-      const parsedSequence = parseRollingAlphaCodeSequence(
-        shipment.shipmentCode,
-        prefix,
-        'SHP',
-      );
-
-      if (parsedSequence !== null) {
-        continue;
-      }
-
-      let nextSequence = 0;
-      while (usedSequences.has(nextSequence)) {
-        nextSequence += 1;
-      }
-
-      await this.prisma.shipment.update({
-        where: { id: shipment.id },
-        data: {
-          shipmentCode: formatRollingAlphaCode(prefix, 'SHP', nextSequence),
-        },
-      });
-      usedSequences.add(nextSequence);
-    }
+    return Boolean(match);
   }
 
-  private async transitionShipmentStatus(
-    shipmentId: string,
+  /** Converts unique violations into a readable 409; rethrows anything else. */
+  private async rethrowUniqueViolation(
+    error: unknown,
     organizationId: string,
-    nextStatus: ShipmentStatus,
-    eventTypes: string[],
-    allowedFromStatuses: ShipmentStatus[],
-    notes: string,
-    afterUpdate?: (tx: Prisma.TransactionClient) => Promise<void>,
-    metadata?: Prisma.InputJsonValue,
-  ) {
+    invoiceNumber?: string | null,
+    excludeShipmentId?: string,
+  ): Promise<never> {
+    if (!isUniqueConstraintViolation(error)) {
+      throw error;
+    }
+
+    if (
+      await this.isInvoiceNumberTaken(
+        organizationId,
+        invoiceNumber,
+        excludeShipmentId,
+      )
+    ) {
+      throw new ConflictException(
+        `Invoice number ${invoiceNumber} is already used by another shipment in this organization`,
+      );
+    }
+
+    throw new ConflictException(
+      'A shipment with the same code already exists. Please retry or use a different code.',
+    );
+  }
+
+  private async transitionShipmentStatus(options: TransitionOptions) {
+    const {
+      shipmentId,
+      organizationId,
+      nextStatus,
+      eventType,
+      allowedFromStatuses,
+      notes,
+      actorUserId,
+      afterUpdate,
+      metadata,
+      extraData,
+    } = options;
     const shipment = await this.ensureShipmentExists(shipmentId);
 
     if (shipment.organizationId !== organizationId) {
@@ -1771,18 +2631,31 @@ export class ShipmentsService {
     }
 
     if (!allowedFromStatuses.includes(shipment.status)) {
-      throw new BadRequestException(
+      throw new ConflictException(
         `Shipment cannot move from ${shipment.status} to ${nextStatus}`,
       );
     }
 
     const result = await this.prisma.$transaction(async (tx) => {
-      await tx.shipment.update({
-        where: { id: shipmentId },
+      // Guarded transition: only succeeds if the status is still one of the
+      // allowed source statuses at write time.
+      const guard = await tx.shipment.updateMany({
+        where: {
+          id: shipmentId,
+          organizationId,
+          status: { in: allowedFromStatuses },
+        },
         data: {
+          ...(extraData ?? {}),
           status: nextStatus,
         },
       });
+
+      if (guard.count === 0) {
+        throw new ConflictException(
+          `Shipment status changed concurrently; it can no longer move to ${nextStatus}. Reload and try again.`,
+        );
+      }
 
       if (afterUpdate) {
         await afterUpdate(tx);
@@ -1791,11 +2664,12 @@ export class ShipmentsService {
       const event = {
         organizationId,
         shipmentId,
-        eventType: eventTypes[0],
+        actorUserId: actorUserId ?? undefined,
+        eventType,
         fromStatus: shipment.status,
         toStatus: nextStatus,
-        source: EventSource.API,
-        notes,
+        source: options.source ?? EventSource.API,
+        notes: notes ?? null,
         metadata,
       };
 
@@ -1820,48 +2694,134 @@ export class ShipmentsService {
       });
 
       return {
-        shipmentDetails: shipmentDetails
-          ? await this.enrichShipmentCoordinates(shipmentDetails)
-          : null,
+        shipmentDetails,
         orderEvent: this.toOrderEventMessage(event),
       };
     });
 
-    await this.publishOrderEventSafe(result.orderEvent);
+    this.publishOrderEventSafe(result.orderEvent);
     this.driverRealtimeService.notifyShipmentChange(shipment.currentDriverId, {
       shipmentId,
       organizationId,
       change: 'status_changed',
     });
-    return result.shipmentDetails;
+
+    // Coordinates are resolved after the transaction from stored data only, so
+    // an external geocoder can never stall or roll back a status change.
+    return result.shipmentDetails
+      ? this.toStoredCoordinateResponse(result.shipmentDetails)
+      : null;
+  }
+
+  private async assertProofExists(
+    shipmentId: string,
+    organizationId: string,
+    proofType: ProofType,
+  ) {
+    const proofCount = await this.prisma.proofOfDelivery.count({
+      where: {
+        shipmentId,
+        organizationId,
+        proofType,
+      },
+    });
+
+    if (proofCount === 0) {
+      throw new BadRequestException(
+        proofType === ProofType.PICKUP
+          ? 'Pickup proof is required before confirming pickup'
+          : 'At least one delivery proof is required before completing delivery',
+      );
+    }
+  }
+
+  private async markStops(
+    tx: Prisma.TransactionClient,
+    shipmentId: string,
+    stopType: StopType,
+    stage: 'arrived' | 'completed',
+  ) {
+    const now = new Date();
+
+    if (stage === 'arrived') {
+      await tx.shipmentStop.updateMany({
+        where: { shipmentId, stopType },
+        data: { status: StopStatus.ARRIVED },
+      });
+      await tx.shipmentStop.updateMany({
+        where: { shipmentId, stopType, actualArrivalAt: null },
+        data: { actualArrivalAt: now },
+      });
+      return;
+    }
+
+    await tx.shipmentStop.updateMany({
+      where: { shipmentId, stopType },
+      data: { status: StopStatus.COMPLETED, actualDepartureAt: now },
+    });
+    await tx.shipmentStop.updateMany({
+      where: { shipmentId, stopType, actualArrivalAt: null },
+      data: { actualArrivalAt: now },
+    });
   }
 
   private async closeTrackingSession(
     tx: Prisma.TransactionClient,
     shipmentId: string,
+    status: TrackingSessionStatus = TrackingSessionStatus.COMPLETED,
   ) {
-    const shipment = await tx.shipment.findUnique({
-      where: { id: shipmentId },
-    });
-
-    if (!shipment?.currentTrackingSessionId) {
-      return;
-    }
-
-    await tx.trackingSession.update({
-      where: { id: shipment.currentTrackingSessionId },
+    await tx.trackingSession.updateMany({
+      where: { shipmentId, status: TrackingSessionStatus.ACTIVE },
       data: {
-        status: TrackingSessionStatus.COMPLETED,
+        status,
         endedAt: new Date(),
       },
     });
 
-    await tx.shipment.update({
-      where: { id: shipmentId },
+    await tx.shipment.updateMany({
+      where: { id: shipmentId, currentTrackingSessionId: { not: null } },
       data: {
         currentTrackingSessionId: null,
       },
     });
+  }
+
+  private async closeActiveAssignments(
+    tx: Prisma.TransactionClient,
+    shipmentId: string,
+    status: ShipmentAssignmentStatus,
+  ) {
+    await tx.shipmentAssignment.updateMany({
+      where: {
+        shipmentId,
+        assignmentStatus: ShipmentAssignmentStatus.ACTIVE,
+      },
+      data: {
+        assignmentStatus: status,
+        unassignedAt: new Date(),
+      },
+    });
+  }
+
+  private async findActiveSessionForDriver(
+    trackingSessionId: string | null,
+    shipmentId: string,
+    driverId: string,
+  ) {
+    if (!trackingSessionId) {
+      return null;
+    }
+
+    const session = await this.prisma.trackingSession.findUnique({
+      where: { id: trackingSessionId },
+    });
+
+    return session &&
+      session.status === TrackingSessionStatus.ACTIVE &&
+      session.shipmentId === shipmentId &&
+      session.driverId === driverId
+      ? session
+      : null;
   }
 
   private async ensureShipmentExists(id: string) {
@@ -1906,6 +2866,533 @@ export class ShipmentsService {
     return vehicle;
   }
 
+  // ---------------------------------------------------------------------------
+  // Update helpers (stops / items / route coordinates / snapshots)
+  // ---------------------------------------------------------------------------
+
+  private toItemCreateData(
+    organizationId: string,
+    item: CreateShipmentItemDto,
+  ) {
+    return {
+      organizationId,
+      description: item.description,
+      quantity: new Prisma.Decimal(item.quantity),
+      unit: item.unit,
+      weight:
+        item.weight !== undefined ? new Prisma.Decimal(item.weight) : undefined,
+      volume:
+        item.volume !== undefined ? new Prisma.Decimal(item.volume) : undefined,
+      declaredValue:
+        item.declaredValue !== undefined
+          ? new Prisma.Decimal(item.declaredValue)
+          : undefined,
+    };
+  }
+
+  private toStopCreateData(
+    organizationId: string,
+    stop: CreateShipmentStopDto,
+  ) {
+    return {
+      organizationId,
+      stopSequence: stop.stopSequence,
+      stopType: stop.stopType,
+      locationName: stop.locationName,
+      addressLine1: stop.addressLine1,
+      addressLine2: stop.addressLine2,
+      city: stop.city,
+      state: stop.state,
+      postalCode: stop.postalCode,
+      country: stop.country ?? 'India',
+      plannedArrivalAt: stop.plannedArrivalAt
+        ? new Date(stop.plannedArrivalAt)
+        : undefined,
+      plannedDepartureAt: stop.plannedDepartureAt
+        ? new Date(stop.plannedDepartureAt)
+        : undefined,
+      status: StopStatus.PENDING,
+    };
+  }
+
+  private toStopDto(stop: ExistingStop): CreateShipmentStopDto {
+    return {
+      stopSequence: stop.stopSequence,
+      stopType: stop.stopType,
+      locationName: stop.locationName,
+      addressLine1: stop.addressLine1 ?? undefined,
+      addressLine2: stop.addressLine2 ?? undefined,
+      city: stop.city ?? undefined,
+      state: stop.state ?? undefined,
+      postalCode: stop.postalCode ?? undefined,
+      country: stop.country ?? undefined,
+      plannedArrivalAt: stop.plannedArrivalAt?.toISOString(),
+      plannedDepartureAt: stop.plannedDepartureAt?.toISOString(),
+    };
+  }
+
+  private stopAddressKey(stop: {
+    stopType: string;
+    locationName?: string | null;
+    addressLine1?: string | null;
+    addressLine2?: string | null;
+    city?: string | null;
+    state?: string | null;
+    postalCode?: string | null;
+    country?: string | null;
+  }) {
+    const normalize = (value: unknown) => textOf(value).trim().toLowerCase();
+
+    return [
+      stop.stopType,
+      normalize(stop.locationName),
+      normalize(stop.addressLine1),
+      normalize(stop.addressLine2),
+      normalize(stop.city),
+      normalize(stop.state),
+      normalize(stop.postalCode),
+      normalize(stop.country || 'India'),
+    ].join('|');
+  }
+
+  private planStopChanges(
+    existingStops: ExistingStop[],
+    inputStops: CreateShipmentStopDto[],
+  ): StopChangePlan {
+    const existingBySequence = new Map(
+      existingStops.map((stop) => [stop.stopSequence, stop]),
+    );
+    const locationChanged =
+      existingStops.length !== inputStops.length ||
+      inputStops.some((stop) => {
+        const current = existingBySequence.get(stop.stopSequence);
+        return (
+          !current || this.stopAddressKey(current) !== this.stopAddressKey(stop)
+        );
+      });
+
+    const sideKey = (
+      stops: Array<Parameters<ShipmentsService['stopAddressKey']>[0]>,
+      side: RouteSide,
+    ) => {
+      const stop = stops.find((candidate) => candidate.stopType === side);
+      return stop ? this.stopAddressKey(stop) : '';
+    };
+
+    return {
+      locationChanged,
+      pickupChanged:
+        sideKey(existingStops, 'PICKUP') !== sideKey(inputStops, 'PICKUP'),
+      deliveryChanged:
+        sideKey(existingStops, 'DELIVERY') !== sideKey(inputStops, 'DELIVERY'),
+    };
+  }
+
+  /**
+   * Applies stop edits in place (matched by stopSequence) so arrival/departure
+   * progress survives edits that do not change the stop's address. Stops whose
+   * address changes are reset to PENDING; missing stops are removed.
+   */
+  private async applyStopChanges(
+    tx: Prisma.TransactionClient,
+    shipmentId: string,
+    organizationId: string,
+    existingStops: ExistingStop[],
+    inputStops: CreateShipmentStopDto[],
+  ) {
+    const existingBySequence = new Map(
+      existingStops.map((stop) => [stop.stopSequence, stop]),
+    );
+    const inputSequences = new Set(inputStops.map((stop) => stop.stopSequence));
+    const removedStopIds = existingStops
+      .filter((stop) => !inputSequences.has(stop.stopSequence))
+      .map((stop) => stop.id);
+
+    if (removedStopIds.length) {
+      await tx.shipmentStop.deleteMany({
+        where: { id: { in: removedStopIds }, shipmentId },
+      });
+    }
+
+    for (const stop of inputStops) {
+      const current = existingBySequence.get(stop.stopSequence);
+
+      if (!current) {
+        await tx.shipmentStop.create({
+          data: {
+            ...this.toStopCreateData(organizationId, stop),
+            shipmentId,
+          },
+        });
+        continue;
+      }
+
+      const addressChanged =
+        this.stopAddressKey(current) !== this.stopAddressKey(stop);
+
+      await tx.shipmentStop.update({
+        where: { id: current.id },
+        data: {
+          stopType: stop.stopType,
+          locationName: stop.locationName,
+          addressLine1: stop.addressLine1 ?? null,
+          addressLine2: stop.addressLine2 ?? null,
+          city: stop.city ?? null,
+          state: stop.state ?? null,
+          postalCode: stop.postalCode ?? null,
+          country: stop.country ?? 'India',
+          plannedArrivalAt: stop.plannedArrivalAt
+            ? new Date(stop.plannedArrivalAt)
+            : null,
+          plannedDepartureAt: stop.plannedDepartureAt
+            ? new Date(stop.plannedDepartureAt)
+            : null,
+          ...(addressChanged
+            ? {
+                status: StopStatus.PENDING,
+                actualArrivalAt: null,
+                actualDepartureAt: null,
+              }
+            : {}),
+        },
+      });
+    }
+  }
+
+  private planItemChanges(
+    existingItems: ExistingItem[],
+    inputItems: CreateShipmentItemDto[],
+  ): ItemChangePlan {
+    if (existingItems.length !== inputItems.length) {
+      return 'replace';
+    }
+
+    const toNumber = (value: unknown) =>
+      value === null || value === undefined ? null : Number(value);
+    const sameNumber = (left: unknown, right: unknown) =>
+      toNumber(left) === toNumber(right);
+
+    let detailsChanged = false;
+    for (let index = 0; index < inputItems.length; index += 1) {
+      const current = existingItems[index];
+      const next = inputItems[index];
+
+      if (
+        current.description.trim() !== next.description.trim() ||
+        current.unit.trim() !== next.unit.trim() ||
+        !sameNumber(current.quantity, next.quantity)
+      ) {
+        return 'replace';
+      }
+
+      if (
+        !sameNumber(current.weight, next.weight) ||
+        !sameNumber(current.volume, next.volume) ||
+        !sameNumber(current.declaredValue, next.declaredValue)
+      ) {
+        detailsChanged = true;
+      }
+    }
+
+    return detailsChanged ? 'details' : 'unchanged';
+  }
+
+  private async applyItemChanges(
+    tx: Prisma.TransactionClient,
+    shipmentId: string,
+    organizationId: string,
+    existingItems: ExistingItem[],
+    inputItems: CreateShipmentItemDto[],
+    plan: ItemChangePlan,
+  ) {
+    if (plan === 'details') {
+      for (let index = 0; index < inputItems.length; index += 1) {
+        const next = inputItems[index];
+        await tx.shipmentItem.update({
+          where: { id: existingItems[index].id },
+          data: {
+            weight:
+              next.weight !== undefined
+                ? new Prisma.Decimal(next.weight)
+                : null,
+            volume:
+              next.volume !== undefined
+                ? new Prisma.Decimal(next.volume)
+                : null,
+            declaredValue:
+              next.declaredValue !== undefined
+                ? new Prisma.Decimal(next.declaredValue)
+                : null,
+          },
+        });
+      }
+      return;
+    }
+
+    if (plan === 'replace') {
+      // `items: []` is an explicit "remove all items" (only reachable before
+      // dispatch; locked shipments are rejected earlier).
+      await tx.shipmentItem.deleteMany({ where: { shipmentId } });
+      if (inputItems.length) {
+        await tx.shipmentItem.createMany({
+          data: inputItems.map((item) => ({
+            ...this.toItemCreateData(organizationId, item),
+            shipmentId,
+          })),
+        });
+      }
+    }
+  }
+
+  private preserveRouteFormKeys(
+    existingFormData: Record<string, unknown>,
+    nextFormData: Record<string, unknown>,
+  ) {
+    const merged: Record<string, unknown> = { ...nextFormData };
+
+    for (const key of ROUTE_FORM_KEYS) {
+      if (Object.prototype.hasOwnProperty.call(existingFormData, key)) {
+        merged[key] = existingFormData[key];
+      } else {
+        delete merged[key];
+      }
+    }
+
+    return merged;
+  }
+
+  private routeFormAddressChanged(
+    existingFormData: Record<string, unknown>,
+    nextFormData: Record<string, unknown> | undefined,
+    side: RouteSide,
+  ) {
+    if (!nextFormData) {
+      return false;
+    }
+
+    const normalize = (value: unknown) => textOf(value).trim().toLowerCase();
+
+    return ROUTE_ADDRESS_FORM_KEYS[side].some(
+      (key) =>
+        normalize(existingFormData[key]) !== normalize(nextFormData[key]),
+    );
+  }
+
+  /**
+   * For each route side: when the address is unchanged keep the submitted (or
+   * previously stored) pin and never block on the geocoder; when it changed,
+   * trust a newly pinned coordinate, else geocode (and fail if unresolvable).
+   * Mutates `input.adminFormData`.
+   */
+  private async resolveRouteCoordinatesForUpdate(
+    input: CreateShipmentDto,
+    existingFormData: Record<string, unknown>,
+    changed: Record<RouteSide, boolean>,
+  ) {
+    const formData = this.asRecord(input.adminFormData);
+    const hasRouteInformation = Boolean(
+      input.stops?.length || formData.originAddress || formData.deliveryAddress,
+    );
+    if (!hasRouteInformation) {
+      return;
+    }
+
+    const nextFormData: Record<string, unknown> = { ...formData };
+
+    for (const side of ['PICKUP', 'DELIVERY'] as RouteSide[]) {
+      const keys = ROUTE_COORDINATE_FORM_KEYS[side];
+      const existingCoordinate = this.firstValidCoordinate([
+        existingFormData[keys.latitude],
+        existingFormData[keys.longitude],
+      ]);
+      const submittedCoordinate = this.firstValidCoordinate([
+        formData[keys.latitude],
+        formData[keys.longitude],
+      ]);
+
+      let coordinate: Coordinate | null;
+      let verifiedAt: unknown;
+
+      if (!changed[side]) {
+        coordinate = submittedCoordinate ?? existingCoordinate;
+        verifiedAt =
+          formData[keys.verifiedAt] || existingFormData[keys.verifiedAt];
+        if (!coordinate) {
+          try {
+            coordinate = await this.resolveRequiredStopCoordinate(input, side);
+            verifiedAt = new Date().toISOString();
+          } catch {
+            // Geocoder down / incomplete legacy address: do not block the edit.
+            coordinate = null;
+          }
+        }
+      } else if (
+        submittedCoordinate &&
+        !this.isSameCoordinate(submittedCoordinate, existingCoordinate)
+      ) {
+        coordinate = submittedCoordinate;
+        verifiedAt = formData[keys.verifiedAt] || new Date().toISOString();
+      } else {
+        coordinate = await this.resolveRequiredStopCoordinate(input, side);
+        verifiedAt = new Date().toISOString();
+      }
+
+      if (coordinate) {
+        nextFormData[keys.latitude] = String(coordinate.latitude);
+        nextFormData[keys.longitude] = String(coordinate.longitude);
+        if (verifiedAt) {
+          nextFormData[keys.verifiedAt] = verifiedAt;
+        }
+      }
+    }
+
+    input.adminFormData = nextFormData;
+  }
+
+  private isSameCoordinate(left: Coordinate | null, right: Coordinate | null) {
+    if (!left || !right) {
+      return false;
+    }
+
+    return (
+      Math.abs(left.latitude - right.latitude) < 1e-6 &&
+      Math.abs(left.longitude - right.longitude) < 1e-6
+    );
+  }
+
+  /**
+   * Freezes the pickup/delivery address at creation (or route edit) so later
+   * edits to a client location do not rewrite historical shipments.
+   */
+  private async buildAddressSnapshots(input: CreateShipmentDto): Promise<{
+    source: Prisma.InputJsonValue | null;
+    destination: Prisma.InputJsonValue | null;
+  }> {
+    const locationIds = [
+      input.sourceLocationId,
+      input.destinationLocationId,
+    ].filter((id): id is string => Boolean(id));
+    const locations = locationIds.length
+      ? await this.prisma.companyClientLocation.findMany({
+          where: {
+            id: { in: locationIds },
+            organizationId: input.organizationId,
+          },
+        })
+      : [];
+    const formData = this.asRecord(input.adminFormData);
+    const capturedAt = new Date().toISOString();
+    const text = (value: unknown) => {
+      const normalized = textOf(value).trim();
+      return normalized || null;
+    };
+
+    const build = (side: RouteSide): Prisma.InputJsonValue | null => {
+      const isPickup = side === 'PICKUP';
+      const locationId = isPickup
+        ? input.sourceLocationId
+        : input.destinationLocationId;
+      const location = locations.find(
+        (candidate) => candidate.id === locationId,
+      );
+      const stop = input.stops?.find(
+        (candidate) => candidate.stopType === side,
+      );
+      const keys = ROUTE_COORDINATE_FORM_KEYS[side];
+      const coordinate = this.firstValidCoordinate([
+        formData[keys.latitude],
+        formData[keys.longitude],
+      ]);
+
+      let base: Record<string, string | null> | null = null;
+      if (location) {
+        base = {
+          source: 'company_client_location',
+          locationId: location.id,
+          companyClientId: location.companyClientId,
+          name: location.name,
+          addressLine1: location.addressLine1,
+          addressLine2: location.addressLine2,
+          city: location.city,
+          state: location.state,
+          postalCode: location.postalCode,
+          country: location.country,
+          gstin: location.gstin,
+          contactName: location.contactName,
+          contactPhone: location.contactPhone,
+        };
+      } else if (stop) {
+        base = {
+          source: 'shipment_stop',
+          name: text(stop.locationName),
+          addressLine1: text(stop.addressLine1),
+          addressLine2: text(stop.addressLine2),
+          city: text(stop.city),
+          state: text(stop.state),
+          postalCode: text(stop.postalCode),
+          country: text(stop.country) ?? 'India',
+        };
+      } else if (formData[isPickup ? 'originAddress' : 'deliveryAddress']) {
+        base = {
+          source: 'admin_form',
+          name: text(formData[isPickup ? 'originName' : 'destinationName']),
+          addressLine1: text(
+            formData[isPickup ? 'originAddress' : 'deliveryAddress'],
+          ),
+          addressLine2: null,
+          city: text(formData[isPickup ? 'originCity' : 'destinationCity']),
+          state: text(formData[isPickup ? 'originState' : 'destinationState']),
+          postalCode: text(
+            formData[isPickup ? 'originPincode' : 'destinationPincode'],
+          ),
+          country:
+            text(formData[isPickup ? 'originCountry' : 'destinationCountry']) ??
+            'India',
+        };
+      }
+
+      if (!base) {
+        return null;
+      }
+
+      return {
+        ...base,
+        latitude: coordinate?.latitude ?? null,
+        longitude: coordinate?.longitude ?? null,
+        capturedAt,
+      };
+    };
+
+    return {
+      source: build('PICKUP'),
+      destination: build('DELIVERY'),
+    };
+  }
+
+  private asRecord(value: unknown): Record<string, unknown> {
+    return value && typeof value === 'object' && !Array.isArray(value)
+      ? { ...(value as Record<string, unknown>) }
+      : {};
+  }
+
+  private clampInteger(
+    value: unknown,
+    fallback: number,
+    min: number,
+    max: number,
+  ) {
+    if (value === undefined || value === null || value === '') {
+      return fallback;
+    }
+
+    const parsed = Math.trunc(Number(value));
+    if (!Number.isFinite(parsed)) {
+      return fallback;
+    }
+
+    return Math.min(Math.max(parsed, min), max);
+  }
+
   private mapShipmentCompanyClient<
     T extends { companyClient?: { companyClientCode?: string } | null },
   >(shipment: T) {
@@ -1917,6 +3404,7 @@ export class ShipmentsService {
     };
   }
 
+  /** Detail responses: stored coordinates first, geocoding as a fallback. */
   private async enrichShipmentCoordinates<
     T extends {
       adminFormData?: unknown;
@@ -1929,14 +3417,11 @@ export class ShipmentsService {
     },
   >(shipment: T) {
     const mappedShipment = this.mapShipmentCompanyClient(shipment);
-    const resolvedPickupCoordinates = await this.resolveShipmentCoordinate(
-      shipment,
-      'pickup',
-    );
-    const resolvedDestinationCoordinates = await this.resolveShipmentCoordinate(
-      shipment,
-      'destination',
-    );
+    const [resolvedPickupCoordinates, resolvedDestinationCoordinates] =
+      await Promise.all([
+        this.resolveShipmentCoordinate(shipment, 'pickup'),
+        this.resolveShipmentCoordinate(shipment, 'destination'),
+      ]);
 
     return {
       ...mappedShipment,
@@ -1945,7 +3430,32 @@ export class ShipmentsService {
     };
   }
 
-  private async resolveShipmentCoordinate(
+  /** List/status responses: stored coordinates only, never calls a geocoder. */
+  private toStoredCoordinateResponse<
+    T extends {
+      adminFormData?: unknown;
+      sourceLocation?: Record<string, unknown> | null;
+      destinationLocation?: Record<string, unknown> | null;
+      sourceAddressSnapshot?: unknown;
+      destinationAddressSnapshot?: unknown;
+      stops?: Array<Record<string, unknown>> | null;
+      companyClient?: { companyClientCode?: string } | null;
+    },
+  >(shipment: T) {
+    return {
+      ...this.mapShipmentCompanyClient(shipment),
+      resolvedPickupCoordinates: this.getShipmentCoordinateContext(
+        shipment,
+        'pickup',
+      ).directCoordinate,
+      resolvedDestinationCoordinates: this.getShipmentCoordinateContext(
+        shipment,
+        'destination',
+      ).directCoordinate,
+    };
+  }
+
+  private getShipmentCoordinateContext(
     shipment: {
       adminFormData?: unknown;
       sourceLocation?: Record<string, unknown> | null;
@@ -1956,17 +3466,15 @@ export class ShipmentsService {
     },
     kind: 'pickup' | 'destination',
   ) {
-    const formData =
-      shipment.adminFormData &&
-      typeof shipment.adminFormData === 'object' &&
-      !Array.isArray(shipment.adminFormData)
-        ? (shipment.adminFormData as Record<string, unknown>)
-        : {};
+    const formData = this.asRecord(shipment.adminFormData);
     const stopType = kind === 'pickup' ? 'PICKUP' : 'DELIVERY';
     const stop =
-      shipment.stops?.find((candidate) => candidate.stopType === stopType) || null;
+      shipment.stops?.find((candidate) => candidate.stopType === stopType) ||
+      null;
     const location =
-      kind === 'pickup' ? shipment.sourceLocation : shipment.destinationLocation;
+      kind === 'pickup'
+        ? shipment.sourceLocation
+        : shipment.destinationLocation;
     const snapshotValue =
       kind === 'pickup'
         ? shipment.sourceAddressSnapshot
@@ -1981,7 +3489,9 @@ export class ShipmentsService {
     const directCoordinate = this.firstValidCoordinate(
       [
         formData[kind === 'pickup' ? 'originLatitude' : 'destinationLatitude'],
-        formData[kind === 'pickup' ? 'originLongitude' : 'destinationLongitude'],
+        formData[
+          kind === 'pickup' ? 'originLongitude' : 'destinationLongitude'
+        ],
       ],
       [
         formData[kind === 'pickup' ? 'pickupLatitude' : 'receiverLatitude'],
@@ -1991,6 +3501,23 @@ export class ShipmentsService {
       [stop?.latitude, stop?.longitude],
       [location?.latitude, location?.longitude],
     );
+
+    return { formData, stop, location, snapshot, directCoordinate };
+  }
+
+  private async resolveShipmentCoordinate(
+    shipment: {
+      adminFormData?: unknown;
+      sourceLocation?: Record<string, unknown> | null;
+      destinationLocation?: Record<string, unknown> | null;
+      sourceAddressSnapshot?: unknown;
+      destinationAddressSnapshot?: unknown;
+      stops?: Array<Record<string, unknown>> | null;
+    },
+    kind: 'pickup' | 'destination',
+  ) {
+    const { formData, stop, location, snapshot, directCoordinate } =
+      this.getShipmentCoordinateContext(shipment, kind);
 
     if (directCoordinate) {
       return directCoordinate;
@@ -2074,7 +3601,8 @@ export class ShipmentsService {
       const previous = routePoints[routePoints.length - 1];
       if (
         previous &&
-        this.calculateDistanceMetres(previous, point) < MIN_ROUTE_POINT_DISTANCE_METRES
+        this.calculateDistanceMetres(previous, point) <
+          MIN_ROUTE_POINT_DISTANCE_METRES
       ) {
         continue;
       }
@@ -2094,7 +3622,10 @@ export class ShipmentsService {
 
     for (const point of points.slice(1, -1)) {
       const previous = distanceFiltered[distanceFiltered.length - 1];
-      if (this.calculateDistanceMetres(previous, point) >= MIN_SNAP_POINT_DISTANCE_METRES) {
+      if (
+        this.calculateDistanceMetres(previous, point) >=
+        MIN_SNAP_POINT_DISTANCE_METRES
+      ) {
         distanceFiltered.push(point);
       }
     }
@@ -2116,7 +3647,9 @@ export class ShipmentsService {
     const sampled: TrackingRoutePoint[] = [];
     const lastIndex = distanceFiltered.length - 1;
     for (let index = 0; index < MAX_SNAP_POINTS; index += 1) {
-      const sourceIndex = Math.round((index * lastIndex) / (MAX_SNAP_POINTS - 1));
+      const sourceIndex = Math.round(
+        (index * lastIndex) / (MAX_SNAP_POINTS - 1),
+      );
       const point = distanceFiltered[sourceIndex];
       const previous = sampled[sampled.length - 1];
       if (
@@ -2188,7 +3721,9 @@ export class ShipmentsService {
     );
 
     if (route.length < 2) {
-      throw new Error(payload.message || payload.code || 'OSRM Match returned no geometry');
+      throw new Error(
+        payload.message || payload.code || 'OSRM Match returned no geometry',
+      );
     }
 
     return route;
@@ -2218,7 +3753,9 @@ export class ShipmentsService {
     );
 
     if (route.length < 2) {
-      throw new Error(payload.message || payload.code || 'OSRM Route returned no geometry');
+      throw new Error(
+        payload.message || payload.code || 'OSRM Route returned no geometry',
+      );
     }
 
     return route;
@@ -2231,7 +3768,10 @@ export class ShipmentsService {
     }
 
     const snapPoints = this.simplifyRoutePointsForSnapping(points);
-    const chunks = this.chunkRoutePoints(snapPoints, GOOGLE_ROADS_POINT_BATCH_SIZE);
+    const chunks = this.chunkRoutePoints(
+      snapPoints,
+      GOOGLE_ROADS_POINT_BATCH_SIZE,
+    );
     const snappedChunks = await this.mapWithConcurrency(chunks, 1, (chunk) =>
       this.fetchGoogleRoadsSegment(chunk, googleApiKey),
     );
@@ -2274,7 +3814,9 @@ export class ShipmentsService {
 
     if (payload.error) {
       throw new Error(
-        payload.error.message || payload.error.status || 'Google Roads returned an error',
+        payload.error.message ||
+          payload.error.status ||
+          'Google Roads returned an error',
       );
     }
 
@@ -2360,7 +3902,9 @@ export class ShipmentsService {
 
     if (payload.status !== 'OK' || !encodedPolyline) {
       throw new Error(
-        payload.error_message || payload.status || 'Google Directions returned no geometry',
+        payload.error_message ||
+          payload.status ||
+          'Google Directions returned no geometry',
       );
     }
 
@@ -2466,7 +4010,9 @@ export class ShipmentsService {
 
   private toOsrmCoordinates(points: TrackingRoutePoint[]) {
     return points
-      .map((point) => `${point.longitude.toFixed(6)},${point.latitude.toFixed(6)}`)
+      .map(
+        (point) => `${point.longitude.toFixed(6)},${point.latitude.toFixed(6)}`,
+      )
       .join(';');
   }
 
@@ -2507,15 +4053,18 @@ export class ShipmentsService {
     return `${provider}: ${message}`;
   }
 
-  private setSnappedRouteCache(cacheKey: string, response: SnappedRouteResponse) {
+  private setSnappedRouteCache(
+    cacheKey: string,
+    response: SnappedRouteResponse,
+  ) {
     snappedRouteCache.set(cacheKey, {
       expiresAt: Date.now() + ROUTE_CACHE_TTL_MS,
       response,
     });
 
     while (snappedRouteCache.size > MAX_ROUTE_CACHE_ENTRIES) {
-      const oldestKey = snappedRouteCache.keys().next().value;
-      if (!oldestKey) {
+      const [oldestKey] = snappedRouteCache.keys();
+      if (oldestKey === undefined) {
         return;
       }
       snappedRouteCache.delete(oldestKey);
@@ -2579,19 +4128,21 @@ export class ShipmentsService {
       ],
     ];
 
-    return [...new Set(
-      rawCandidates
-        .map((parts) =>
-          parts
-            .map((part) => String(part || '').trim())
-            .filter(Boolean)
-            .join(', '),
-        )
-        .filter(Boolean)
-        .map((candidate) =>
-          /\bindia\b/i.test(candidate) ? candidate : `${candidate}, India`,
-        ),
-    )];
+    return [
+      ...new Set(
+        rawCandidates
+          .map((parts) =>
+            parts
+              .map((part) => textOf(part).trim())
+              .filter(Boolean)
+              .join(', '),
+          )
+          .filter(Boolean)
+          .map((candidate) =>
+            /\bindia\b/i.test(candidate) ? candidate : `${candidate}, India`,
+          ),
+      ),
+    ];
   }
 
   async validateShipmentLocation(input: ValidateShipmentLocationDto) {
@@ -2619,58 +4170,81 @@ export class ShipmentsService {
   }
 
   private async normalizeRequiredRouteCoordinates(input: CreateShipmentDto) {
-    const adminFormData =
-      input.adminFormData &&
-      typeof input.adminFormData === 'object' &&
-      !Array.isArray(input.adminFormData)
-        ? (input.adminFormData as Record<string, unknown>)
-        : {};
+    const adminFormData = this.asRecord(input.adminFormData);
 
     // Code-only inbound drafts may be created before route information arrives.
     // They still cannot be assigned because assignDriver checks both resolved pins.
     const hasRouteInformation = Boolean(
       input.stops?.length ||
-        adminFormData.originAddress ||
-        adminFormData.deliveryAddress,
+      adminFormData.originAddress ||
+      adminFormData.deliveryAddress,
     );
     if (!hasRouteInformation) {
       return;
     }
 
-    const pickup = await this.resolveRequiredStopCoordinate(input, 'PICKUP');
-    const delivery = await this.resolveRequiredStopCoordinate(input, 'DELIVERY');
+    const nextFormData: Record<string, unknown> = { ...adminFormData };
 
-    input.adminFormData = {
-      ...adminFormData,
-      originLatitude: String(pickup.latitude),
-      originLongitude: String(pickup.longitude),
-      destinationLatitude: String(delivery.latitude),
-      destinationLongitude: String(delivery.longitude),
-      pickupLocationVerifiedAt: new Date().toISOString(),
-      deliveryLocationVerifiedAt: new Date().toISOString(),
-    };
+    for (const side of ['PICKUP', 'DELIVERY'] as RouteSide[]) {
+      const keys = ROUTE_COORDINATE_FORM_KEYS[side];
+      const pinnedCoordinate = this.firstValidCoordinate([
+        adminFormData[keys.latitude],
+        adminFormData[keys.longitude],
+      ]);
+
+      // Keep a pin the user already verified (validate-location / map pin);
+      // the address itself must still be complete.
+      if (pinnedCoordinate && adminFormData[keys.verifiedAt]) {
+        this.buildRequiredStopAddress(input, side);
+        nextFormData[keys.latitude] = String(pinnedCoordinate.latitude);
+        nextFormData[keys.longitude] = String(pinnedCoordinate.longitude);
+        continue;
+      }
+
+      const coordinate = await this.resolveRequiredStopCoordinate(input, side);
+      nextFormData[keys.latitude] = String(coordinate.latitude);
+      nextFormData[keys.longitude] = String(coordinate.longitude);
+      nextFormData[keys.verifiedAt] = new Date().toISOString();
+    }
+
+    input.adminFormData = nextFormData;
+  }
+
+  private buildRequiredStopAddress(
+    input: CreateShipmentDto,
+    stopType: RouteSide,
+  ) {
+    const stop = input.stops?.find(
+      (candidate) => candidate.stopType === stopType,
+    );
+    const isPickup = stopType === 'PICKUP';
+    const adminFormData = this.asRecord(input.adminFormData);
+
+    return this.buildRequiredLocationAddress({
+      locationName:
+        stop?.locationName ||
+        adminFormData[isPickup ? 'originName' : 'destinationName'],
+      addressLine1:
+        stop?.addressLine1 ||
+        adminFormData[isPickup ? 'originAddress' : 'deliveryAddress'],
+      city:
+        stop?.city ||
+        adminFormData[isPickup ? 'originCity' : 'destinationCity'],
+      state:
+        stop?.state ||
+        adminFormData[isPickup ? 'originState' : 'destinationState'],
+      postalCode:
+        stop?.postalCode ||
+        adminFormData[isPickup ? 'originPincode' : 'destinationPincode'],
+    });
   }
 
   private async resolveRequiredStopCoordinate(
     input: CreateShipmentDto,
-    stopType: 'PICKUP' | 'DELIVERY',
+    stopType: RouteSide,
   ) {
-    const stop = input.stops?.find((candidate) => candidate.stopType === stopType);
     const isPickup = stopType === 'PICKUP';
-    const adminFormData =
-      input.adminFormData &&
-      typeof input.adminFormData === 'object' &&
-      !Array.isArray(input.adminFormData)
-        ? (input.adminFormData as Record<string, unknown>)
-        : {};
-
-    const address = this.buildRequiredLocationAddress({
-      locationName: stop?.locationName || adminFormData[isPickup ? 'originName' : 'destinationName'],
-      addressLine1: stop?.addressLine1 || adminFormData[isPickup ? 'originAddress' : 'deliveryAddress'],
-      city: stop?.city || adminFormData[isPickup ? 'originCity' : 'destinationCity'],
-      state: stop?.state || adminFormData[isPickup ? 'originState' : 'destinationState'],
-      postalCode: stop?.postalCode || adminFormData[isPickup ? 'originPincode' : 'destinationPincode'],
-    });
+    const address = this.buildRequiredStopAddress(input, stopType);
     const coordinate = await this.geocodeAddress(address);
 
     if (!coordinate) {
@@ -2689,9 +4263,9 @@ export class ShipmentsService {
     state?: unknown;
     postalCode?: unknown;
   }) {
-    const addressLine1 = String(input.addressLine1 || '').trim();
-    const city = String(input.city || '').trim();
-    const postalCode = String(input.postalCode || '').trim();
+    const addressLine1 = textOf(input.addressLine1).trim();
+    const city = textOf(input.city).trim();
+    const postalCode = textOf(input.postalCode).trim();
 
     if (!addressLine1 || !city || !/^\d{6}$/.test(postalCode)) {
       throw new BadRequestException(
@@ -2699,8 +4273,15 @@ export class ShipmentsService {
       );
     }
 
-    return [input.locationName, addressLine1, city, input.state, postalCode, 'India']
-      .map((value) => String(value || '').trim())
+    return [
+      input.locationName,
+      addressLine1,
+      city,
+      input.state,
+      postalCode,
+      'India',
+    ]
+      .map((value) => textOf(value).trim())
       .filter(Boolean)
       .join(', ');
   }
@@ -2711,8 +4292,9 @@ export class ShipmentsService {
       return null;
     }
 
-    if (geocodeCache.has(normalizedAddress)) {
-      return geocodeCache.get(normalizedAddress) ?? null;
+    const cached = geocodeCache.lookup(normalizedAddress);
+    if (cached) {
+      return cached.value;
     }
 
     try {
@@ -2721,10 +4303,11 @@ export class ShipmentsService {
         ? await this.geocodeWithGoogle(normalizedAddress, googleApiKey)
         : await this.geocodeWithNominatim(normalizedAddress);
 
-      geocodeCache.set(normalizedAddress, coordinate);
+      // Misses are cached for minutes, hits for a day (bounded LRU).
+      geocodeCache.setResult(normalizedAddress, coordinate);
       return coordinate;
     } catch {
-      geocodeCache.set(normalizedAddress, null);
+      geocodeCache.set(normalizedAddress, null, GEOCODE_ERROR_TTL_MS);
       return null;
     }
   }
@@ -2742,6 +4325,7 @@ export class ShipmentsService {
       headers: {
         Accept: 'application/json',
       },
+      signal: AbortSignal.timeout(GEOCODE_FETCH_TIMEOUT_MS),
     });
 
     if (!response.ok) {
@@ -2765,7 +4349,9 @@ export class ShipmentsService {
     return this.firstValidCoordinate([latitude, longitude]);
   }
 
-  private async geocodeWithNominatim(address: string): Promise<Coordinate | null> {
+  private async geocodeWithNominatim(
+    address: string,
+  ): Promise<Coordinate | null> {
     const url = new URL('https://nominatim.openstreetmap.org/search');
     url.searchParams.set('format', 'jsonv2');
     url.searchParams.set('limit', '1');
@@ -2777,6 +4363,7 @@ export class ShipmentsService {
         Accept: 'application/json',
         'User-Agent': 'AshwaLogix/1.0 shipment-coordinate-resolver',
       },
+      signal: AbortSignal.timeout(GEOCODE_FETCH_TIMEOUT_MS),
     });
 
     if (!response.ok) {
@@ -2799,7 +4386,10 @@ export class ShipmentsService {
     apiKey: string,
   ): Promise<string | null> {
     const url = new URL('https://maps.googleapis.com/maps/api/geocode/json');
-    url.searchParams.set('latlng', `${coordinate.latitude},${coordinate.longitude}`);
+    url.searchParams.set(
+      'latlng',
+      `${coordinate.latitude},${coordinate.longitude}`,
+    );
     url.searchParams.set('key', apiKey);
     url.searchParams.set('region', 'in');
 
@@ -2807,6 +4397,7 @@ export class ShipmentsService {
       headers: {
         Accept: 'application/json',
       },
+      signal: AbortSignal.timeout(GEOCODE_FETCH_TIMEOUT_MS),
     });
 
     if (!response.ok) {
@@ -2838,6 +4429,7 @@ export class ShipmentsService {
         Accept: 'application/json',
         'User-Agent': 'AshwaLogix/1.0 shipment-reverse-geocoder',
       },
+      signal: AbortSignal.timeout(GEOCODE_FETCH_TIMEOUT_MS),
     });
 
     if (!response.ok) {
@@ -2853,9 +4445,7 @@ export class ShipmentsService {
 
   private mapCompanyClient<
     T extends { companyClientCode?: string } | null | undefined,
-  >(
-    companyClient: T,
-  ) {
+  >(companyClient: T) {
     if (!companyClient) {
       return null;
     }
@@ -2890,7 +4480,40 @@ export class ShipmentsService {
     };
   }
 
-  private async publishOrderEventSafe(event: OrderEventMessage) {
-    await this.trackingEventBus.publishOrderEvent(event);
+  /**
+   * Fire-and-forget: the DB commit is the source of truth, so a slow or
+   * unavailable broker must never delay (or fail) the HTTP response.
+   */
+  private publishOrderEventSafe(event: OrderEventMessage) {
+    let timer: NodeJS.Timeout | undefined;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(
+        () =>
+          reject(
+            new Error(`timed out after ${ORDER_EVENT_PUBLISH_TIMEOUT_MS}ms`),
+          ),
+        ORDER_EVENT_PUBLISH_TIMEOUT_MS,
+      );
+      timer.unref?.();
+    });
+
+    void Promise.race([
+      Promise.resolve().then(() =>
+        this.trackingEventBus.publishOrderEvent(event),
+      ),
+      timeout,
+    ])
+      .catch((error: unknown) => {
+        this.logger.warn(
+          `Order event ${event.eventType} for shipment ${event.shipmentId} was not published: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      })
+      .finally(() => {
+        if (timer) {
+          clearTimeout(timer);
+        }
+      });
   }
 }

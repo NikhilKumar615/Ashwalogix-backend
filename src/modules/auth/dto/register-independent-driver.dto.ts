@@ -1,9 +1,5 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
-import {
-  DriverLicenseType,
-  FuelType,
-  Gender,
-} from '@prisma/client';
+import { DriverLicenseType, FuelType, Gender } from '@prisma/client';
 import { Type } from 'class-transformer';
 import {
   ArrayMinSize,

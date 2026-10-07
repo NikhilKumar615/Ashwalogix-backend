@@ -14,15 +14,28 @@ type TrackingValidationResult = {
   location: TrackingLocationUpdateDto;
   accepted: boolean;
   rejectionReason?: 'accuracy' | 'speed';
+  /**
+   * True when the point was accepted only because the gap since the last good
+   * point exceeded the recovery window (e.g. after a tunnel / GPS outage).
+   * Smoothing state should be reset in that case.
+   */
+  recovered?: boolean;
 };
 
 const MAX_ACCEPTED_ACCURACY_METRES = 50;
-const MAX_ACCEPTED_SPEED_KMH = 80;
+// Highway trucks can legitimately reach ~100 km/h; leave headroom for GPS jitter.
+const MAX_ACCEPTED_SPEED_KMH = 120;
+// After this long without an accepted point, accept the next accurate point
+// even if the implied speed is high, so the live position can never freeze.
+const RECOVERY_GAP_MS = 2 * 60_000;
 const EARTH_RADIUS_KM = 6371;
 
 @Injectable()
 export class TrackingValidationService {
-  private readonly lastGoodPointByShipment = new Map<string, GoodTrackingPoint>();
+  private readonly lastGoodPointByShipment = new Map<
+    string,
+    GoodTrackingPoint
+  >();
 
   validate(
     shipmentId: string,
@@ -38,6 +51,8 @@ export class TrackingValidationService {
       return this.buildRejectedResult(lastGoodPoint, 'accuracy');
     }
 
+    let recovered = false;
+
     if (lastGoodPoint) {
       const impliedSpeedKmh = this.calculateImpliedSpeedKmh(
         lastGoodPoint,
@@ -46,7 +61,13 @@ export class TrackingValidationService {
       );
 
       if (impliedSpeedKmh > MAX_ACCEPTED_SPEED_KMH) {
-        return this.buildRejectedResult(lastGoodPoint, 'speed');
+        const elapsedMs = eventTimestamp - lastGoodPoint.timestamp;
+        if (elapsedMs <= RECOVERY_GAP_MS) {
+          // Rejections never touch lastGoodPoint (incl. its timestamp), so the
+          // recovery window keeps growing until a point is accepted.
+          return this.buildRejectedResult(lastGoodPoint, 'speed');
+        }
+        recovered = true;
       }
     }
 
@@ -67,6 +88,7 @@ export class TrackingValidationService {
     return {
       location: acceptedLocation,
       accepted: true,
+      ...(recovered ? { recovered: true } : {}),
     };
   }
 
@@ -162,7 +184,11 @@ export class TrackingValidationService {
         Math.cos(destinationLatitude) *
         Math.sin(longitudeDelta / 2) ** 2;
 
-    return 2 * EARTH_RADIUS_KM * Math.atan2(Math.sqrt(haversine), Math.sqrt(1 - haversine));
+    return (
+      2 *
+      EARTH_RADIUS_KM *
+      Math.atan2(Math.sqrt(haversine), Math.sqrt(1 - haversine))
+    );
   }
 
   private toRadians(value: number) {

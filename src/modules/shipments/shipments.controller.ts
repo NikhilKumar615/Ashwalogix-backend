@@ -30,6 +30,7 @@ import { AssignDriverDto } from './dto/assign-driver.dto';
 import { CreateShipmentDto } from './dto/create-shipment.dto';
 import { CreateProofOfDeliveryDto } from './dto/create-proof-of-delivery.dto';
 import { CreateTrackingPointDto } from './dto/create-tracking-point.dto';
+import { DeleteShipmentDto } from './dto/delete-shipment.dto';
 import { FailShipmentDto } from './dto/fail-shipment.dto';
 import { ManualShipmentStatusDto } from './dto/manual-shipment-status.dto';
 import { ShipmentStatusActionDto } from './dto/shipment-status-action.dto';
@@ -53,6 +54,20 @@ export class ShipmentsController {
   @ApiOperation({ summary: 'List shipments' })
   @ApiQuery({ name: 'organizationId', required: false, type: String })
   @ApiQuery({ name: 'status', required: false, enum: ShipmentStatus })
+  @ApiQuery({
+    name: 'take',
+    required: false,
+    type: Number,
+    description:
+      'Page size (default 500, max 1000). Response stays a plain array.',
+  })
+  @ApiQuery({ name: 'skip', required: false, type: Number })
+  @ApiQuery({
+    name: 'cursor',
+    required: false,
+    type: String,
+    description: 'Shipment id to continue after (newest-first ordering).',
+  })
   @Roles(
     OrganizationRole.ORG_ADMIN,
     OrganizationRole.DISPATCHER,
@@ -63,14 +78,21 @@ export class ShipmentsController {
     @CurrentUser() user: JwtPayload,
     @Query('organizationId') organizationId: string,
     @Query('status') status?: ShipmentStatus,
+    @Query('take') take?: string,
+    @Query('skip') skip?: string,
+    @Query('cursor') cursor?: string,
   ) {
     if (organizationId) {
-      await this.authorizationService.assertOrganizationAccess(user, organizationId, [
-        OrganizationRole.ORG_ADMIN,
-        OrganizationRole.DISPATCHER,
-        OrganizationRole.OPERATIONS,
-        OrganizationRole.WAREHOUSE,
-      ]);
+      await this.authorizationService.assertOrganizationAccess(
+        user,
+        organizationId,
+        [
+          OrganizationRole.ORG_ADMIN,
+          OrganizationRole.DISPATCHER,
+          OrganizationRole.OPERATIONS,
+          OrganizationRole.WAREHOUSE,
+        ],
+      );
     }
 
     return this.shipmentsService.listShipments({
@@ -80,11 +102,17 @@ export class ShipmentsController {
           ? undefined
           : user.organizationIds,
       status,
+      take: take !== undefined ? Number(take) : undefined,
+      skip: skip !== undefined ? Number(skip) : undefined,
+      cursor: cursor || undefined,
     });
   }
 
   @Get('lookup/code/:shipmentCode')
-  @ApiOperation({ summary: 'Lookup shipment details by shipment code for cross-org prefilling' })
+  @ApiOperation({
+    summary:
+      "Lookup shipment details by shipment code within the caller's organizations",
+  })
   @ApiParam({ name: 'shipmentCode', type: String })
   @Roles(
     OrganizationRole.ORG_ADMIN,
@@ -96,11 +124,21 @@ export class ShipmentsController {
     @Param('shipmentCode') shipmentCode: string,
     @CurrentUser() user: JwtPayload,
   ) {
-    if (!user.organizationIds?.length && user.platformRole !== PlatformRole.SUPER_ADMIN) {
+    if (
+      !user.organizationIds?.length &&
+      user.platformRole !== PlatformRole.SUPER_ADMIN
+    ) {
       throw new NotFoundException(`Shipment ${shipmentCode} not found`);
     }
 
-    const shipment = await this.shipmentsService.getShipmentByCode(shipmentCode);
+    // Restricted to the caller's own organizations (super admin: all). No
+    // notification is sent for a lookup.
+    const shipment = await this.shipmentsService.getShipmentByCode(
+      shipmentCode,
+      user.platformRole === PlatformRole.SUPER_ADMIN
+        ? null
+        : (user.organizationIds ?? []),
+    );
 
     if (!shipment) {
       throw new NotFoundException(`Shipment ${shipmentCode} not found`);
@@ -110,7 +148,9 @@ export class ShipmentsController {
   }
 
   @Get('tracking/reverse-geocode')
-  @ApiOperation({ summary: 'Reverse geocode tracking coordinates to a readable place label' })
+  @ApiOperation({
+    summary: 'Reverse geocode tracking coordinates to a readable place label',
+  })
   @ApiQuery({ name: 'latitude', required: true, type: Number })
   @ApiQuery({ name: 'longitude', required: true, type: Number })
   @Roles(
@@ -125,12 +165,18 @@ export class ShipmentsController {
     @Query('longitude') longitude: number,
   ) {
     return {
-      label: await this.shipmentsService.reverseGeocodeCoordinates(latitude, longitude),
+      label: await this.shipmentsService.reverseGeocodeCoordinates(
+        latitude,
+        longitude,
+      ),
     };
   }
 
   @Post('validate-location')
-  @ApiOperation({ summary: 'Validate and pin a pickup or delivery location before shipment creation' })
+  @ApiOperation({
+    summary:
+      'Validate and pin a pickup or delivery location before shipment creation',
+  })
   @ApiBody({ type: ValidateShipmentLocationDto })
   @Roles(
     OrganizationRole.ORG_ADMIN,
@@ -204,7 +250,7 @@ export class ShipmentsController {
       ],
     );
 
-    return this.shipmentsService.createShipment(body);
+    return this.shipmentsService.createShipment(body, user.sub);
   }
 
   @Patch(':id')
@@ -221,15 +267,19 @@ export class ShipmentsController {
     @Body() body: UpdateShipmentDto,
     @CurrentUser() user: JwtPayload,
   ) {
-    await this.authorizationService.assertShipmentWriteAccess(user, shipmentId, {
-      allowedOrganizationRoles: [
-        OrganizationRole.ORG_ADMIN,
-        OrganizationRole.DISPATCHER,
-        OrganizationRole.OPERATIONS,
-      ],
-    });
+    await this.authorizationService.assertShipmentWriteAccess(
+      user,
+      shipmentId,
+      {
+        allowedOrganizationRoles: [
+          OrganizationRole.ORG_ADMIN,
+          OrganizationRole.DISPATCHER,
+          OrganizationRole.OPERATIONS,
+        ],
+      },
+    );
 
-    return this.shipmentsService.updateShipment(shipmentId, body);
+    return this.shipmentsService.updateShipment(shipmentId, body, user.sub);
   }
 
   @Post(':id/assign-driver')
@@ -246,13 +296,17 @@ export class ShipmentsController {
     @Body() body: AssignDriverDto,
     @CurrentUser() user: JwtPayload,
   ) {
-    await this.authorizationService.assertShipmentWriteAccess(user, shipmentId, {
-      allowedOrganizationRoles: [
-        OrganizationRole.ORG_ADMIN,
-        OrganizationRole.DISPATCHER,
-        OrganizationRole.OPERATIONS,
-      ],
-    });
+    await this.authorizationService.assertShipmentWriteAccess(
+      user,
+      shipmentId,
+      {
+        allowedOrganizationRoles: [
+          OrganizationRole.ORG_ADMIN,
+          OrganizationRole.DISPATCHER,
+          OrganizationRole.OPERATIONS,
+        ],
+      },
+    );
     await this.authorizationService.assertOrganizationAccess(
       user,
       body.organizationId,
@@ -263,7 +317,7 @@ export class ShipmentsController {
       ],
     );
 
-    return this.shipmentsService.assignDriver(shipmentId, body);
+    return this.shipmentsService.assignDriver(shipmentId, body, user.sub);
   }
 
   @Get(':id/timeline')
@@ -310,20 +364,30 @@ export class ShipmentsController {
       user,
       body.organizationId,
     );
-    await this.authorizationService.assertShipmentWriteAccess(user, shipmentId, {
-      allowedOrganizationRoles: [
-        OrganizationRole.ORG_ADMIN,
-        OrganizationRole.DISPATCHER,
-        OrganizationRole.OPERATIONS,
-      ],
-      allowAssignedDriver: true,
-    });
+    await this.authorizationService.assertShipmentWriteAccess(
+      user,
+      shipmentId,
+      {
+        allowedOrganizationRoles: [
+          OrganizationRole.ORG_ADMIN,
+          OrganizationRole.DISPATCHER,
+          OrganizationRole.OPERATIONS,
+        ],
+        allowAssignedDriver: true,
+      },
+    );
 
-    return this.shipmentsService.startTrackingSession(shipmentId, body);
+    return this.shipmentsService.startTrackingSession(
+      shipmentId,
+      body,
+      user.sub,
+    );
   }
 
   @Post(':id/tracking/points')
-  @ApiOperation({ summary: 'Add a tracking point to the active shipment session' })
+  @ApiOperation({
+    summary: 'Add a tracking point to the active shipment session',
+  })
   @ApiParam({ name: 'id', type: String })
   @ApiBody({ type: CreateTrackingPointDto })
   @Roles(
@@ -341,14 +405,18 @@ export class ShipmentsController {
       user,
       body.organizationId,
     );
-    await this.authorizationService.assertShipmentWriteAccess(user, shipmentId, {
-      allowedOrganizationRoles: [
-        OrganizationRole.ORG_ADMIN,
-        OrganizationRole.DISPATCHER,
-        OrganizationRole.OPERATIONS,
-      ],
-      allowAssignedDriver: true,
-    });
+    await this.authorizationService.assertShipmentWriteAccess(
+      user,
+      shipmentId,
+      {
+        allowedOrganizationRoles: [
+          OrganizationRole.ORG_ADMIN,
+          OrganizationRole.DISPATCHER,
+          OrganizationRole.OPERATIONS,
+        ],
+        allowAssignedDriver: true,
+      },
+    );
 
     return this.shipmentsService.addTrackingPoint(shipmentId, body);
   }
@@ -410,7 +478,9 @@ export class ShipmentsController {
   }
 
   @Get(':id/tracking/snapped-route')
-  @ApiOperation({ summary: 'Get cached road-snapped tracking route for a shipment' })
+  @ApiOperation({
+    summary: 'Get cached road-snapped tracking route for a shipment',
+  })
   @ApiParam({ name: 'id', type: String })
   @Roles(
     OrganizationRole.ORG_ADMIN,
@@ -482,16 +552,24 @@ export class ShipmentsController {
       user,
       body.organizationId,
     );
-    await this.authorizationService.assertShipmentWriteAccess(user, shipmentId, {
-      allowedOrganizationRoles: [
-        OrganizationRole.ORG_ADMIN,
-        OrganizationRole.DISPATCHER,
-        OrganizationRole.OPERATIONS,
-      ],
-      allowAssignedDriver: true,
-    });
+    await this.authorizationService.assertShipmentWriteAccess(
+      user,
+      shipmentId,
+      {
+        allowedOrganizationRoles: [
+          OrganizationRole.ORG_ADMIN,
+          OrganizationRole.DISPATCHER,
+          OrganizationRole.OPERATIONS,
+        ],
+        allowAssignedDriver: true,
+      },
+    );
 
-    return this.shipmentsService.createProofOfDelivery(shipmentId, body);
+    return this.shipmentsService.createProofOfDelivery(
+      shipmentId,
+      body,
+      user.sub,
+    );
   }
 
   @Post(':id/plan')
@@ -517,15 +595,19 @@ export class ShipmentsController {
         OrganizationRole.OPERATIONS,
       ],
     );
-    await this.authorizationService.assertShipmentWriteAccess(user, shipmentId, {
-      allowedOrganizationRoles: [
-        OrganizationRole.ORG_ADMIN,
-        OrganizationRole.DISPATCHER,
-        OrganizationRole.OPERATIONS,
-      ],
-    });
+    await this.authorizationService.assertShipmentWriteAccess(
+      user,
+      shipmentId,
+      {
+        allowedOrganizationRoles: [
+          OrganizationRole.ORG_ADMIN,
+          OrganizationRole.DISPATCHER,
+          OrganizationRole.OPERATIONS,
+        ],
+      },
+    );
 
-    return this.shipmentsService.planShipment(shipmentId, body);
+    return this.shipmentsService.planShipment(shipmentId, body, user.sub);
   }
 
   @Post(':id/confirm')
@@ -551,15 +633,19 @@ export class ShipmentsController {
         OrganizationRole.OPERATIONS,
       ],
     );
-    await this.authorizationService.assertShipmentWriteAccess(user, shipmentId, {
-      allowedOrganizationRoles: [
-        OrganizationRole.ORG_ADMIN,
-        OrganizationRole.DISPATCHER,
-        OrganizationRole.OPERATIONS,
-      ],
-    });
+    await this.authorizationService.assertShipmentWriteAccess(
+      user,
+      shipmentId,
+      {
+        allowedOrganizationRoles: [
+          OrganizationRole.ORG_ADMIN,
+          OrganizationRole.DISPATCHER,
+          OrganizationRole.OPERATIONS,
+        ],
+      },
+    );
 
-    return this.shipmentsService.confirmShipment(shipmentId, body);
+    return this.shipmentsService.confirmShipment(shipmentId, body, user.sub);
   }
 
   @Post(':id/mark-at-pickup')
@@ -581,16 +667,20 @@ export class ShipmentsController {
       user,
       body.organizationId,
     );
-    await this.authorizationService.assertShipmentWriteAccess(user, shipmentId, {
-      allowedOrganizationRoles: [
-        OrganizationRole.ORG_ADMIN,
-        OrganizationRole.DISPATCHER,
-        OrganizationRole.OPERATIONS,
-      ],
-      allowAssignedDriver: true,
-    });
+    await this.authorizationService.assertShipmentWriteAccess(
+      user,
+      shipmentId,
+      {
+        allowedOrganizationRoles: [
+          OrganizationRole.ORG_ADMIN,
+          OrganizationRole.DISPATCHER,
+          OrganizationRole.OPERATIONS,
+        ],
+        allowAssignedDriver: true,
+      },
+    );
 
-    return this.shipmentsService.markAtPickup(shipmentId, body);
+    return this.shipmentsService.markAtPickup(shipmentId, body, user.sub);
   }
 
   @Post(':id/confirm-pickup')
@@ -612,16 +702,20 @@ export class ShipmentsController {
       user,
       body.organizationId,
     );
-    await this.authorizationService.assertShipmentWriteAccess(user, shipmentId, {
-      allowedOrganizationRoles: [
-        OrganizationRole.ORG_ADMIN,
-        OrganizationRole.DISPATCHER,
-        OrganizationRole.OPERATIONS,
-      ],
-      allowAssignedDriver: true,
-    });
+    await this.authorizationService.assertShipmentWriteAccess(
+      user,
+      shipmentId,
+      {
+        allowedOrganizationRoles: [
+          OrganizationRole.ORG_ADMIN,
+          OrganizationRole.DISPATCHER,
+          OrganizationRole.OPERATIONS,
+        ],
+        allowAssignedDriver: true,
+      },
+    );
 
-    return this.shipmentsService.confirmPickup(shipmentId, body);
+    return this.shipmentsService.confirmPickup(shipmentId, body, user.sub);
   }
 
   @Post(':id/mark-in-transit')
@@ -643,16 +737,20 @@ export class ShipmentsController {
       user,
       body.organizationId,
     );
-    await this.authorizationService.assertShipmentWriteAccess(user, shipmentId, {
-      allowedOrganizationRoles: [
-        OrganizationRole.ORG_ADMIN,
-        OrganizationRole.DISPATCHER,
-        OrganizationRole.OPERATIONS,
-      ],
-      allowAssignedDriver: true,
-    });
+    await this.authorizationService.assertShipmentWriteAccess(
+      user,
+      shipmentId,
+      {
+        allowedOrganizationRoles: [
+          OrganizationRole.ORG_ADMIN,
+          OrganizationRole.DISPATCHER,
+          OrganizationRole.OPERATIONS,
+        ],
+        allowAssignedDriver: true,
+      },
+    );
 
-    return this.shipmentsService.markInTransit(shipmentId, body);
+    return this.shipmentsService.markInTransit(shipmentId, body, user.sub);
   }
 
   @Post(':id/mark-at-delivery')
@@ -674,16 +772,20 @@ export class ShipmentsController {
       user,
       body.organizationId,
     );
-    await this.authorizationService.assertShipmentWriteAccess(user, shipmentId, {
-      allowedOrganizationRoles: [
-        OrganizationRole.ORG_ADMIN,
-        OrganizationRole.DISPATCHER,
-        OrganizationRole.OPERATIONS,
-      ],
-      allowAssignedDriver: true,
-    });
+    await this.authorizationService.assertShipmentWriteAccess(
+      user,
+      shipmentId,
+      {
+        allowedOrganizationRoles: [
+          OrganizationRole.ORG_ADMIN,
+          OrganizationRole.DISPATCHER,
+          OrganizationRole.OPERATIONS,
+        ],
+        allowAssignedDriver: true,
+      },
+    );
 
-    return this.shipmentsService.markAtDelivery(shipmentId, body);
+    return this.shipmentsService.markAtDelivery(shipmentId, body, user.sub);
   }
 
   @Post(':id/complete-delivery')
@@ -714,7 +816,7 @@ export class ShipmentsController {
       allowAssignedDriver: true,
     });
 
-    return this.shipmentsService.completeDelivery(shipmentId, body);
+    return this.shipmentsService.completeDelivery(shipmentId, body, user.sub);
   }
 
   @Post(':id/complete')
@@ -740,15 +842,19 @@ export class ShipmentsController {
         OrganizationRole.OPERATIONS,
       ],
     );
-    await this.authorizationService.assertShipmentWriteAccess(user, shipmentId, {
-      allowedOrganizationRoles: [
-        OrganizationRole.ORG_ADMIN,
-        OrganizationRole.DISPATCHER,
-        OrganizationRole.OPERATIONS,
-      ],
-    });
+    await this.authorizationService.assertShipmentWriteAccess(
+      user,
+      shipmentId,
+      {
+        allowedOrganizationRoles: [
+          OrganizationRole.ORG_ADMIN,
+          OrganizationRole.DISPATCHER,
+          OrganizationRole.OPERATIONS,
+        ],
+      },
+    );
 
-    return this.shipmentsService.completeShipment(shipmentId, body);
+    return this.shipmentsService.completeShipment(shipmentId, body, user.sub);
   }
 
   @Post(':id/fail')
@@ -770,16 +876,20 @@ export class ShipmentsController {
       user,
       body.organizationId,
     );
-    await this.authorizationService.assertShipmentWriteAccess(user, shipmentId, {
-      allowedOrganizationRoles: [
-        OrganizationRole.ORG_ADMIN,
-        OrganizationRole.DISPATCHER,
-        OrganizationRole.OPERATIONS,
-      ],
-      allowAssignedDriver: true,
-    });
+    await this.authorizationService.assertShipmentWriteAccess(
+      user,
+      shipmentId,
+      {
+        allowedOrganizationRoles: [
+          OrganizationRole.ORG_ADMIN,
+          OrganizationRole.DISPATCHER,
+          OrganizationRole.OPERATIONS,
+        ],
+        allowAssignedDriver: true,
+      },
+    );
 
-    return this.shipmentsService.failShipment(shipmentId, body);
+    return this.shipmentsService.failShipment(shipmentId, body, user.sub);
   }
 
   @Post(':id/cancel')
@@ -805,15 +915,19 @@ export class ShipmentsController {
         OrganizationRole.OPERATIONS,
       ],
     );
-    await this.authorizationService.assertShipmentWriteAccess(user, shipmentId, {
-      allowedOrganizationRoles: [
-        OrganizationRole.ORG_ADMIN,
-        OrganizationRole.DISPATCHER,
-        OrganizationRole.OPERATIONS,
-      ],
-    });
+    await this.authorizationService.assertShipmentWriteAccess(
+      user,
+      shipmentId,
+      {
+        allowedOrganizationRoles: [
+          OrganizationRole.ORG_ADMIN,
+          OrganizationRole.DISPATCHER,
+          OrganizationRole.OPERATIONS,
+        ],
+      },
+    );
 
-    return this.shipmentsService.cancelShipment(shipmentId, body);
+    return this.shipmentsService.cancelShipment(shipmentId, body, user.sub);
   }
 
   @Post(':id/manual-status')
@@ -839,21 +953,31 @@ export class ShipmentsController {
         OrganizationRole.OPERATIONS,
       ],
     );
-    await this.authorizationService.assertShipmentWriteAccess(user, shipmentId, {
-      allowedOrganizationRoles: [
-        OrganizationRole.ORG_ADMIN,
-        OrganizationRole.DISPATCHER,
-        OrganizationRole.OPERATIONS,
-      ],
-    });
+    await this.authorizationService.assertShipmentWriteAccess(
+      user,
+      shipmentId,
+      {
+        allowedOrganizationRoles: [
+          OrganizationRole.ORG_ADMIN,
+          OrganizationRole.DISPATCHER,
+          OrganizationRole.OPERATIONS,
+        ],
+      },
+    );
 
-    return this.shipmentsService.manuallyUpdateShipmentStatus(shipmentId, body);
+    return this.shipmentsService.manuallyUpdateShipmentStatus(
+      shipmentId,
+      body,
+      user.sub,
+    );
   }
 
   @Delete(':id')
   @ApiOperation({ summary: 'Delete a shipment' })
   @ApiParam({ name: 'id', type: String })
   @ApiQuery({ name: 'organizationId', required: true, type: String })
+  @ApiQuery({ name: 'reason', required: false, type: String })
+  @ApiBody({ type: DeleteShipmentDto, required: false })
   @Roles(
     OrganizationRole.ORG_ADMIN,
     OrganizationRole.DISPATCHER,
@@ -863,6 +987,8 @@ export class ShipmentsController {
     @Param('id') shipmentId: string,
     @Query('organizationId') organizationId: string,
     @CurrentUser() user: JwtPayload,
+    @Body() body?: DeleteShipmentDto,
+    @Query('reason') reasonQuery?: string,
   ) {
     await this.authorizationService.assertOrganizationWriteAccess(
       user,
@@ -873,14 +999,23 @@ export class ShipmentsController {
         OrganizationRole.OPERATIONS,
       ],
     );
-    await this.authorizationService.assertShipmentWriteAccess(user, shipmentId, {
-      allowedOrganizationRoles: [
-        OrganizationRole.ORG_ADMIN,
-        OrganizationRole.DISPATCHER,
-        OrganizationRole.OPERATIONS,
-      ],
-    });
+    await this.authorizationService.assertShipmentWriteAccess(
+      user,
+      shipmentId,
+      {
+        allowedOrganizationRoles: [
+          OrganizationRole.ORG_ADMIN,
+          OrganizationRole.DISPATCHER,
+          OrganizationRole.OPERATIONS,
+        ],
+      },
+    );
 
-    return this.shipmentsService.deleteShipment(shipmentId, organizationId);
+    return this.shipmentsService.deleteShipment(
+      shipmentId,
+      organizationId,
+      body?.reason ?? reasonQuery,
+      user.sub,
+    );
   }
 }

@@ -1,6 +1,11 @@
 import { ForbiddenException, Injectable } from '@nestjs/common';
-import { OrganizationRole, OrganizationStatus, PlatformRole } from '@prisma/client';
+import {
+  OrganizationRole,
+  OrganizationStatus,
+  PlatformRole,
+} from '@prisma/client';
 import { PrismaService } from '../../shared/prisma/prisma.service';
+import { effectiveSectionAccess } from './auth-security.util';
 import type { JwtPayload } from './interfaces/jwt-payload.interface';
 
 type AllowedRole = `${OrganizationRole}` | `${PlatformRole}`;
@@ -9,6 +14,8 @@ type AllowedRole = `${OrganizationRole}` | `${PlatformRole}`;
 export class AuthorizationService {
   constructor(private readonly prisma: PrismaService) {}
 
+  // Kept async: every caller awaits it and future checks may hit the DB.
+  // eslint-disable-next-line @typescript-eslint/require-await
   async assertOrganizationAccess(
     user: JwtPayload,
     organizationId: string,
@@ -46,15 +53,55 @@ export class AuthorizationService {
     }
   }
 
+  /**
+   * True only for SUPER_ADMIN or an ORG_ADMIN member of the organization.
+   * Section access (including fullAccess) never satisfies this check.
+   */
+  isOrganizationAdmin(user: JwtPayload, organizationId: string) {
+    if (user.platformRole === PlatformRole.SUPER_ADMIN) {
+      return true;
+    }
+    return user.memberships.some(
+      (membership) =>
+        membership.organizationId === organizationId &&
+        membership.role === OrganizationRole.ORG_ADMIN,
+    );
+  }
+
+  assertOrganizationAdmin(
+    user: JwtPayload,
+    organizationId: string,
+    message?: string,
+  ) {
+    if (!this.isOrganizationAdmin(user, organizationId)) {
+      throw new ForbiddenException(
+        message ?? 'Only an organization admin can perform this action',
+      );
+    }
+  }
+
+  /** Section access held by the caller in this organization (null for drivers). */
+  getSectionAccess(user: JwtPayload, organizationId: string) {
+    const membership = user.memberships.find(
+      (item) => item.organizationId === organizationId,
+    );
+    return membership
+      ? effectiveSectionAccess(membership.role, membership.sectionAccess)
+      : null;
+  }
+
   private hasAnySectionAccess(user: JwtPayload, organizationId: string) {
     return user.memberships.some((membership) => {
       if (membership.organizationId !== organizationId) return false;
-      const access = membership.sectionAccess as { fullAccess?: boolean; sections?: unknown } | null;
-      return access?.fullAccess === true ||
-        (Array.isArray(access?.sections) &&
-          (user.requestedSection
-            ? access.sections.includes(user.requestedSection)
-            : access.sections.length > 0));
+      const access = effectiveSectionAccess(
+        membership.role,
+        membership.sectionAccess,
+      );
+      if (!access) return false;
+      if (access.fullAccess) return true;
+      return user.requestedSection
+        ? access.sections.includes(user.requestedSection)
+        : access.sections.length > 0;
     });
   }
 
@@ -80,8 +127,21 @@ export class AuthorizationService {
 
     if (organization.status !== OrganizationStatus.ACTIVE) {
       throw new ForbiddenException(
-        'Your organization is still pending approval. Browsing is allowed, but changes are blocked until approval.',
+        this.inactiveOrganizationMessage(organization.status),
       );
+    }
+  }
+
+  private inactiveOrganizationMessage(status?: OrganizationStatus | null) {
+    switch (status) {
+      case OrganizationStatus.PENDING_APPROVAL:
+        return 'Your organization is still pending approval. Browsing is allowed, but changes are blocked until approval.';
+      case OrganizationStatus.SUSPENDED:
+        return 'Your organization has been suspended. Contact Ashwa Logix support.';
+      case OrganizationStatus.REJECTED:
+        return 'Your organization registration was rejected.';
+      default:
+        return 'Organization access could not be resolved';
     }
   }
 
@@ -183,7 +243,7 @@ export class AuthorizationService {
 
     if (!organization || organization.status !== OrganizationStatus.ACTIVE) {
       throw new ForbiddenException(
-        'Your organization is still pending approval. Browsing is allowed, but changes are blocked until approval.',
+        this.inactiveOrganizationMessage(organization?.status),
       );
     }
 

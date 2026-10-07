@@ -30,11 +30,15 @@ type TransactionClient = Prisma.TransactionClient;
 
 type StockStatus = 'OK' | 'LOW' | 'OUT';
 
+const MIN_MOVEMENT_QUANTITY = '0.01';
+const MAX_CODE_GENERATION_ATTEMPTS = 5;
+
 type NormalizedMovementInput = {
   warehouseId: string;
   inventoryItemId: string;
   movementType: InventoryMovementType;
-  quantity: number;
+  /** Signed only for ADJUSTMENT (negative reduces stock). */
+  quantity: Prisma.Decimal;
   storageLocation?: string | null;
   storageLocationId?: string | null;
   destinationWarehouseId?: string | null;
@@ -61,8 +65,39 @@ export class WarehouseService {
   }
 
   async createWarehouse(organizationId: string, input: CreateWarehouseDto) {
-    const warehouseCode = await this.generateWarehouseCode(organizationId);
+    // Generated codes can collide under concurrent creates: retry on P2002.
+    for (let attempt = 0; ; attempt += 1) {
+      const warehouseCode = await this.generateWarehouseCode(
+        organizationId,
+        attempt,
+      );
+      try {
+        return await this.createWarehouseWithCode(
+          organizationId,
+          warehouseCode,
+          input,
+        );
+      } catch (error) {
+        const isUniqueViolation =
+          error instanceof Prisma.PrismaClientKnownRequestError &&
+          error.code === 'P2002';
+        if (!isUniqueViolation) {
+          throw error;
+        }
+        if (attempt + 1 >= MAX_CODE_GENERATION_ATTEMPTS) {
+          throw new ConflictException(
+            'Could not allocate a unique warehouse code. Please try again.',
+          );
+        }
+      }
+    }
+  }
 
+  private createWarehouseWithCode(
+    organizationId: string,
+    warehouseCode: string,
+    input: CreateWarehouseDto,
+  ) {
     return this.prisma.warehouse.create({
       data: {
         organizationId,
@@ -80,25 +115,48 @@ export class WarehouseService {
     });
   }
 
-  async deleteWarehouse(organizationId: string, warehouseId: string, reason: string, deletedByUserId: string) {
+  async deleteWarehouse(
+    organizationId: string,
+    warehouseId: string,
+    reason: string,
+    deletedByUserId: string,
+  ) {
     const warehouse = await this.getWarehouseById(organizationId, warehouseId);
-    const [stockCount, movementCount, destinationMovementCount] = await Promise.all([
-      this.prisma.inventoryStock.count({ where: { organizationId, warehouseId } }),
-      this.prisma.inventoryMovement.count({ where: { organizationId, warehouseId } }),
-      this.prisma.inventoryMovement.count({ where: { organizationId, destinationWarehouseId: warehouseId } }),
-    ]);
+    const [stockCount, movementCount, destinationMovementCount] =
+      await Promise.all([
+        this.prisma.inventoryStock.count({
+          where: { organizationId, warehouseId },
+        }),
+        this.prisma.inventoryMovement.count({
+          where: { organizationId, warehouseId },
+        }),
+        this.prisma.inventoryMovement.count({
+          where: { organizationId, destinationWarehouseId: warehouseId },
+        }),
+      ]);
     if (stockCount || movementCount || destinationMovementCount) {
-      throw new BadRequestException('Warehouses with inventory or movement history cannot be deleted. Empty or transfer stock first.');
+      throw new BadRequestException(
+        'Warehouses with inventory or movement history cannot be deleted. Empty or transfer stock first.',
+      );
     }
     await this.prisma.$transaction(async (tx) => {
       await tx.storageLocation.deleteMany({ where: { warehouseId } });
-      await tx.deletionAudit.create({ data: { organizationId, entityType: 'WAREHOUSE', entityId: warehouse.id, entityLabel: warehouse.name, reason: reason.trim(), deletedByUserId } });
+      await tx.deletionAudit.create({
+        data: {
+          organizationId,
+          entityType: 'WAREHOUSE',
+          entityId: warehouse.id,
+          entityLabel: warehouse.name,
+          reason: reason.trim(),
+          deletedByUserId,
+        },
+      });
       await tx.warehouse.delete({ where: { id: warehouseId } });
     });
     return { id: warehouseId, deleted: true };
   }
 
-  private async generateWarehouseCode(organizationId: string) {
+  private async generateWarehouseCode(organizationId: string, offset = 0) {
     const organization = await this.prisma.organization.findUnique({
       where: { id: organizationId },
       select: { name: true },
@@ -121,7 +179,9 @@ export class WarehouseService {
           'WAR',
         );
         return sequence !== null && sequence > highest ? sequence : highest;
-      }, 0) + 1;
+      }, 0) +
+      1 +
+      offset;
 
     return formatNumericCode(prefix, 'WAR', nextSequence);
   }
@@ -148,21 +208,25 @@ export class WarehouseService {
   ) {
     await this.ensureWarehouseExists(organizationId, warehouseId);
 
-    return this.prisma.warehouse.update({
-      where: { id: warehouseId },
-      data: {
-        warehouseCode: input.warehouseCode,
-        name: input.name,
-        addressLine1: input.addressLine1,
-        addressLine2: input.addressLine2,
-        city: input.city,
-        state: input.state,
-        postalCode: input.postalCode,
-        country: input.country,
-        status: input.status,
-        notes: input.notes,
-      },
-    });
+    return this.withUniqueConstraintMessage(
+      'A warehouse with this code already exists',
+      () =>
+        this.prisma.warehouse.update({
+          where: { id: warehouseId },
+          data: {
+            warehouseCode: input.warehouseCode,
+            name: input.name,
+            addressLine1: input.addressLine1,
+            addressLine2: input.addressLine2,
+            city: input.city,
+            state: input.state,
+            postalCode: input.postalCode,
+            country: input.country,
+            status: input.status,
+            notes: input.notes,
+          },
+        }),
+    );
   }
 
   async listInventoryItems(
@@ -182,30 +246,34 @@ export class WarehouseService {
     organizationId: string,
     input: CreateInventoryItemDto,
   ) {
-    return this.prisma.inventoryItem.create({
-      data: {
-        organizationId,
-        itemCode: input.itemCode,
-        name: input.name,
-        description: input.description,
-        category: input.category,
-        unitOfMeasure: input.unitOfMeasure,
-        rate:
-          input.rate !== undefined
-            ? new Prisma.Decimal(input.rate)
-            : undefined,
-        minThreshold:
-          input.minThreshold !== undefined
-            ? new Prisma.Decimal(input.minThreshold)
-            : undefined,
-        maxThreshold:
-          input.maxThreshold !== undefined
-            ? new Prisma.Decimal(input.maxThreshold)
-            : undefined,
-        status: input.status ?? InventoryItemStatus.ACTIVE,
-        notes: input.notes,
-      },
-    });
+    return this.withUniqueConstraintMessage(
+      'An inventory item with this item code already exists',
+      () =>
+        this.prisma.inventoryItem.create({
+          data: {
+            organizationId,
+            itemCode: input.itemCode,
+            name: input.name,
+            description: input.description,
+            category: input.category,
+            unitOfMeasure: input.unitOfMeasure,
+            rate:
+              input.rate !== undefined
+                ? new Prisma.Decimal(input.rate)
+                : undefined,
+            minThreshold:
+              input.minThreshold !== undefined
+                ? new Prisma.Decimal(input.minThreshold)
+                : undefined,
+            maxThreshold:
+              input.maxThreshold !== undefined
+                ? new Prisma.Decimal(input.maxThreshold)
+                : undefined,
+            status: input.status ?? InventoryItemStatus.ACTIVE,
+            notes: input.notes,
+          },
+        }),
+    );
   }
 
   async getInventoryItemById(organizationId: string, inventoryItemId: string) {
@@ -230,30 +298,34 @@ export class WarehouseService {
   ) {
     await this.ensureInventoryItemExists(organizationId, inventoryItemId);
 
-    return this.prisma.inventoryItem.update({
-      where: { id: inventoryItemId },
-      data: {
-        itemCode: input.itemCode,
-        name: input.name,
-        description: input.description,
-        category: input.category,
-        unitOfMeasure: input.unitOfMeasure,
-        rate:
-          input.rate !== undefined
-            ? new Prisma.Decimal(input.rate)
-            : undefined,
-        minThreshold:
-          input.minThreshold !== undefined
-            ? new Prisma.Decimal(input.minThreshold)
-            : undefined,
-        maxThreshold:
-          input.maxThreshold !== undefined
-            ? new Prisma.Decimal(input.maxThreshold)
-            : undefined,
-        status: input.status,
-        notes: input.notes,
-      },
-    });
+    return this.withUniqueConstraintMessage(
+      'An inventory item with this item code already exists',
+      () =>
+        this.prisma.inventoryItem.update({
+          where: { id: inventoryItemId },
+          data: {
+            itemCode: input.itemCode,
+            name: input.name,
+            description: input.description,
+            category: input.category,
+            unitOfMeasure: input.unitOfMeasure,
+            rate:
+              input.rate !== undefined
+                ? new Prisma.Decimal(input.rate)
+                : undefined,
+            minThreshold:
+              input.minThreshold !== undefined
+                ? new Prisma.Decimal(input.minThreshold)
+                : undefined,
+            maxThreshold:
+              input.maxThreshold !== undefined
+                ? new Prisma.Decimal(input.maxThreshold)
+                : undefined,
+            status: input.status,
+            notes: input.notes,
+          },
+        }),
+    );
   }
 
   async deleteInventoryItem(organizationId: string, inventoryItemId: string) {
@@ -362,10 +434,7 @@ export class WarehouseService {
         warehouse: true,
         storageLocationRef: true,
       },
-      orderBy: [
-        { inventoryItem: { name: 'asc' } },
-        { storageLocation: 'asc' },
-      ],
+      orderBy: [{ inventoryItem: { name: 'asc' } }, { storageLocation: 'asc' }],
     });
 
     return rows.map((row) => ({
@@ -436,8 +505,23 @@ export class WarehouseService {
     organizationId: string,
     input: CreateInventoryMovementDto,
   ) {
-    await this.ensureWarehouseExists(organizationId, input.warehouseId);
-    await this.ensureInventoryItemExists(organizationId, input.inventoryItemId);
+    const warehouse = await this.ensureWarehouseExists(
+      organizationId,
+      input.warehouseId,
+    );
+    const inventoryItem = await this.ensureInventoryItemExists(
+      organizationId,
+      input.inventoryItemId,
+    );
+    const quantity = this.resolveMovementQuantity(input);
+    const addsStockToSource =
+      input.movementType === InventoryMovementType.INBOUND ||
+      (input.movementType === InventoryMovementType.ADJUSTMENT &&
+        quantity.gt(0));
+
+    if (addsStockToSource) {
+      this.assertCanReceiveStock(warehouse, inventoryItem);
+    }
 
     if (input.movementType === InventoryMovementType.TRANSFER) {
       if (!input.destinationWarehouseId) {
@@ -452,7 +536,11 @@ export class WarehouseService {
         );
       }
 
-      await this.ensureWarehouseExists(organizationId, input.destinationWarehouseId);
+      const destinationWarehouse = await this.ensureWarehouseExists(
+        organizationId,
+        input.destinationWarehouseId,
+      );
+      this.assertCanReceiveStock(destinationWarehouse, inventoryItem);
     }
 
     return this.prisma.$transaction(async (tx) => {
@@ -460,7 +548,7 @@ export class WarehouseService {
         warehouseId: input.warehouseId,
         inventoryItemId: input.inventoryItemId,
         movementType: input.movementType,
-        quantity: input.quantity,
+        quantity,
         storageLocation: input.storageLocation ?? null,
         storageLocationId: input.storageLocationId ?? null,
         destinationWarehouseId: input.destinationWarehouseId ?? null,
@@ -473,6 +561,54 @@ export class WarehouseService {
 
       return movement;
     });
+  }
+
+  /**
+   * Quantities are positive, except ADJUSTMENT which is signed: a negative
+   * quantity or adjustmentDirection=DECREASE reduces stock.
+   */
+  private resolveMovementQuantity(input: CreateInventoryMovementDto) {
+    const raw = new Prisma.Decimal(input.quantity);
+
+    if (input.movementType === InventoryMovementType.ADJUSTMENT) {
+      if (raw.abs().lt(MIN_MOVEMENT_QUANTITY)) {
+        throw new BadRequestException(
+          `Adjustment quantity must be at least ${MIN_MOVEMENT_QUANTITY}`,
+        );
+      }
+      if (input.adjustmentDirection === 'DECREASE') {
+        return raw.abs().negated();
+      }
+      if (input.adjustmentDirection === 'INCREASE') {
+        return raw.abs();
+      }
+      return raw;
+    }
+
+    if (raw.lt(MIN_MOVEMENT_QUANTITY)) {
+      throw new BadRequestException(
+        `Quantity must be at least ${MIN_MOVEMENT_QUANTITY}`,
+      );
+    }
+
+    return raw;
+  }
+
+  private assertCanReceiveStock(
+    warehouse: { name: string; status: WarehouseStatus },
+    inventoryItem: { name: string; status: InventoryItemStatus },
+  ) {
+    if (warehouse.status !== WarehouseStatus.ACTIVE) {
+      throw new BadRequestException(
+        `Warehouse ${warehouse.name} is inactive and cannot receive stock`,
+      );
+    }
+
+    if (inventoryItem.status !== InventoryItemStatus.ACTIVE) {
+      throw new BadRequestException(
+        `Inventory item ${inventoryItem.name} is inactive and cannot receive stock`,
+      );
+    }
   }
 
   async reverseInventoryMovement(
@@ -497,23 +633,34 @@ export class WarehouseService {
     }
 
     if (originalMovement.reversedByMovement) {
-      throw new ConflictException('Inventory movement has already been reversed');
+      throw new ConflictException(
+        'Inventory movement has already been reversed',
+      );
     }
 
-    return this.prisma.$transaction(async (tx) => {
-      const reversalInput = this.buildReversalMovementInput(
-        originalMovement,
-        input.notes,
-      );
+    try {
+      return await this.prisma.$transaction(async (tx) => {
+        const reversalInput = this.buildReversalMovementInput(
+          originalMovement,
+          input.notes,
+        );
 
-      const movement = await this.recordInventoryMovement(
-        tx,
-        organizationId,
-        reversalInput,
-      );
+        const movement = await this.recordInventoryMovement(
+          tx,
+          organizationId,
+          reversalInput,
+        );
 
-      return movement;
-    });
+        return movement;
+      });
+    } catch (error) {
+      // reversalOfMovementId is unique: a concurrent reversal won the race.
+      this.throwUniqueConstraintError(
+        error,
+        'Inventory movement has already been reversed',
+      );
+      throw error;
+    }
   }
 
   private buildReversalMovementInput(
@@ -533,7 +680,7 @@ export class WarehouseService {
     },
     notes: string,
   ): NormalizedMovementInput {
-    const quantity = Number(movement.quantity);
+    const quantity = new Prisma.Decimal(movement.quantity);
 
     switch (movement.movementType) {
       case InventoryMovementType.INBOUND:
@@ -569,7 +716,7 @@ export class WarehouseService {
           warehouseId: movement.warehouseId,
           inventoryItemId: movement.inventoryItemId,
           movementType: InventoryMovementType.ADJUSTMENT,
-          quantity: quantity * -1,
+          quantity: quantity.negated(),
           storageLocation: movement.storageLocation,
           storageLocationId: movement.storageLocationId,
           referenceType: movement.referenceType,
@@ -609,94 +756,66 @@ export class WarehouseService {
     organizationId: string,
     input: NormalizedMovementInput,
   ) {
+    const quantity = new Prisma.Decimal(input.quantity);
+    const sourceDelta = this.calculateSourceDelta(input.movementType, quantity);
+
     const sourceLocation = await this.resolveSourceStorageLocation(
       tx,
       organizationId,
       input.warehouseId,
       input.storageLocationId ?? null,
       input.storageLocation ?? null,
+      // Reversals restore a previous state, so they may touch inactive bins.
+      sourceDelta.gt(0) && !input.reversalOfMovementId,
     );
 
-    const sourceStock = await this.findStockRow(
-      tx,
-      organizationId,
-      input.warehouseId,
-      input.inventoryItemId,
-      sourceLocation.storageLocation,
-      sourceLocation.storageLocationId,
-    );
-
-    const currentQuantity = sourceStock ? Number(sourceStock.quantityOnHand) : 0;
-    const nextQuantity = this.calculateNextQuantity(
-      currentQuantity,
-      input.movementType,
-      input.quantity,
-    );
-
-    if (nextQuantity < 0) {
-      throw new BadRequestException(
-        'Inventory movement would make stock negative',
-      );
-    }
-
-    if (sourceStock) {
-      await tx.inventoryStock.update({
-        where: { id: sourceStock.id },
-        data: {
-          quantityOnHand: new Prisma.Decimal(nextQuantity),
-          storageLocationId:
-            sourceStock.storageLocationId ?? sourceLocation.storageLocationId,
-        },
-      });
-    } else {
-      await tx.inventoryStock.create({
-        data: {
-          organizationId,
-          warehouseId: input.warehouseId,
-          inventoryItemId: input.inventoryItemId,
-          storageLocation: sourceLocation.storageLocation,
-          storageLocationId: sourceLocation.storageLocationId,
-          quantityOnHand: new Prisma.Decimal(nextQuantity),
-        },
-      });
-    }
-
-    if (
+    const isTransfer =
       input.movementType === InventoryMovementType.TRANSFER &&
-      input.destinationWarehouseId
-    ) {
-      const destinationStock = await this.findStockRow(
-        tx,
-        organizationId,
-        input.destinationWarehouseId,
-        input.inventoryItemId,
-        input.destinationStorageLocation ?? null,
-        null,
-      );
-      const destinationCurrentQuantity = destinationStock
-        ? Number(destinationStock.quantityOnHand)
-        : 0;
+      !!input.destinationWarehouseId;
+    const destinationStorageLocation =
+      input.destinationStorageLocation?.trim() || null;
 
-      if (destinationStock) {
-        await tx.inventoryStock.update({
-          where: { id: destinationStock.id },
-          data: {
-            quantityOnHand: new Prisma.Decimal(
-              destinationCurrentQuantity + input.quantity,
+    // Serialize concurrent movements on the same stock rows (incl. NULL
+    // storage locations, which the unique index does not cover). Locks are
+    // taken in a stable order so opposite transfers cannot deadlock.
+    const lockKeys = [
+      this.stockLockKey(
+        input.warehouseId,
+        input.inventoryItemId,
+        sourceLocation.storageLocation,
+      ),
+      ...(isTransfer
+        ? [
+            this.stockLockKey(
+              input.destinationWarehouseId as string,
+              input.inventoryItemId,
+              destinationStorageLocation,
             ),
-          },
-        });
-      } else {
-        await tx.inventoryStock.create({
-          data: {
-            organizationId,
-            warehouseId: input.destinationWarehouseId,
-            inventoryItemId: input.inventoryItemId,
-            storageLocation: input.destinationStorageLocation ?? null,
-            quantityOnHand: new Prisma.Decimal(input.quantity),
-          },
-        });
-      }
+          ]
+        : []),
+    ].sort();
+    for (const key of lockKeys) {
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${'inventory_stock'}), hashtext(${key}))`;
+    }
+
+    await this.applyStockDelta(tx, {
+      organizationId,
+      warehouseId: input.warehouseId,
+      inventoryItemId: input.inventoryItemId,
+      storageLocation: sourceLocation.storageLocation,
+      storageLocationId: sourceLocation.storageLocationId,
+      delta: sourceDelta,
+    });
+
+    if (isTransfer) {
+      await this.applyStockDelta(tx, {
+        organizationId,
+        warehouseId: input.destinationWarehouseId as string,
+        inventoryItemId: input.inventoryItemId,
+        storageLocation: destinationStorageLocation,
+        storageLocationId: null,
+        delta: quantity,
+      });
     }
 
     const movement = await tx.inventoryMovement.create({
@@ -705,7 +824,7 @@ export class WarehouseService {
         warehouseId: input.warehouseId,
         inventoryItemId: input.inventoryItemId,
         movementType: input.movementType,
-        quantity: new Prisma.Decimal(input.quantity),
+        quantity,
         storageLocation: sourceLocation.storageLocation,
         storageLocationId: sourceLocation.storageLocationId,
         destinationWarehouseId: input.destinationWarehouseId,
@@ -729,17 +848,120 @@ export class WarehouseService {
     return this.serializeMovementWithReversal(movement);
   }
 
+  private stockLockKey(
+    warehouseId: string,
+    inventoryItemId: string,
+    storageLocation: string | null,
+  ) {
+    return `${warehouseId}:${inventoryItemId}:${storageLocation ?? '\u0000null'}`;
+  }
+
+  /**
+   * Applies a signed quantity change to a stock row atomically: decrements
+   * are conditional on enough stock (no read-compute-write in JS), so
+   * concurrent movements can never drive stock negative or lose updates.
+   */
+  private async applyStockDelta(
+    tx: TransactionClient,
+    input: {
+      organizationId: string;
+      warehouseId: string;
+      inventoryItemId: string;
+      storageLocation: string | null;
+      storageLocationId: string | null;
+      delta: Prisma.Decimal;
+    },
+  ) {
+    const stockRow = await this.findStockRow(
+      tx,
+      input.organizationId,
+      input.warehouseId,
+      input.inventoryItemId,
+      input.storageLocation,
+      input.storageLocationId,
+    );
+
+    if (!stockRow) {
+      if (input.delta.lt(0)) {
+        throw new BadRequestException(
+          'Inventory movement would make stock negative',
+        );
+      }
+
+      try {
+        await tx.inventoryStock.create({
+          data: {
+            organizationId: input.organizationId,
+            warehouseId: input.warehouseId,
+            inventoryItemId: input.inventoryItemId,
+            storageLocation: input.storageLocation,
+            storageLocationId: input.storageLocationId,
+            quantityOnHand: input.delta,
+          },
+        });
+      } catch (error) {
+        if (
+          error instanceof Prisma.PrismaClientKnownRequestError &&
+          error.code === 'P2002'
+        ) {
+          throw new ConflictException(
+            'Stock was updated concurrently. Please retry the movement.',
+          );
+        }
+        throw error;
+      }
+      return;
+    }
+
+    const storageLocationIdPatch =
+      !stockRow.storageLocationId && input.storageLocationId
+        ? { storageLocationId: input.storageLocationId }
+        : {};
+
+    if (input.delta.gte(0)) {
+      await tx.inventoryStock.update({
+        where: { id: stockRow.id },
+        data: {
+          quantityOnHand: { increment: input.delta },
+          ...storageLocationIdPatch,
+        },
+      });
+      return;
+    }
+
+    const decrement = input.delta.abs();
+    const result = await tx.inventoryStock.updateMany({
+      where: {
+        id: stockRow.id,
+        quantityOnHand: { gte: decrement },
+      },
+      data: {
+        quantityOnHand: { decrement },
+        ...storageLocationIdPatch,
+      },
+    });
+
+    if (result.count === 0) {
+      throw new BadRequestException(
+        'Inventory movement would make stock negative',
+      );
+    }
+  }
+
   private async resolveSourceStorageLocation(
     tx: TransactionClient,
     organizationId: string,
     warehouseId: string,
     storageLocationId: string | null,
     storageLocation: string | null,
+    requireActive = false,
   ) {
+    const normalizedStorageLocation = storageLocation?.trim() || null;
+
     if (!storageLocationId) {
       return {
         storageLocationId: null,
-        storageLocation,
+        storageLocation: normalizedStorageLocation,
       };
     }
 
@@ -757,9 +979,15 @@ export class WarehouseService {
       throw new NotFoundException('Storage location not found');
     }
 
+    if (requireActive && location.status !== StorageLocationStatus.ACTIVE) {
+      throw new BadRequestException(
+        `Storage location ${location.code} is inactive and cannot receive stock`,
+      );
+    }
+
     return {
       storageLocationId: location.id,
-      storageLocation: storageLocation ?? location.code,
+      storageLocation: normalizedStorageLocation ?? location.code,
     };
   }
 
@@ -776,7 +1004,8 @@ export class WarehouseService {
         organizationId,
         warehouseId,
         inventoryItemId,
-        storageLocation,
+        // Explicit NULL handling: `storageLocation: null` matches IS NULL.
+        storageLocation: storageLocation === null ? null : storageLocation,
       },
       orderBy: { createdAt: 'asc' },
       take: 10,
@@ -814,14 +1043,13 @@ export class WarehouseService {
     return 'OK';
   }
 
-  private serializeMovementWithReversal(
-    movement: {
-      reversedByMovement?: { id: string } | null;
-      [key: string]: unknown;
-    },
-  ) {
+  private serializeMovementWithReversal(movement: {
+    reversedByMovement?: { id: string } | null;
+    [key: string]: unknown;
+  }) {
     const reversedByMovementId = movement.reversedByMovement?.id ?? null;
-    const { reversedByMovement, ...rest } = movement;
+    const rest: Record<string, unknown> = { ...movement };
+    delete rest.reversedByMovement;
 
     return {
       ...rest,
@@ -829,22 +1057,34 @@ export class WarehouseService {
     };
   }
 
-  private calculateNextQuantity(
-    currentQuantity: number,
+  /** Signed change applied to the source stock row for a movement. */
+  private calculateSourceDelta(
     movementType: InventoryMovementType,
-    quantity: number,
+    quantity: Prisma.Decimal,
   ) {
     switch (movementType) {
       case InventoryMovementType.INBOUND:
-        return currentQuantity + quantity;
+        return quantity;
       case InventoryMovementType.OUTBOUND:
-        return currentQuantity - quantity;
+        return quantity.negated();
       case InventoryMovementType.ADJUSTMENT:
-        return currentQuantity + quantity;
+        return quantity;
       case InventoryMovementType.TRANSFER:
-        return currentQuantity - quantity;
+        return quantity.negated();
       default:
-        return currentQuantity;
+        throw new BadRequestException('Unsupported movement type');
+    }
+  }
+
+  private async withUniqueConstraintMessage<T>(
+    message: string,
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    try {
+      return await operation();
+    } catch (error) {
+      this.throwUniqueConstraintError(error, message);
+      throw error;
     }
   }
 
@@ -857,7 +1097,10 @@ export class WarehouseService {
     }
   }
 
-  private async ensureWarehouseExists(organizationId: string, warehouseId: string) {
+  private async ensureWarehouseExists(
+    organizationId: string,
+    warehouseId: string,
+  ) {
     const warehouse = await this.prisma.warehouse.findFirst({
       where: {
         id: warehouseId,

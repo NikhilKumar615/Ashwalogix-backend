@@ -924,6 +924,7 @@ model Shipment {
   @@index([currentDriverId])
   @@index([currentTrackingSessionId])
   @@index([invoiceNumber])
+  @@index([organizationId, status, createdAt])
   @@map("shipments")
 }
 
@@ -997,6 +998,8 @@ model ShipmentAssignment {
   @@index([vehicleId])
   @@index([assignmentStatus])
   @@index([assignedAt])
+  @@index([driverId, assignmentStatus])
+  @@index([vehicleId, assignmentStatus])
   @@map("shipment_assignments")
 }
 
@@ -1005,6 +1008,7 @@ model ShipmentStatusEvent {
   organizationId String          @map("organization_id") @db.Uuid
   shipmentId     String          @map("shipment_id") @db.Uuid
   driverId       String?         @map("driver_id") @db.Uuid
+  actorUserId    String?         @map("actor_user_id") @db.Uuid
   eventType      String          @map("event_type")
   fromStatus     ShipmentStatus? @map("from_status")
   toStatus       ShipmentStatus? @map("to_status")
@@ -1021,6 +1025,8 @@ model ShipmentStatusEvent {
   @@index([shipmentId])
   @@index([eventType])
   @@index([eventTime(sort: Desc)])
+  @@index([shipmentId, eventTime])
+  @@index([actorUserId])
   @@map("shipment_status_events")
 }
 
@@ -1043,6 +1049,7 @@ model TrackingSession {
   @@index([shipmentId])
   @@index([driverId])
   @@index([status])
+  @@index([shipmentId, status])
   @@map("tracking_sessions")
 }
 
@@ -1068,6 +1075,7 @@ model TrackingPoint {
   @@index([shipmentId])
   @@index([driverId])
   @@index([recordedAt(sort: Desc)])
+  @@index([shipmentId, recordedAt])
   @@map("tracking_points")
 }
 

@@ -1,8 +1,11 @@
 import {
   BadRequestException,
   ForbiddenException,
+  HttpException,
+  HttpStatus,
   Injectable,
   Logger,
+  NotFoundException,
   UnauthorizedException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
@@ -24,9 +27,23 @@ import {
   SubscriptionStatus,
   UserStatus,
 } from '@prisma/client';
-import { compare, hash } from 'bcryptjs';
+import { compare, hash, hashSync } from 'bcryptjs';
 import { randomInt, randomUUID } from 'crypto';
+import {
+  jwtSecret,
+  shouldExposeEmailTokens,
+} from '../../shared/config/runtime-security';
 import { PrismaService } from '../../shared/prisma/prisma.service';
+import {
+  ACCESS_TOKEN_TYPE,
+  AttemptLimiter,
+  generateOneTimeToken,
+  hashOneTimeToken,
+  invalidateAllSessions,
+  invalidateUserSession,
+  oneTimeTokenLookupValues,
+  passwordFingerprint,
+} from './auth-security.util';
 import {
   formatIndependentDriverCode,
   formatPlatformClientCode,
@@ -35,6 +52,7 @@ import {
   parseIndependentDriverCodeSequence,
   parsePlatformClientCodeSequence,
 } from '../../shared/codes/entity-code.util';
+import { isPublicRegistrationStorageKey } from '../documents/documents-upload-policy';
 import { MailService } from '../mail/mail.service';
 import { CreateClientOrganizationDto } from './dto/create-client-organization.dto';
 import { LoginDto } from './dto/login.dto';
@@ -45,6 +63,14 @@ import { SuperAdminVerifyOtpDto } from './dto/super-admin-verify-otp.dto';
 import { UpdateClientOrganizationDto } from './dto/update-client-organization.dto';
 import { VerifyEmailDto } from './dto/verify-email.dto';
 import { JwtPayload } from './interfaces/jwt-payload.interface';
+
+/** A real bcrypt hash used to equalise timing when the account does not exist. */
+const DUMMY_PASSWORD_HASH = hashSync(randomUUID(), 10);
+
+/** Per-account super-admin OTP failures: 5 wrong codes => OTP invalidated + 15 min lock. */
+const otpAttemptLimiter = new AttemptLimiter(5, 15 * 60_000, 15 * 60_000);
+/** Per-email password failures: 10 within 15 min => 15 min lock (applies to unknown emails too). */
+const loginAttemptLimiter = new AttemptLimiter(10, 15 * 60_000, 15 * 60_000);
 
 @Injectable()
 export class AuthService {
@@ -59,6 +85,17 @@ export class AuthService {
   ) {}
 
   async registerCompanyAdmin(input: RegisterCompanyAdminDto) {
+    // S6: self-registration may only reference files uploaded through the
+    // public onboarding upload (never another organization's storage keys).
+    const invalidDocument = input.registrationDocuments?.find(
+      (document) => !isPublicRegistrationStorageKey(document.storageKey),
+    );
+    if (invalidDocument) {
+      throw new BadRequestException(
+        'Registration documents must be uploaded through the onboarding upload',
+      );
+    }
+
     const existingUser = await this.prisma.user.findFirst({
       where: {
         OR: [
@@ -75,9 +112,8 @@ export class AuthService {
     }
 
     const passwordHash = await hash(input.password, 10);
-    const now = new Date();
 
-    const verificationToken = randomUUID();
+    const verificationToken = generateOneTimeToken();
     const verificationHours = this.getVerificationLinkHours();
     const verificationTokenExpiresAt = new Date(
       Date.now() + verificationHours * 60 * 60 * 1000,
@@ -92,7 +128,8 @@ export class AuthService {
           passwordHash,
           // Verification is required for email updates, not for initial access.
           status: UserStatus.PENDING_APPROVAL,
-          verificationToken,
+          // Only the SHA-256 of the emailed token is stored.
+          verificationToken: hashOneTimeToken(verificationToken),
           verificationTokenExpiresAt,
         },
       });
@@ -163,7 +200,8 @@ export class AuthService {
     }
 
     return {
-      message: 'Registration created. You can sign in while approval is pending. Please verify your email within 72 hours to continue receiving access and email updates.',
+      message:
+        'Registration created. You can sign in while approval is pending. Please verify your email within 72 hours to continue receiving access and email updates.',
       userId: result.user.id,
       organizationId: result.organization.id,
     };
@@ -259,7 +297,7 @@ export class AuthService {
   async verifyEmail(input: VerifyEmailDto) {
     const user = await this.prisma.user.findFirst({
       where: {
-        verificationToken: input.token,
+        verificationToken: { in: oneTimeTokenLookupValues(input.token) },
       },
     });
 
@@ -290,6 +328,7 @@ export class AuthService {
         emailVerificationSuspendedAt: null,
       },
     });
+    invalidateUserSession(user.id);
 
     return {
       message: wasSuspendedForEmailVerification
@@ -303,7 +342,7 @@ export class AuthService {
   async login(input: LoginDto) {
     const user = await this.getUserForAuthentication(input.email);
 
-    await this.assertValidPassword(user, input.password);
+    await this.assertValidPassword(user, input.password, input.email);
     if (!user) {
       throw new UnauthorizedException('Invalid email or password');
     }
@@ -322,7 +361,7 @@ export class AuthService {
   async requestSuperAdminOtp(input: SuperAdminRequestOtpDto) {
     const user = await this.getUserForAuthentication(input.email);
 
-    await this.assertValidPassword(user, input.password);
+    await this.assertValidPassword(user, input.password, input.email);
     if (!user) {
       throw new UnauthorizedException('Invalid email or password');
     }
@@ -333,6 +372,8 @@ export class AuthService {
         'Only SUPER_ADMIN accounts can use the OTP sign-in flow',
       );
     }
+
+    this.assertOtpNotLocked(user.id);
 
     const otp = String(randomInt(0, 1_000_000)).padStart(6, '0');
     const ttlMinutes = Number(
@@ -369,8 +410,19 @@ export class AuthService {
       message: 'OTP sent to your email address',
       email: user.email,
       expiresAt,
+      // Only ever echoed in non-production with AUTH_EXPOSE_EMAIL_TOKENS=true.
       otp: this.shouldExposeEmailTokens() ? otp : undefined,
     };
+  }
+
+  private assertOtpNotLocked(userId: string) {
+    const lockedForMs = otpAttemptLimiter.lockedFor(userId);
+    if (lockedForMs > 0) {
+      throw new HttpException(
+        `Too many incorrect OTP attempts. Try again in ${Math.ceil(lockedForMs / 60_000)} minute(s).`,
+        HttpStatus.TOO_MANY_REQUESTS,
+      );
+    }
   }
 
   async verifySuperAdminOtp(input: SuperAdminVerifyOtpDto) {
@@ -387,6 +439,8 @@ export class AuthService {
       );
     }
 
+    this.assertOtpNotLocked(user.id);
+
     if (!user.loginOtpHash || !user.loginOtpExpiresAt) {
       throw new BadRequestException(
         'Request a new OTP before attempting to verify',
@@ -401,27 +455,44 @@ export class AuthService {
     const otpMatches = await compare(input.otp, user.loginOtpHash);
 
     if (!otpMatches) {
+      const lockedOut = otpAttemptLimiter.recordFailure(user.id);
+      if (lockedOut) {
+        // Burn the OTP so the remaining guesses cannot be spent on it.
+        await this.clearLoginOtp(user.id);
+        this.logger.warn(
+          `Super-admin OTP locked after repeated failures for user ${user.id}`,
+        );
+        throw new HttpException(
+          'Too many incorrect OTP attempts. The code has been invalidated; request a new one in 15 minutes.',
+          HttpStatus.TOO_MANY_REQUESTS,
+        );
+      }
       throw new UnauthorizedException('Invalid OTP');
     }
 
+    otpAttemptLimiter.reset(user.id);
     await this.clearLoginOtp(user.id);
 
     return this.completeLogin(user);
   }
 
   async forgotPassword(email: string) {
+    // Identical response whether or not the account exists (no enumeration).
+    const genericResponse = {
+      message:
+        'If an account exists for this email, a password reset link has been sent.',
+    };
+
     const user = await this.prisma.user.findUnique({
       where: { email: email.toLowerCase() },
+      select: { id: true, email: true, fullName: true, status: true },
     });
 
-    if (!user) {
-      return {
-        message:
-          'If an account exists for this email, a reset token has been generated.',
-      };
+    if (!user || user.status === UserStatus.REJECTED) {
+      return genericResponse;
     }
 
-    const resetPasswordToken = randomUUID();
+    const resetPasswordToken = generateOneTimeToken();
     const resetHours = Number(
       this.configService.get<string>('PASSWORD_RESET_TTL_HOURS') ?? '1',
     );
@@ -432,28 +503,41 @@ export class AuthService {
     await this.prisma.user.update({
       where: { id: user.id },
       data: {
-        resetPasswordToken,
+        // Only the SHA-256 of the emailed token is stored.
+        resetPasswordToken: hashOneTimeToken(resetPasswordToken),
         resetPasswordTokenExpiresAt,
       },
     });
 
-    await this.mailService.sendPasswordResetEmail({
-      to: user.email,
-      fullName: user.fullName,
-      token: resetPasswordToken,
-    });
+    try {
+      await this.mailService.sendPasswordResetEmail({
+        to: user.email,
+        fullName: user.fullName,
+        token: resetPasswordToken,
+      });
+    } catch (error) {
+      // Do not reveal delivery failures (that would confirm the account exists).
+      this.logger.error(
+        `Password reset email for user ${user.id} could not be sent.`,
+        error instanceof Error ? error.stack : undefined,
+      );
+    }
 
-    return {
-      message:
-        'Password reset token created. Check your email for the reset link.',
-      resetToken: this.shouldExposeEmailTokens() ? resetPasswordToken : undefined,
-      expiresAt: this.shouldExposeEmailTokens() ? resetPasswordTokenExpiresAt : undefined,
-    };
+    if (this.shouldExposeEmailTokens()) {
+      // Local testing only: never active in production.
+      return {
+        ...genericResponse,
+        resetToken: resetPasswordToken,
+        expiresAt: resetPasswordTokenExpiresAt,
+      };
+    }
+
+    return genericResponse;
   }
 
   async resetPassword(token: string, newPassword: string) {
     const user = await this.prisma.user.findFirst({
-      where: { resetPasswordToken: token },
+      where: { resetPasswordToken: { in: oneTimeTokenLookupValues(token) } },
     });
 
     if (!user) {
@@ -475,18 +559,85 @@ export class AuthService {
         passwordHash,
         resetPasswordToken: null,
         resetPasswordTokenExpiresAt: null,
+        loginOtpHash: null,
+        loginOtpExpiresAt: null,
+        loginOtpRequestedAt: null,
       },
     });
+    // The password fingerprint (pwv) changed, so every existing session for
+    // this user is now rejected by JwtStrategy.
+    invalidateUserSession(user.id);
+    loginAttemptLimiter.reset(user.email.toLowerCase());
 
     return {
-      message: 'Password reset successful. You can now log in with the new password.',
+      message:
+        'Password reset successful. You can now log in with the new password.',
       userId: user.id,
     };
   }
 
-  async getCurrentUser(userId: string) {
-    await this.normalizeOrganizationClientCodes();
+  /** Logged-in password change; requires the current password. */
+  async changePassword(
+    userId: string,
+    currentPassword: string,
+    newPassword: string,
+  ) {
+    const user = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: { id: true, email: true, passwordHash: true },
+    });
 
+    if (!user?.passwordHash) {
+      throw new UnauthorizedException('User not found');
+    }
+
+    const lockKey = `change-password:${user.id}`;
+    if (loginAttemptLimiter.lockedFor(lockKey) > 0) {
+      throw new HttpException(
+        'Too many incorrect attempts. Try again later.',
+        HttpStatus.TOO_MANY_REQUESTS,
+      );
+    }
+
+    if (!(await compare(currentPassword, user.passwordHash))) {
+      loginAttemptLimiter.recordFailure(lockKey);
+      throw new BadRequestException('Current password is incorrect');
+    }
+    loginAttemptLimiter.reset(lockKey);
+
+    if (await compare(newPassword, user.passwordHash)) {
+      throw new BadRequestException(
+        'New password must be different from the current password',
+      );
+    }
+
+    await this.prisma.user.update({
+      where: { id: user.id },
+      data: {
+        passwordHash: await hash(newPassword, 10),
+        resetPasswordToken: null,
+        resetPasswordTokenExpiresAt: null,
+      },
+    });
+    invalidateUserSession(user.id);
+
+    // Old tokens (including the caller's) are now invalid; hand back a fresh one.
+    const refreshed = await this.getUserForAuthentication(user.email);
+    if (!refreshed) {
+      throw new UnauthorizedException('User not found');
+    }
+    const session = await this.completeLogin(refreshed);
+
+    return {
+      message: 'Password updated. Other sessions have been signed out.',
+      ...session,
+    };
+  }
+
+  async getCurrentUser(userId: string) {
+    // Note: organization client codes are normalized by the super-admin
+    // listing endpoints, not on every /auth/me call (that was a write path
+    // touching every organization on each request).
     const user = await this.prisma.user.findUnique({
       where: { id: userId },
       include: {
@@ -840,11 +991,14 @@ export class AuthService {
           phone: input.contactPhone,
           gstNumber: input.gstNumber,
           panNumber: input.panNumber,
-          addressLine1: input.branches?.[0]?.addressLine1 ?? organization.addressLine1,
-          addressLine2: input.branches?.[0]?.addressLine2 ?? organization.addressLine2,
+          addressLine1:
+            input.branches?.[0]?.addressLine1 ?? organization.addressLine1,
+          addressLine2:
+            input.branches?.[0]?.addressLine2 ?? organization.addressLine2,
           city: input.branches?.[0]?.city ?? organization.city,
           state: input.branches?.[0]?.state ?? organization.state,
-          postalCode: input.branches?.[0]?.postalCode ?? organization.postalCode,
+          postalCode:
+            input.branches?.[0]?.postalCode ?? organization.postalCode,
           country: input.branches?.[0]?.country ?? organization.country,
         },
       });
@@ -956,7 +1110,9 @@ export class AuthService {
     });
 
     if (approver?.platformRole !== PlatformRole.SUPER_ADMIN) {
-      throw new ForbiddenException('Only SUPER_ADMIN can approve organizations');
+      throw new ForbiddenException(
+        'Only SUPER_ADMIN can approve organizations',
+      );
     }
 
     const organization = await this.prisma.organization.findUnique({
@@ -1001,7 +1157,8 @@ export class AuthService {
         where: { id: organizationId },
         data: {
           clientCode:
-            organization.clientCode && isPlatformClientCode(organization.clientCode)
+            organization.clientCode &&
+            isPlatformClientCode(organization.clientCode)
               ? organization.clientCode
               : await this.generateOrganizationClientCode(tx, approvedAt),
           status: OrganizationStatus.ACTIVE,
@@ -1030,18 +1187,159 @@ export class AuthService {
       });
     });
 
-    await this.mailService.sendOrganizationApprovedEmail({
-      to: ownerUser.email,
-      fullName: ownerUser.fullName,
-      organizationName: organization.name,
-      notes: notes ?? null,
-    });
+    invalidateAllSessions();
+
+    // The approval is committed; a mail failure must not turn it into a 500.
+    const emailSent = await this.sendMailSafely(
+      `organization ${organizationId} approval`,
+      () =>
+        this.mailService.sendOrganizationApprovedEmail({
+          to: ownerUser.email,
+          fullName: ownerUser.fullName,
+          organizationName: organization.name,
+          notes: notes ?? null,
+        }),
+    );
 
     return {
       message: 'Organization approved successfully',
       organizationId,
       approvedAt,
       notes: notes ?? null,
+      emailSent,
+    };
+  }
+
+  /** Runs a mail send, logging (not throwing) on failure. Returns whether it succeeded. */
+  private async sendMailSafely(context: string, send: () => Promise<void>) {
+    try {
+      await send();
+      return true;
+    } catch (error) {
+      this.logger.error(
+        `Email for ${context} could not be sent.`,
+        error instanceof Error ? error.stack : undefined,
+      );
+      return false;
+    }
+  }
+
+  async getSuspendedOrganizations() {
+    return this.prisma.organization.findMany({
+      where: { status: OrganizationStatus.SUSPENDED },
+      orderBy: { updatedAt: 'desc' },
+      include: {
+        locations: {
+          orderBy: [{ isPrimary: 'desc' }, { createdAt: 'asc' }],
+        },
+        subscriptions: {
+          where: { isCurrent: true },
+          include: { plan: true },
+          orderBy: { createdAt: 'desc' },
+          take: 1,
+        },
+      },
+    });
+  }
+
+  /**
+   * SUPER_ADMIN: suspend an ACTIVE (or pending) organization. Members are
+   * blocked from signing in and from every org-scoped API within ~30 seconds
+   * (JwtStrategy session cache TTL); this instance applies it immediately.
+   */
+  async suspendOrganization(
+    organizationId: string,
+    actorUserId: string,
+    reason?: string,
+  ) {
+    const organization = await this.prisma.organization.findUnique({
+      where: { id: organizationId },
+      select: { id: true, name: true, status: true },
+    });
+
+    if (!organization) {
+      throw new NotFoundException('Organization not found');
+    }
+
+    if (organization.status === OrganizationStatus.SUSPENDED) {
+      throw new BadRequestException('Organization is already suspended');
+    }
+
+    if (
+      organization.status !== OrganizationStatus.ACTIVE &&
+      organization.status !== OrganizationStatus.PENDING_APPROVAL
+    ) {
+      throw new BadRequestException(
+        'Only active or pending organizations can be suspended',
+      );
+    }
+
+    const suspendedAt = new Date();
+    await this.prisma.organization.update({
+      where: { id: organizationId },
+      data: { status: OrganizationStatus.SUSPENDED },
+    });
+    invalidateAllSessions();
+
+    this.logger.warn(
+      `Organization ${organizationId} suspended by ${actorUserId} (previous status ${organization.status}). Reason: ${reason?.trim() || '(none given)'}`,
+    );
+
+    return {
+      message: 'Organization suspended',
+      organizationId,
+      previousStatus: organization.status,
+      status: OrganizationStatus.SUSPENDED,
+      suspendedAt,
+      reason: reason?.trim() || null,
+    };
+  }
+
+  /** SUPER_ADMIN: reactivate a SUSPENDED organization (back to ACTIVE). */
+  async reactivateOrganization(
+    organizationId: string,
+    actorUserId: string,
+    reason?: string,
+  ) {
+    const organization = await this.prisma.organization.findUnique({
+      where: { id: organizationId },
+      select: { id: true, status: true, approvedAt: true },
+    });
+
+    if (!organization) {
+      throw new NotFoundException('Organization not found');
+    }
+
+    if (organization.status !== OrganizationStatus.SUSPENDED) {
+      throw new BadRequestException(
+        'Only suspended organizations can be reactivated',
+      );
+    }
+
+    // An organization suspended before it was ever approved goes back to the
+    // approval queue instead of becoming ACTIVE without review.
+    const nextStatus = organization.approvedAt
+      ? OrganizationStatus.ACTIVE
+      : OrganizationStatus.PENDING_APPROVAL;
+
+    await this.prisma.organization.update({
+      where: { id: organizationId },
+      data: { status: nextStatus },
+    });
+    invalidateAllSessions();
+
+    this.logger.log(
+      `Organization ${organizationId} reactivated by ${actorUserId} -> ${nextStatus}. Reason: ${reason?.trim() || '(none given)'}`,
+    );
+
+    return {
+      message:
+        nextStatus === OrganizationStatus.ACTIVE
+          ? 'Organization reactivated'
+          : 'Organization returned to the pending approval queue',
+      organizationId,
+      status: nextStatus,
+      reactivatedAt: new Date(),
     };
   }
 
@@ -1106,20 +1404,27 @@ export class AuthService {
       }
     });
 
-    if (ownerUser?.email) {
-      await this.mailService.sendOrganizationRejectedEmail({
-        to: ownerUser.email,
-        fullName: ownerUser.fullName,
-        organizationName: organization.name,
-        reason,
-      });
-    }
+    invalidateAllSessions();
+
+    const emailSent = ownerUser?.email
+      ? await this.sendMailSafely(
+          `organization ${organizationId} rejection`,
+          () =>
+            this.mailService.sendOrganizationRejectedEmail({
+              to: ownerUser.email,
+              fullName: ownerUser.fullName,
+              organizationName: organization.name,
+              reason,
+            }),
+        )
+      : false;
 
     return {
       message: 'Organization rejected successfully',
       organizationId,
       rejectedAt,
       reason,
+      emailSent,
     };
   }
 
@@ -1189,12 +1494,17 @@ export class AuthService {
       },
     });
 
-    if (registration.email) {
-      await this.mailService.sendIndependentDriverApprovedEmail({
-        to: registration.email,
-        fullName: registration.fullName,
-        notes: notes ?? null,
-      });
+    const registrationEmail = registration.email;
+    if (registrationEmail) {
+      await this.sendMailSafely(
+        `independent driver ${registrationId} approval`,
+        () =>
+          this.mailService.sendIndependentDriverApprovedEmail({
+            to: registrationEmail,
+            fullName: registration.fullName,
+            notes: notes ?? null,
+          }),
+      );
     }
 
     return {
@@ -1254,12 +1564,17 @@ export class AuthService {
       },
     });
 
-    if (registration.email) {
-      await this.mailService.sendIndependentDriverRejectedEmail({
-        to: registration.email,
-        fullName: registration.fullName,
-        reason,
-      });
+    const registrationEmail = registration.email;
+    if (registrationEmail) {
+      await this.sendMailSafely(
+        `independent driver ${registrationId} rejection`,
+        () =>
+          this.mailService.sendIndependentDriverRejectedEmail({
+            to: registrationEmail,
+            fullName: registration.fullName,
+            reason,
+          }),
+      );
     }
 
     return {
@@ -1321,12 +1636,22 @@ export class AuthService {
     }
 
     const hasPortalMembership = user.organizationMembers.some(
-      (membership) => membership.status === MembershipStatus.ACTIVE,
+      (membership) =>
+        membership.status === MembershipStatus.ACTIVE &&
+        (membership.organization.status === OrganizationStatus.ACTIVE ||
+          membership.organization.status ===
+            OrganizationStatus.PENDING_APPROVAL),
     );
 
     if (!hasPortalMembership) {
+      const suspended = user.organizationMembers.some(
+        (membership) =>
+          membership.organization.status === OrganizationStatus.SUSPENDED,
+      );
       throw new ForbiddenException(
-        'No active organization membership is available for this account',
+        suspended
+          ? 'Your organization has been suspended. Contact Ashwa Logix support.'
+          : 'No active organization membership is available for this account',
       );
     }
   }
@@ -1339,8 +1664,9 @@ export class AuthService {
 
   private getVerificationSuspensionHours() {
     return Number(
-      this.configService.get<string>('EMAIL_VERIFICATION_SUSPEND_AFTER_HOURS') ??
-        '72',
+      this.configService.get<string>(
+        'EMAIL_VERIFICATION_SUSPEND_AFTER_HOURS',
+      ) ?? '72',
     );
   }
 
@@ -1376,28 +1702,28 @@ export class AuthService {
     const paymentCollectionMethod =
       plan.priceAmount.toNumber() === 0
         ? PaymentCollectionMethod.NONE
-        : input.requestedPaymentCollectionMethod ??
+        : (input.requestedPaymentCollectionMethod ??
           billingSettings?.defaultPaymentCollectionMethod ??
-          PaymentCollectionMethod.MANUAL;
+          PaymentCollectionMethod.MANUAL);
 
     const paymentStatus =
       plan.priceAmount.toNumber() === 0
         ? SubscriptionPaymentStatus.NOT_REQUIRED
-        : input.requestedPaymentStatus ??
+        : (input.requestedPaymentStatus ??
           (paymentCollectionMethod === PaymentCollectionMethod.NONE
-        ? SubscriptionPaymentStatus.NOT_REQUIRED
-        : SubscriptionPaymentStatus.PENDING);
+            ? SubscriptionPaymentStatus.NOT_REQUIRED
+            : SubscriptionPaymentStatus.PENDING));
 
     const status =
       plan.priceAmount.toNumber() === 0
         ? SubscriptionStatus.ACTIVE
-        : input.requestedStatus ??
+        : (input.requestedStatus ??
           (paymentStatus === SubscriptionPaymentStatus.RECEIVED ||
           paymentStatus === SubscriptionPaymentStatus.WAIVED ||
           paymentStatus === SubscriptionPaymentStatus.NOT_REQUIRED ||
           billingSettings?.allowManualActivationWithoutPayment
             ? SubscriptionStatus.ACTIVE
-            : SubscriptionStatus.PENDING_PAYMENT);
+            : SubscriptionStatus.PENDING_PAYMENT));
 
     const startsAt = status === SubscriptionStatus.ACTIVE ? new Date() : null;
 
@@ -1524,7 +1850,10 @@ export class AuthService {
     }
   }
 
-  private calculateGraceEndDate(startsAt: Date | null, graceDays: number | null) {
+  private calculateGraceEndDate(
+    startsAt: Date | null,
+    graceDays: number | null,
+  ) {
     if (!startsAt || !graceDays) {
       return null;
     }
@@ -1686,13 +2015,14 @@ export class AuthService {
   }
 
   private async listIndependentDriversWithoutCodeColumn() {
-    const registrations = await this.prisma.independentDriverRegistration.findMany({
-      where: {
-        status: IndependentDriverRegistrationStatus.PENDING_APPROVAL,
-      },
-      orderBy: { createdAt: 'asc' },
-      select: this.independentDriverRegistrationLegacySelect(),
-    });
+    const registrations =
+      await this.prisma.independentDriverRegistration.findMany({
+        where: {
+          status: IndependentDriverRegistrationStatus.PENDING_APPROVAL,
+        },
+        orderBy: { createdAt: 'asc' },
+        select: this.independentDriverRegistrationLegacySelect(),
+      });
 
     return registrations.map((registration) => ({
       ...registration,
@@ -1703,10 +2033,11 @@ export class AuthService {
   private async getIndependentDriverRegistrationWithoutCodeColumn(
     registrationId: string,
   ) {
-    const registration = await this.prisma.independentDriverRegistration.findUnique({
-      where: { id: registrationId },
-      select: this.independentDriverRegistrationLegacySelect(),
-    });
+    const registration =
+      await this.prisma.independentDriverRegistration.findUnique({
+        where: { id: registrationId },
+        select: this.independentDriverRegistrationLegacySelect(),
+      });
 
     if (!registration) {
       throw new BadRequestException(
@@ -1765,7 +2096,7 @@ export class AuthService {
     return (
       error instanceof Prisma.PrismaClientKnownRequestError &&
       error.code === 'P2022' &&
-      String(error.meta?.modelName || '') === 'IndependentDriverRegistration'
+      error.meta?.modelName === 'IndependentDriverRegistration'
     );
   }
 
@@ -1790,53 +2121,78 @@ export class AuthService {
       passwordHash: string | null;
     } | null,
     password: string,
+    email: string,
   ) {
-    if (!user?.passwordHash) {
-      throw new UnauthorizedException('Invalid email or password');
+    const lockKey = email.trim().toLowerCase();
+    const lockedForMs = loginAttemptLimiter.lockedFor(lockKey);
+    if (lockedForMs > 0) {
+      throw new HttpException(
+        `Too many failed sign-in attempts. Try again in ${Math.ceil(lockedForMs / 60_000)} minute(s).`,
+        HttpStatus.TOO_MANY_REQUESTS,
+      );
     }
 
-    const passwordMatches = await compare(password, user.passwordHash);
-
-    if (!passwordMatches) {
-      throw new UnauthorizedException('Invalid email or password');
-    }
-  }
-
-    private async completeLogin(user: {
-      id: string;
-      fullName: string;
-      email: string;
-      status: UserStatus;
-      platformRole: PlatformRole | null;
-      driverProfile?: {
-        id: string;
-        organizationId: string;
-        driverCode: string;
-        fullName: string;
-        phone: string;
-        email: string | null;
-        status: import('@prisma/client').DriverStatus;
-        employmentType: import('@prisma/client').EmploymentType;
-        homeBase: string | null;
-        licenseNumber: string | null;
-        licenseExpiry: Date | null;
-      } | null;
-      organizationMembers: {
-        organizationId: string;
-        role: OrganizationRole;
-        status: MembershipStatus;
-        sectionAccess: Prisma.JsonValue | null;
-        organization: {
-          name: string;
-          status: OrganizationStatus;
-        };
-      }[];
-  }) {
-    const activeMemberships = user.organizationMembers.filter(
-      (membership) => membership.status === MembershipStatus.ACTIVE,
+    // Always run bcrypt so response time does not reveal whether the account exists.
+    const passwordMatches = await compare(
+      password,
+      user?.passwordHash ?? DUMMY_PASSWORD_HASH,
     );
 
+    if (!user?.passwordHash || !passwordMatches) {
+      loginAttemptLimiter.recordFailure(lockKey);
+      throw new UnauthorizedException('Invalid email or password');
+    }
+
+    loginAttemptLimiter.reset(lockKey);
+  }
+
+  private async completeLogin(user: {
+    id: string;
+    fullName: string;
+    email: string;
+    passwordHash: string | null;
+    status: UserStatus;
+    platformRole: PlatformRole | null;
+    driverProfile?: {
+      id: string;
+      organizationId: string;
+      driverCode: string;
+      fullName: string;
+      phone: string;
+      email: string | null;
+      status: import('@prisma/client').DriverStatus;
+      employmentType: import('@prisma/client').EmploymentType;
+      homeBase: string | null;
+      licenseNumber: string | null;
+      licenseExpiry: Date | null;
+    } | null;
+    organizationMembers: {
+      organizationId: string;
+      role: OrganizationRole;
+      status: MembershipStatus;
+      sectionAccess: Prisma.JsonValue | null;
+      organization: {
+        name: string;
+        status: OrganizationStatus;
+      };
+    }[];
+  }) {
+    const activeMemberships = user.organizationMembers.filter(
+      (membership) =>
+        membership.status === MembershipStatus.ACTIVE &&
+        (membership.organization.status === OrganizationStatus.ACTIVE ||
+          membership.organization.status ===
+            OrganizationStatus.PENDING_APPROVAL),
+    );
+
+    // Roles/memberships in the token are informational only: JwtStrategy
+    // reloads them from the database on every request.
     const payload: JwtPayload = {
+      typ: ACCESS_TOKEN_TYPE,
+      pwv: passwordFingerprint(
+        user.passwordHash,
+        jwtSecret(this.configService),
+      ),
       sub: user.id,
       email: user.email,
       platformRole: user.platformRole ?? null,
@@ -1858,35 +2214,35 @@ export class AuthService {
 
     return {
       accessToken: await this.jwtService.signAsync(payload),
-        user: {
-          id: user.id,
-          fullName: user.fullName,
-          email: user.email,
-          platformRole: user.platformRole,
-          status: user.status,
-          driverProfile: user.driverProfile
-            ? {
-                id: user.driverProfile.id,
-                organizationId: user.driverProfile.organizationId,
-                driverCode: user.driverProfile.driverCode,
-                fullName: user.driverProfile.fullName,
-                phone: user.driverProfile.phone,
-                email: user.driverProfile.email,
-                status: user.driverProfile.status,
-                employmentType: user.driverProfile.employmentType,
-                homeBase: user.driverProfile.homeBase,
-                licenseNumber: user.driverProfile.licenseNumber,
-                licenseExpiry: user.driverProfile.licenseExpiry,
-              }
-            : null,
-          organizationMemberships: activeMemberships.map((membership) => ({
-            organizationId: membership.organizationId,
-            organizationName: membership.organization.name,
-            organizationStatus: membership.organization.status,
-            role: membership.role,
-            membershipStatus: membership.status,
-            sectionAccess: membership.sectionAccess,
-          })),
+      user: {
+        id: user.id,
+        fullName: user.fullName,
+        email: user.email,
+        platformRole: user.platformRole,
+        status: user.status,
+        driverProfile: user.driverProfile
+          ? {
+              id: user.driverProfile.id,
+              organizationId: user.driverProfile.organizationId,
+              driverCode: user.driverProfile.driverCode,
+              fullName: user.driverProfile.fullName,
+              phone: user.driverProfile.phone,
+              email: user.driverProfile.email,
+              status: user.driverProfile.status,
+              employmentType: user.driverProfile.employmentType,
+              homeBase: user.driverProfile.homeBase,
+              licenseNumber: user.driverProfile.licenseNumber,
+              licenseExpiry: user.driverProfile.licenseExpiry,
+            }
+          : null,
+        organizationMemberships: activeMemberships.map((membership) => ({
+          organizationId: membership.organizationId,
+          organizationName: membership.organization.name,
+          organizationStatus: membership.organization.status,
+          role: membership.role,
+          membershipStatus: membership.status,
+          sectionAccess: membership.sectionAccess,
+        })),
       },
     };
   }
@@ -1903,10 +2259,9 @@ export class AuthService {
   }
 
   private shouldExposeEmailTokens() {
-    return (
-      String(
-        this.configService.get<string>('AUTH_EXPOSE_EMAIL_TOKENS') ?? 'true',
-      ).toLowerCase() === 'true'
+    // Defaults to false and is always false when NODE_ENV=production.
+    return shouldExposeEmailTokens(
+      this.configService.get<string>('AUTH_EXPOSE_EMAIL_TOKENS'),
     );
   }
 
@@ -1931,20 +2286,10 @@ export class AuthService {
       throw new BadRequestException('DRIVING_LICENSE_PHOTO upload is required');
     }
 
-    if (
-      !documentTypes.has('AADHAAR_CARD') &&
-      !documentTypes.has('PAN_CARD')
-    ) {
+    if (!documentTypes.has('AADHAAR_CARD') && !documentTypes.has('PAN_CARD')) {
       throw new BadRequestException(
         'At least one of AADHAAR_CARD or PAN_CARD upload is required',
       );
     }
   }
 }
-
-
-
-
-
-
-

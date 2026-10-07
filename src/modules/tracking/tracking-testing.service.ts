@@ -5,6 +5,7 @@ import { randomUUID } from 'crypto';
 import { TRACKING_EVENT_BUS } from '../../shared/kafka/kafka.constants';
 import type { TrackingEventBus } from '../../shared/kafka/interfaces/tracking-event-bus.interface';
 import { PrismaService } from '../../shared/prisma/prisma.service';
+import { TRACKING_TOKEN_TYPE } from '../auth/auth-security.util';
 import { AuthorizationService } from '../auth/authorization.service';
 import type { JwtPayload } from '../auth/interfaces/jwt-payload.interface';
 import { CreateDriverTrackingTokenDto } from './dto/create-driver-tracking-token.dto';
@@ -220,6 +221,9 @@ export class TrackingTestingService {
     destinationLongitude?: number;
   }) {
     return this.jwtService.signAsync({
+      // `typ: 'tracking'` makes JwtStrategy reject this token on HTTP APIs;
+      // it is only valid for the /tracking WebSocket namespace.
+      typ: TRACKING_TOKEN_TYPE,
       sub: input.subject,
       shipmentId: input.shipmentId,
       organizationId: input.organizationId,

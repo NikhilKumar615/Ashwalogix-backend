@@ -37,7 +37,11 @@ export type OrderEventHandler = (
 ) => Promise<void> | void;
 
 export interface TrackingEventBus {
-  publishRiderLocation(event: RiderLocationEvent): Promise<void>;
+  /**
+   * Resolves `true` when the event was handed to the bus, `false` when the bus
+   * is unavailable (callers should then persist/handle the event directly).
+   */
+  publishRiderLocation(event: RiderLocationEvent): Promise<boolean>;
   publishOrderEvent(event: OrderEventMessage): Promise<void>;
   registerRiderLocationConsumer(
     groupId: string,

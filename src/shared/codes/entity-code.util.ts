@@ -64,7 +64,9 @@ export function buildStatePrefix(state: string | null | undefined) {
     return DEFAULT_STATE_PREFIX;
   }
 
-  return INDIA_STATE_CODE_MAP[sanitized] || sanitized.slice(0, 2).padEnd(2, 'X');
+  return (
+    INDIA_STATE_CODE_MAP[sanitized] || sanitized.slice(0, 2).padEnd(2, 'X')
+  );
 }
 
 export function formatRollingAlphaCode(
@@ -159,9 +161,9 @@ export function parsePlatformClientCodeSequence(code: string, year: number) {
 export function isPlatformClientCode(code: string | null | undefined) {
   return Boolean(
     code &&
-      code.match(
-        new RegExp(`^${escapeRegExp(PLATFORM_PREFIX)}-\\d{2}-(\\d{4})([A-Z]+)$`),
-      ),
+    code.match(
+      new RegExp(`^${escapeRegExp(PLATFORM_PREFIX)}-\\d{2}-(\\d{4})([A-Z]+)$`),
+    ),
   );
 }
 
@@ -173,9 +175,7 @@ export function formatIndependentDriverCode(sequence: number) {
 
 export function parseIndependentDriverCodeSequence(code: string) {
   const match = code.match(
-    new RegExp(
-      `^${escapeRegExp(INDEPENDENT_DRIVER_PREFIX)}-(\\d{4})([A-Z]+)$`,
-    ),
+    new RegExp(`^${escapeRegExp(INDEPENDENT_DRIVER_PREFIX)}-(\\d{4})([A-Z]+)$`),
   );
 
   if (!match) {
@@ -202,11 +202,67 @@ function toAlphaSuffix(index: number) {
 }
 
 function fromAlphaSuffix(value: string) {
-  return value.split('').reduce((total, character) => {
-    return total * 26 + (character.charCodeAt(0) - 64);
-  }, 0) - 1;
+  return (
+    value.split('').reduce((total, character) => {
+      return total * 26 + (character.charCodeAt(0) - 64);
+    }, 0) - 1
+  );
 }
 
 function escapeRegExp(value: string) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+export const MAX_CODE_GENERATION_ATTEMPTS = 5;
+
+/**
+ * True for a Prisma unique-constraint violation (P2002). Duck-typed so this
+ * util stays free of a Prisma client import.
+ */
+export function isUniqueConstraintViolation(error: unknown) {
+  return (
+    typeof error === 'object' &&
+    error !== null &&
+    (error as { code?: unknown }).code === 'P2002'
+  );
+}
+
+/**
+ * Runs `operation` and retries it (with a freshly generated code, which the
+ * operation is responsible for producing from `attempt`) when it fails with a
+ * unique-constraint violation that `shouldRetry` attributes to the generated
+ * code. Concurrent creators reading the same "highest sequence" therefore
+ * converge instead of surfacing a 500/409 to the user.
+ */
+export async function withUniqueCodeRetry<T>(
+  operation: (attempt: number) => Promise<T>,
+  options: {
+    attempts?: number;
+    shouldRetry?: (error: unknown) => boolean | Promise<boolean>;
+  } = {},
+): Promise<T> {
+  const attempts = Math.max(
+    options.attempts ?? MAX_CODE_GENERATION_ATTEMPTS,
+    1,
+  );
+  let lastError: unknown;
+
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      return await operation(attempt);
+    } catch (error) {
+      lastError = error;
+      if (!isUniqueConstraintViolation(error)) {
+        throw error;
+      }
+      const retry = options.shouldRetry
+        ? await options.shouldRetry(error)
+        : true;
+      if (!retry) {
+        throw error;
+      }
+    }
+  }
+
+  throw lastError;
 }

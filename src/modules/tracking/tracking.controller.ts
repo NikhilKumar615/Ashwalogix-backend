@@ -1,5 +1,13 @@
-import { Body, Controller, Get, Post, UseGuards } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  Get,
+  NotFoundException,
+  Post,
+  UseGuards,
+} from '@nestjs/common';
 import { OrganizationRole } from '@prisma/client';
+import { isProduction } from '../../shared/config/runtime-security';
 import { ApiBearerAuth, ApiBody, ApiOperation, ApiTags } from '@nestjs/swagger';
 import { CurrentUser } from '../auth/decorators/current-user.decorator';
 import { Roles } from '../auth/decorators/roles.decorator';
@@ -29,7 +37,11 @@ export class TrackingController {
     summary: 'Generate a tracking JWT for Swagger/manual WebSocket testing',
   })
   @ApiBody({ type: CreateTrackingTestTokenDto })
+  @ApiBearerAuth()
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles('SUPER_ADMIN')
   createTestToken(@Body() body: CreateTrackingTestTokenDto) {
+    this.assertTestEndpointsEnabled();
     return this.trackingTestingService.createToken(body);
   }
 
@@ -66,7 +78,18 @@ export class TrackingController {
     summary: 'Publish a test order.events Kafka message for notification-consumer testing',
   })
   @ApiBody({ type: PublishTestOrderEventDto })
+  @ApiBearerAuth()
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles('SUPER_ADMIN')
   publishTestOrderEvent(@Body() body: PublishTestOrderEventDto) {
+    this.assertTestEndpointsEnabled();
     return this.trackingTestingService.publishTestOrderEvent(body);
+  }
+
+  /** Test helpers are SUPER_ADMIN-only and disabled entirely in production. */
+  private assertTestEndpointsEnabled() {
+    if (isProduction()) {
+      throw new NotFoundException();
+    }
   }
 }
