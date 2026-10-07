@@ -4,11 +4,11 @@ import {
   WebSocketGateway,
   WebSocketServer,
 } from '@nestjs/websockets';
-import { OnModuleDestroy } from '@nestjs/common';
+import { Logger, OnModuleDestroy } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import { PrismaService } from '../../shared/prisma/prisma.service';
 import type { JwtPayload } from '../auth/interfaces/jwt-payload.interface';
-import type { Server, Socket } from 'socket.io';
+import type { Namespace, Server, Socket } from 'socket.io';
 import { createAdapter } from '@socket.io/redis-adapter';
 import Redis from 'ioredis';
 import { DriverRealtimeService } from './driver-realtime.service';
@@ -25,12 +25,13 @@ type DriverSocket = Socket & {
   cors: { origin: allowedOrigins(), credentials: true },
 })
 export class DriverRealtimeGateway
-  implements OnGatewayInit<Server>, OnGatewayConnection<DriverSocket>, OnModuleDestroy
+  implements OnGatewayInit<Server | Namespace>, OnGatewayConnection<DriverSocket>, OnModuleDestroy
 {
   @WebSocketServer()
   server!: Server;
   private redisPublisher?: Redis;
   private redisSubscriber?: Redis;
+  private readonly logger = new Logger(DriverRealtimeGateway.name);
 
   constructor(
     private readonly jwtService: JwtService,
@@ -38,14 +39,28 @@ export class DriverRealtimeGateway
     private readonly driverRealtimeService: DriverRealtimeService,
   ) {}
 
-  afterInit(server: Server) {
+  afterInit(server: Server | Namespace) {
     const redisUrl = process.env.REDIS_URL?.trim();
     if (redisUrl) {
-      this.redisPublisher = new Redis(redisUrl, { maxRetriesPerRequest: null });
-      this.redisSubscriber = this.redisPublisher.duplicate();
-      server.adapter(createAdapter(this.redisPublisher, this.redisSubscriber));
+      // With a namespaced gateway Nest passes the Namespace, which has no
+      // adapter() method. The adapter must be set on the root Server; it then
+      // re-initialises existing namespaces, including /driver-sync.
+      const rootServer = 'server' in server ? server.server : server;
+      try {
+        this.redisPublisher = new Redis(redisUrl, { maxRetriesPerRequest: null });
+        this.redisSubscriber = this.redisPublisher.duplicate();
+        rootServer.adapter(
+          createAdapter(this.redisPublisher, this.redisSubscriber),
+        );
+      } catch (error) {
+        // Fall back to the in-memory adapter (single instance) rather than
+        // crashing the whole API at startup.
+        this.logger.error(
+          `Redis adapter for driver sync unavailable: ${(error as Error).message}`,
+        );
+      }
     }
-    this.driverRealtimeService.attachServer(server);
+    this.driverRealtimeService.attachServer(server as Server);
   }
 
   async onModuleDestroy() {
