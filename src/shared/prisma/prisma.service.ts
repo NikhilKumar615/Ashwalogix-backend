@@ -7,6 +7,8 @@ import {
 import { ConfigService } from '@nestjs/config';
 import { PrismaPg } from '@prisma/adapter-pg';
 import { PrismaClient } from '@prisma/client';
+import { existsSync, readdirSync } from 'fs';
+import { join } from 'path';
 import { Pool } from 'pg';
 
 @Injectable()
@@ -91,6 +93,39 @@ export class PrismaService
 
   async onModuleInit() {
     await this.$connect();
+    // Never blocks startup; only makes a forgotten migration visible.
+    void this.warnAboutPendingMigrations();
+  }
+
+  /**
+   * Logs an error when prisma/migrations contains migrations the database has
+   * not applied.  Requests that touch the missing tables/columns fail until
+   * `npx prisma migrate deploy` is run (the driver app then cannot save
+   * proofs or change shipment status).
+   */
+  private async warnAboutPendingMigrations() {
+    const logger = new Logger('PrismaService');
+    try {
+      const migrationsDir = join(process.cwd(), 'prisma', 'migrations');
+      if (!existsSync(migrationsDir)) return;
+      const expected = readdirSync(migrationsDir, { withFileTypes: true })
+        .filter((entry) => entry.isDirectory())
+        .map((entry) => entry.name);
+      const applied = await this.$queryRaw<Array<{ migration_name: string }>>`
+        SELECT migration_name FROM _prisma_migrations
+        WHERE finished_at IS NOT NULL AND rolled_back_at IS NULL`;
+      const appliedNames = new Set(applied.map((row) => row.migration_name));
+      const pending = expected.filter((name) => !appliedNames.has(name));
+      if (pending.length) {
+        logger.error(
+          `DATABASE SCHEMA OUT OF DATE: ${pending.length} migration(s) not applied (${pending.join(', ')}). Run "npx prisma migrate deploy".`,
+        );
+      }
+    } catch (error) {
+      logger.warn(
+        `Could not check for pending migrations: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
   }
 
   async onModuleDestroy() {

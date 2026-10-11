@@ -12,7 +12,8 @@ import { Prisma } from '@prisma/client';
 /**
  * Global exception filter:
  * - Maps well-known Prisma errors to safe HTTP responses
- *   (P2002 -> 409, P2025 -> 404, P2003 -> 409, invalid input -> 400).
+ *   (P2002 -> 409, P2025 -> 404, P2003 -> 409, invalid input -> 400,
+ *   missing table/column from an unapplied migration -> 503).
  * - Any other non-HTTP error becomes a generic 500 without leaking internals
  *   (stack/DB messages are logged server-side only).
  * - HttpExceptions (and WebSocket contexts) are delegated to Nest's default handling.
@@ -40,7 +41,11 @@ export class GlobalExceptionFilter
     }>();
 
     if (mapped) {
-      this.logger.warn(`${mapped.code ?? 'prisma'}: ${mapped.logMessage}`);
+      if (mapped.status >= 500) {
+        this.logger.error(`${mapped.code ?? 'prisma'}: ${mapped.logMessage}`);
+      } else {
+        this.logger.warn(`${mapped.code ?? 'prisma'}: ${mapped.logMessage}`);
+      }
       if (!response.headersSent) {
         response.status(mapped.status).json({
           statusCode: mapped.status,
@@ -128,6 +133,19 @@ export class GlobalExceptionFilter
             message: 'The record was modified concurrently. Please retry.',
             code: exception.code,
             logMessage: exception.message,
+          };
+        // The deployed code expects a table/column the database does not have:
+        // a migration was not applied (`npx prisma migrate deploy`).  Every
+        // request touching it fails until then, so say so instead of a vague 500.
+        case 'P2021':
+        case 'P2022':
+          return {
+            status: HttpStatus.SERVICE_UNAVAILABLE,
+            error: 'Service Unavailable',
+            message:
+              'The server database is not up to date, so this action cannot be saved right now. Please contact operations/support.',
+            code: exception.code,
+            logMessage: `DATABASE SCHEMA OUT OF DATE - run "npx prisma migrate deploy": ${exception.message}`,
           };
         default:
           return null;
