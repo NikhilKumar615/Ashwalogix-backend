@@ -191,4 +191,13 @@ export class RegisterIndependentDriverDto {
   @ValidateNested({ each: true })
   @Type(() => IndependentDriverDocumentDto)
   uploadedDocuments!: IndependentDriverDocumentDto[];
+
+  @ApiPropertyOptional({
+    description:
+      "Expo push token of the applicant's phone, to notify them of the decision",
+  })
+  @IsOptional()
+  @IsString()
+  @Matches(/^ExponentPushToken\[[^\]]+\]$|^ExpoPushToken\[[^\]]+\]$/)
+  expoPushToken?: string;
 }

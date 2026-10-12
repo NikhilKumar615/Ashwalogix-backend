@@ -54,6 +54,7 @@ import {
 } from '../../shared/codes/entity-code.util';
 import { isPublicRegistrationStorageKey } from '../documents/documents-upload-policy';
 import { MailService } from '../mail/mail.service';
+import { NotificationsService } from '../notifications/notifications.service';
 import { CreateClientOrganizationDto } from './dto/create-client-organization.dto';
 import { LoginDto } from './dto/login.dto';
 import { RegisterCompanyAdminDto } from './dto/register-company-admin.dto';
@@ -82,6 +83,7 @@ export class AuthService {
     private readonly jwtService: JwtService,
     private readonly configService: ConfigService,
     private readonly mailService: MailService,
+    private readonly notificationsService: NotificationsService,
   ) {}
 
   async registerCompanyAdmin(input: RegisterCompanyAdminDto) {
@@ -262,11 +264,16 @@ export class AuthService {
           input.uploadedDocuments as unknown as Prisma.InputJsonValue,
         status: 'PENDING_APPROVAL' as const,
       };
+      // Only on the current schema; the legacy fallback below omits it.
+      const pushData = input.expoPushToken
+        ? { expoPushToken: input.expoPushToken }
+        : {};
 
       try {
         const registration = await tx.independentDriverRegistration.create({
           data: {
             ...baseData,
+            ...pushData,
             driverCode,
           },
         });
@@ -1494,6 +1501,16 @@ export class AuthService {
       },
     });
 
+    void this.notificationsService.notifyApplicant(registrationId, {
+      type: 'APPLICATION_APPROVED',
+      title: 'Application approved',
+      body: notes
+        ? `Your driver application was approved. ${notes}`
+        : 'Your driver application was approved. Operations will share your sign-in details shortly.',
+      data: { registrationId },
+      organizationId: organizationId ?? registration.organizationId,
+    });
+
     const registrationEmail = registration.email;
     if (registrationEmail) {
       await this.sendMailSafely(
@@ -1562,6 +1579,14 @@ export class AuthService {
         rejectedAt,
         rejectedReason: reason,
       },
+    });
+
+    void this.notificationsService.notifyApplicant(registrationId, {
+      type: 'APPLICATION_REJECTED',
+      title: 'Application not approved',
+      body: `Your driver application was not approved. Reason: ${reason}`,
+      data: { registrationId },
+      organizationId: registration.organizationId,
     });
 
     const registrationEmail = registration.email;

@@ -369,6 +369,7 @@ model User {
   organizationMembers OrganizationUser[]
   driverProfile       Driver?
   pushDevices         PushDevice[]
+  notifications       Notification[]
   platformSettingsRevisions PlatformSettingsRevision[]
   createdOrganizationSubscriptions OrganizationSubscription[] @relation("OrganizationSubscriptionCreatedByUser")
   approvedIndependentDriverRegistrations IndependentDriverRegistration[] @relation("IndependentDriverApprovedByUser")
@@ -390,6 +391,32 @@ model PushDevice {
 
   @@index([userId])
   @@map("push_devices")
+}
+
+/// In-app notification inbox (driver app notification center). Each row is
+/// also pushed to the recipient's devices when created. A row belongs to a
+/// user, or to an independent-driver application that has no account yet.
+model Notification {
+  id             String                         @id @default(uuid()) @db.Uuid
+  userId         String?                        @map("user_id") @db.Uuid
+  registrationId String?                        @map("registration_id") @db.Uuid
+  organizationId String?                        @map("organization_id") @db.Uuid
+  /// SHIPMENT_ASSIGNED, PICKUP_REMINDER, SHIPMENT_RESCHEDULED, KYC, ... (free text so new kinds need no migration)
+  type           String
+  title          String
+  body           String
+  data           Json?
+  /// Set for scheduled notifications so each is created (and pushed) once, even with several server instances.
+  dedupeKey      String?                        @unique @map("dedupe_key")
+  readAt         DateTime?                      @map("read_at")
+  createdAt      DateTime                       @default(now()) @map("created_at")
+  user           User?                          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  registration   IndependentDriverRegistration? @relation(fields: [registrationId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+  @@index([userId, readAt])
+  @@index([registrationId])
+  @@map("notifications")
 }
 
 model DeletionAudit {
@@ -1163,6 +1190,8 @@ model IndependentDriverRegistration {
   vehicleOwnerName          String?                               @map("vehicle_owner_name")
   vehicleRegistrationState  String?                               @map("vehicle_registration_state")
   fuelType                  FuelType?                             @map("fuel_type")
+  /// Applicant's phone, so approval / rejection can be pushed before any account exists.
+  expoPushToken             String?                               @map("expo_push_token")
   uploadedDocuments         Json                                  @map("uploaded_documents")
   status                    IndependentDriverRegistrationStatus   @default(PENDING_APPROVAL)
   approvedAt                DateTime?                             @map("approved_at")
@@ -1171,6 +1200,7 @@ model IndependentDriverRegistration {
   rejectedReason            String?                               @map("rejected_reason")
   organization              Organization?                         @relation(fields: [organizationId], references: [id], onDelete: SetNull)
   approvedByUser            User?                                 @relation("IndependentDriverApprovedByUser", fields: [approvedByUserId], references: [id], onDelete: SetNull)
+  notifications             Notification[]
   createdAt                 DateTime                              @default(now()) @map("created_at")
   updatedAt                 DateTime                              @updatedAt @map("updated_at")
 

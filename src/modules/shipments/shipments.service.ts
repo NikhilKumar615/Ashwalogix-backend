@@ -33,6 +33,7 @@ import type {
 import { PrismaService } from '../../shared/prisma/prisma.service';
 import { MailService } from '../mail/mail.service';
 import { DriverRealtimeService } from '../driver-realtime/driver-realtime.service';
+import { DriverNotificationsService } from '../notifications/driver-notifications.service';
 import {
   buildBusinessPrefix,
   formatRollingAlphaCode,
@@ -399,6 +400,7 @@ export class ShipmentsService {
     private readonly prisma: PrismaService,
     private readonly mailService: MailService,
     private readonly driverRealtimeService: DriverRealtimeService,
+    private readonly driverNotifications: DriverNotificationsService,
     @Inject(TRACKING_EVENT_BUS)
     private readonly trackingEventBus: TrackingEventBus,
   ) {}
@@ -1043,6 +1045,27 @@ export class ShipmentsService {
       organizationId,
       change: 'updated',
     });
+    if (
+      shipment.currentDriverId &&
+      !TERMINAL_SHIPMENT_STATUSES.includes(shipment.status)
+    ) {
+      void this.driverNotifications.shipmentRescheduled(
+        shipment.currentDriverId,
+        shipmentId,
+        {
+          pickupBefore: existingShipment.plannedPickupAt,
+          pickupAfter: shipment.plannedPickupAt,
+          deliveryBefore: existingShipment.plannedDeliveryAt,
+          deliveryAfter: shipment.plannedDeliveryAt,
+        },
+      );
+      if (stopPlan?.locationChanged) {
+        void this.driverNotifications.routeChanged(
+          shipment.currentDriverId,
+          shipmentId,
+        );
+      }
+    }
     return enrichedShipment;
   }
 
@@ -1278,6 +1301,21 @@ export class ShipmentsService {
           organizationId: shipment.organizationId,
           change: 'removed',
         },
+      );
+    }
+    if (shipment.currentDriverId === input.driverId) {
+      // Same driver, different vehicle.
+      void this.driverNotifications.vehicleChanged(input.driverId, shipmentId);
+    } else {
+      void this.driverNotifications.shipmentAssigned(
+        input.driverId,
+        shipmentId,
+      );
+    }
+    if (isDriverChange && shipment.currentDriverId) {
+      void this.driverNotifications.shipmentUnassigned(
+        shipment.currentDriverId,
+        shipmentId,
       );
     }
     return result.assignment;
@@ -2705,6 +2743,12 @@ export class ShipmentsService {
       organizationId,
       change: 'status_changed',
     });
+    if (nextStatus === ShipmentStatus.CANCELLED && shipment.currentDriverId) {
+      void this.driverNotifications.shipmentCancelled(
+        shipment.currentDriverId,
+        shipmentId,
+      );
+    }
 
     // Coordinates are resolved after the transaction from stored data only, so
     // an external geocoder can never stall or roll back a status change.
